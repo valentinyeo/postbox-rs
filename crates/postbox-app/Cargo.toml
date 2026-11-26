@@ -17,6 +17,8 @@ desktop = ["postbox-ui/desktop"]
 
 [dependencies]
 postbox-core.workspace = true
+postbox-hub.workspace = true
 postbox-keymap.workspace = true
+postbox-platform.workspace = true
 postbox-store.workspace = true
 postbox-ui.workspace = true

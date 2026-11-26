@@ -1,66 +1,1892 @@
-use crate::theme::ShadcnPalette;
-use gpui_kit::*;
-use postbox_core::{ThemeChoice, ViewTab};
+use crate::geometry::{
+    CHAT_COLUMN_MAX_WIDTH_PX, SIDEBAR_WIDTH_PX, TYPE_CHAT_NAME_PX, TYPE_LABEL_PX, TYPE_TIME_PX,
+    VIEW_RAIL_WIDTH_PX,
+};
+use crate::palette::PaletteMode;
+use crate::theme::{ShadcnPalette, archived_row_color, archived_text_color};
+use crate::timeline::{TimelineItem, format_time_hm};
+use crate::viewmodel::{FocusTarget, PostboxLaunchContext, PostboxViewModel, SidebarChatRow};
+use crate::{BASE_FONT_PX, FONT_MONO, FONT_SANS, scaled_px};
+use gpui_kit::assets::Assets;
+use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::base::actions::Cancel;
+use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
+use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
+use gpui_kit::component::{IndexPath, Theme, ThemeMode, VirtualListScrollHandle, v_virtual_list};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    Action as GpuiAction, AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle,
+    Focusable, Hsla, InteractiveElement as _, IntoElement, KeyBinding, KeyBindingContextPredicate,
+    KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, ParentElement as _,
+    Pixels, Point, Render, ScrollStrategy, SharedString, Size, StatefulInteractiveElement as _,
+    Styled as _, Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, div, hsla, px,
+    rgb, size,
+};
+use postbox_core::{FontScale, Provider, ThemeChoice};
+use postbox_keymap::{Action as PbAction, Keymap, f1_shortcut_groups};
+use std::borrow::Cow;
+use std::rc::Rc;
+use std::time::Instant;
 
-pub struct PostboxShell {
-    theme: ThemeChoice,
-    view: ViewTab,
-}
+gpui_kit::actions!(
+    postbox,
+    [
+        OpenPalette,
+        ShowShortcutsHelp,
+        SearchChats,
+        ClearSearchOrBack,
+        ToggleUnread,
+        ToggleArchived,
+        ArchiveSelected,
+        KeepArchivedSelected,
+        SelectAllChats,
+        Refresh,
+        Quit,
+        NextChat,
+        PrevChat,
+        FirstChat,
+        LastChat,
+        PageUpChats,
+        PageDownChats,
+        OpenChatSlot1,
+        OpenChatSlot2,
+        OpenChatSlot3,
+        OpenChatSlot4,
+        OpenChatSlot5,
+        OpenChatSlot6,
+        OpenChatSlot7,
+        OpenChatSlot8,
+        OpenChatSlot9,
+        SwitchCombinedInbox,
+        SwitchAccountView2,
+        SwitchAccountView3,
+        SwitchAccountView4,
+        SwitchAccountView5,
+        SwitchAccountView6,
+        SwitchAccountView7,
+        SwitchAccountView8,
+        SwitchAccountView9,
+        NextMessage,
+        PrevMessage,
+        PageUpMessages,
+        PageDownMessages,
+        JumpLatest,
+        ReplyToMessage,
+        OpenLinksAndMedia,
+        FocusComposer,
+        FontSmaller,
+        FontLarger,
+        FontReset,
+        MoveViewUp,
+        MoveViewDown,
+    ]
+);
 
-impl PostboxShell {
-    pub fn new() -> Self {
-        Self {
-            theme: ThemeChoice::default(),
-            view: ViewTab::CombinedInbox,
-        }
+fn gpui_action_for(action: PbAction) -> Option<Box<dyn GpuiAction>> {
+    match action {
+        PbAction::OpenPalette => Some(Box::new(OpenPalette)),
+        PbAction::ShowShortcutsHelp => Some(Box::new(ShowShortcutsHelp)),
+        PbAction::SearchChats => Some(Box::new(SearchChats)),
+        PbAction::ClearSearchOrBack => Some(Box::new(ClearSearchOrBack)),
+        PbAction::ToggleUnread => Some(Box::new(ToggleUnread)),
+        PbAction::ToggleArchived => Some(Box::new(ToggleArchived)),
+        PbAction::ArchiveSelected => Some(Box::new(ArchiveSelected)),
+        PbAction::KeepArchivedSelected => Some(Box::new(KeepArchivedSelected)),
+        PbAction::SelectAllChats => Some(Box::new(SelectAllChats)),
+        PbAction::Refresh => Some(Box::new(Refresh)),
+        PbAction::Quit => Some(Box::new(Quit)),
+        PbAction::NextChat => Some(Box::new(NextChat)),
+        PbAction::PrevChat => Some(Box::new(PrevChat)),
+        PbAction::FirstChat => Some(Box::new(FirstChat)),
+        PbAction::LastChat => Some(Box::new(LastChat)),
+        PbAction::PageUpChats => Some(Box::new(PageUpChats)),
+        PbAction::PageDownChats => Some(Box::new(PageDownChats)),
+        PbAction::OpenChatSlot(1) => Some(Box::new(OpenChatSlot1)),
+        PbAction::OpenChatSlot(2) => Some(Box::new(OpenChatSlot2)),
+        PbAction::OpenChatSlot(3) => Some(Box::new(OpenChatSlot3)),
+        PbAction::OpenChatSlot(4) => Some(Box::new(OpenChatSlot4)),
+        PbAction::OpenChatSlot(5) => Some(Box::new(OpenChatSlot5)),
+        PbAction::OpenChatSlot(6) => Some(Box::new(OpenChatSlot6)),
+        PbAction::OpenChatSlot(7) => Some(Box::new(OpenChatSlot7)),
+        PbAction::OpenChatSlot(8) => Some(Box::new(OpenChatSlot8)),
+        PbAction::OpenChatSlot(9) => Some(Box::new(OpenChatSlot9)),
+        PbAction::SwitchCombinedInbox => Some(Box::new(SwitchCombinedInbox)),
+        PbAction::SwitchAccountView(2) => Some(Box::new(SwitchAccountView2)),
+        PbAction::SwitchAccountView(3) => Some(Box::new(SwitchAccountView3)),
+        PbAction::SwitchAccountView(4) => Some(Box::new(SwitchAccountView4)),
+        PbAction::SwitchAccountView(5) => Some(Box::new(SwitchAccountView5)),
+        PbAction::SwitchAccountView(6) => Some(Box::new(SwitchAccountView6)),
+        PbAction::SwitchAccountView(7) => Some(Box::new(SwitchAccountView7)),
+        PbAction::SwitchAccountView(8) => Some(Box::new(SwitchAccountView8)),
+        PbAction::SwitchAccountView(9) => Some(Box::new(SwitchAccountView9)),
+        PbAction::NextMessage => Some(Box::new(NextMessage)),
+        PbAction::PrevMessage => Some(Box::new(PrevMessage)),
+        PbAction::PageUpMessages => Some(Box::new(PageUpMessages)),
+        PbAction::PageDownMessages => Some(Box::new(PageDownMessages)),
+        PbAction::JumpLatest => Some(Box::new(JumpLatest)),
+        PbAction::ReplyToMessage => Some(Box::new(ReplyToMessage)),
+        PbAction::OpenLinksAndMedia => Some(Box::new(OpenLinksAndMedia)),
+        PbAction::FocusComposer => Some(Box::new(FocusComposer)),
+        PbAction::FontSmaller => Some(Box::new(FontSmaller)),
+        PbAction::FontLarger => Some(Box::new(FontLarger)),
+        PbAction::FontReset => Some(Box::new(FontReset)),
+        PbAction::MoveViewUp => Some(Box::new(MoveViewUp)),
+        PbAction::MoveViewDown => Some(Box::new(MoveViewDown)),
+        _ => None,
     }
 }
 
-impl Default for PostboxShell {
-    fn default() -> Self {
-        Self::new()
+/// Registers all 6 bundled IBM Plex Sans & Mono TTF fonts with GPUI's text system.
+pub fn register_bundled_fonts(cx: &App) {
+    let fonts: Vec<Cow<'static, [u8]>> = vec![
+        Cow::Borrowed(include_bytes!("../../../assets/IBMPlexSans-Regular.ttf")),
+        Cow::Borrowed(include_bytes!("../../../assets/IBMPlexSans-Medium.ttf")),
+        Cow::Borrowed(include_bytes!("../../../assets/IBMPlexSans-SemiBold.ttf")),
+        Cow::Borrowed(include_bytes!("../../../assets/IBMPlexSans-Bold.ttf")),
+        Cow::Borrowed(include_bytes!("../../../assets/IBMPlexSans-Italic.ttf")),
+        Cow::Borrowed(include_bytes!("../../../assets/IBMPlexMono-Regular.ttf")),
+    ];
+    let _ = cx.text_system().add_fonts(fonts);
+}
+
+/// Translates `postbox-keymap` bindings (including `keymap.json` overrides) into GPUI `KeyBinding`s.
+pub fn bind_postbox_keys(cx: &mut App, keymap: &Keymap) {
+    let mut bindings = Vec::new();
+    for entry in keymap.bindings() {
+        let Some(action) = gpui_action_for(entry.action) else {
+            continue;
+        };
+        let predicate = KeyBindingContextPredicate::parse(entry.context.as_gpui_context())
+            .ok()
+            .map(Rc::new);
+        if let Ok(kb) = KeyBinding::load(&entry.stroke, action, predicate, false, None, cx) {
+            bindings.push(kb);
+        }
+    }
+    cx.bind_keys(bindings);
+}
+
+fn hsla_rgb(hex: u32) -> Hsla {
+    Hsla::from(rgb(hex))
+}
+
+/// Applies `ShadcnPalette` and `FontScale` to `gpui_kit::component::Theme`.
+/// Switches `ThemeMode` via `Theme::change` FIRST so `Theme::update` overrides are never clobbered.
+pub fn apply_postbox_theme(cx: &mut App, choice: ThemeChoice, scale: FontScale) {
+    let mode = match choice {
+        ThemeChoice::Light => ThemeMode::Light,
+        ThemeChoice::ZincDark | ThemeChoice::Amoled => ThemeMode::Dark,
+    };
+    if Theme::global(cx).mode != mode {
+        Theme::change(mode, None, cx);
+    }
+
+    let p = ShadcnPalette::for_choice(choice);
+    let body_px = scaled_px(BASE_FONT_PX, scale.percent());
+    let mono_px = scaled_px(13.0, scale.percent());
+
+    Theme::update(cx, |theme| {
+        theme.font_family = SharedString::from(FONT_SANS);
+        theme.mono_font_family = SharedString::from(FONT_MONO);
+        theme.font_size = px(body_px);
+        theme.mono_font_size = px(mono_px);
+        theme.radius = px(6.0);
+        theme.radius_lg = px(10.0);
+
+        let c = &mut theme.colors;
+        c.background = hsla_rgb(p.background);
+        c.foreground = hsla_rgb(p.foreground);
+        c.sidebar = hsla_rgb(p.sidebar);
+        c.sidebar_foreground = hsla_rgb(p.foreground);
+        c.sidebar_border = hsla_rgb(p.border);
+        c.sidebar_accent = hsla_rgb(p.accent);
+        c.sidebar_accent_foreground = hsla_rgb(p.foreground);
+        c.sidebar_primary = hsla_rgb(p.primary);
+        c.sidebar_primary_foreground = hsla_rgb(p.primary_foreground);
+        c.popover = hsla_rgb(p.popover);
+        c.popover_foreground = hsla_rgb(p.foreground);
+        c.primary = hsla_rgb(p.primary);
+        c.primary_foreground = hsla_rgb(p.primary_foreground);
+        c.secondary = hsla_rgb(p.secondary);
+        c.secondary_foreground = hsla_rgb(p.foreground);
+        c.muted = hsla_rgb(p.muted);
+        c.muted_foreground = hsla_rgb(p.muted_foreground);
+        c.accent = hsla_rgb(p.accent);
+        c.accent_foreground = hsla_rgb(p.foreground);
+        c.border = hsla_rgb(p.border);
+        c.input = hsla_rgb(p.border);
+        c.ring = hsla_rgb(p.ring);
+        c.danger = hsla_rgb(p.destructive);
+        c.list = hsla_rgb(p.sidebar);
+        c.list_active = hsla_rgb(p.accent);
+        c.list_active_border = hsla_rgb(p.border);
+        c.list_hover = hsla_rgb(p.muted);
+        c.selection = hsla_rgb(p.selection_fill);
+        c.caret = hsla_rgb(p.foreground);
+    });
+}
+
+fn provider_badge(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Whatsapp => "WA",
+        Provider::Slack => "SL",
+        Provider::Telegram => "TG",
+        Provider::Signal => "SG",
+    }
+}
+
+fn slot_kbd_badge(slot: u8) -> Kbd {
+    Kbd::new(Keystroke {
+        modifiers: Modifiers::none(),
+        key: slot.to_string(),
+        key_char: None,
+    })
+    .outline()
+}
+
+pub struct PostboxShell {
+    vm: PostboxViewModel,
+    started_at: Instant,
+    init_elapsed_ms: u128,
+    root_focus: FocusHandle,
+    sidebar_focus: FocusHandle,
+    message_list_focus: FocusHandle,
+    sidebar_scroll: VirtualListScrollHandle,
+    sidebar_item_sizes: Rc<Vec<Size<Pixels>>>,
+    sidebar_rows_cache: Vec<SidebarChatRow>,
+    timeline_state: Entity<MessageScrollerState>,
+    composer: Entity<TextareaState>,
+    palette_state: Entity<CommandState>,
+    last_window_title: String,
+    last_applied_theme: ThemeChoice,
+    last_applied_scale: FontScale,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl PostboxShell {
+    pub fn new(ctx: PostboxLaunchContext, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let started_at = ctx.started_at;
+        let vm = PostboxViewModel::new(ctx.store, ctx.keymap, ctx.version);
+        Self::from_view_model(vm, started_at, window, cx)
+    }
+
+    pub fn from_view_model(
+        vm: PostboxViewModel,
+        started_at: Instant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let initial_theme = vm.theme();
+        let initial_scale = vm.font_scale();
+        let initial_title = vm.window_title();
+        let initial_timeline_len = vm.timeline_items().len();
+        let sidebar_rows_cache = vm.sidebar_rows();
+        let row_h = vm.row_geometry().height;
+        let sidebar_item_sizes = Rc::new(vec![
+            size(px(SIDEBAR_WIDTH_PX), px(row_h));
+            sidebar_rows_cache.len()
+        ]);
+
+        let root_focus = cx.focus_handle();
+        let sidebar_focus = cx.focus_handle();
+        let message_list_focus = cx.focus_handle();
+        sidebar_focus.focus(window, cx);
+
+        let timeline_state = cx.new(|cx| MessageScrollerState::new(initial_timeline_len, cx));
+        let composer = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 6)
+                .submit_on_enter(true)
+                .placeholder("Write a message... (Ctrl+K for commands)")
+        });
+        let palette_state = cx.new(|cx| CommandState::new(window, cx));
+
+        let composer_sub = cx.subscribe_in(
+            &composer,
+            window,
+            |this: &mut Self, state: &Entity<TextareaState>, event: &InputEvent, window, cx| {
+                match event {
+                    InputEvent::Change => {
+                        let value = state.read(cx).value().to_string();
+                        this.vm.set_composer_text(value);
+                        this.sync_sidebar_cache();
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { shift, .. } if !shift => {
+                        if this.vm.submit_composer_message() {
+                            state.update(cx, |input, cx| input.clean(window, cx));
+                            this.sync_after_vm_change(window, cx);
+                        }
+                    }
+                    InputEvent::Focus => {
+                        this.vm.set_composer_focused(true);
+                        cx.notify();
+                    }
+                    InputEvent::Blur => {
+                        this.vm.set_composer_focused(false);
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+            },
+        );
+
+        let activation_sub = cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() && this.vm.on_window_blur() {
+                this.sync_sidebar_cache();
+                cx.notify();
+            }
+        });
+
+        window.set_window_title(&initial_title);
+        let init_elapsed_ms = started_at.elapsed().as_millis();
+
+        Self {
+            vm,
+            started_at,
+            init_elapsed_ms,
+            root_focus,
+            sidebar_focus,
+            message_list_focus,
+            sidebar_scroll: VirtualListScrollHandle::new(),
+            sidebar_item_sizes,
+            sidebar_rows_cache,
+            timeline_state,
+            composer,
+            palette_state,
+            last_window_title: initial_title,
+            last_applied_theme: initial_theme,
+            last_applied_scale: initial_scale,
+            _subscriptions: vec![composer_sub, activation_sub],
+        }
+    }
+
+    pub fn view_model(&self) -> &PostboxViewModel {
+        &self.vm
+    }
+
+    pub fn init_elapsed_ms(&self) -> u128 {
+        self.init_elapsed_ms
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+
+    fn sync_sidebar_cache(&mut self) {
+        self.sidebar_rows_cache = self.vm.sidebar_rows();
+        let row_h = self.vm.row_geometry().height;
+        self.sidebar_item_sizes = Rc::new(vec![
+            size(px(SIDEBAR_WIDTH_PX), px(row_h));
+            self.sidebar_rows_cache.len()
+        ]);
+    }
+
+    fn sync_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.vm.focus() {
+            FocusTarget::ChatList => self.sidebar_focus.focus(window, cx),
+            FocusTarget::MessageList => self.message_list_focus.focus(window, cx),
+            FocusTarget::Composer => self
+                .composer
+                .update(cx, |input, cx| input.focus(window, cx)),
+            FocusTarget::Palette => self
+                .palette_state
+                .update(cx, |state, cx| state.focus(window, cx)),
+            FocusTarget::ShortcutsOverlay => self.root_focus.focus(window, cx),
+        }
+    }
+
+    fn sync_after_vm_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let theme = self.vm.theme();
+        let scale = self.vm.font_scale();
+        let scale_changed = scale != self.last_applied_scale;
+        if theme != self.last_applied_theme || scale_changed {
+            apply_postbox_theme(cx, theme, scale);
+            self.last_applied_theme = theme;
+            self.last_applied_scale = scale;
+            if scale_changed {
+                self.timeline_state.update(cx, |s, cx| s.remeasure(cx));
+            }
+        }
+
+        self.sync_sidebar_cache();
+        if let Some(sel) = self.vm.selected_chat_idx() {
+            self.sidebar_scroll
+                .scroll_to_item(sel, ScrollStrategy::Nearest);
+        }
+
+        let new_timeline_len = self.vm.timeline_items().len();
+        let scroll_latest = self.vm.take_scroll_to_latest_pending();
+        let current_len = self.timeline_state.read(cx).item_count();
+        if current_len != new_timeline_len || scroll_latest {
+            self.timeline_state.update(cx, |state, cx| {
+                state.reset(new_timeline_len, cx);
+                if scroll_latest {
+                    state.scroll_to_end(cx);
+                }
+            });
+        }
+
+        // Sync composer text if chat switched
+        let wanted_composer = self.vm.composer_text().to_owned();
+        if self.composer.read(cx).value().as_ref() != wanted_composer.as_str() {
+            self.composer.update(cx, |input, cx| {
+                input.set_value(wanted_composer, window, cx);
+            });
+        }
+
+        self.sync_focus(window, cx);
+
+        let title = self.vm.window_title();
+        if title != self.last_window_title {
+            window.set_window_title(&title);
+            self.last_window_title = title;
+        }
+
+        if self.vm.quit_requested() {
+            cx.quit();
+        }
+
+        cx.notify();
+    }
+
+    fn open_palette_mode(
+        &mut self,
+        mode: PaletteMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match mode {
+            PaletteMode::Normal => self.vm.open_palette(),
+            PaletteMode::SearchChats => self.vm.open_search_palette(),
+            PaletteMode::SortViews => self.vm.open_sort_views_palette(),
+            PaletteMode::Links => self.vm.open_links_palette(),
+        }
+        self.palette_state.update(cx, |state, cx| {
+            state.set_query("", window, cx);
+        });
+        self.sync_after_vm_change(window, cx);
+    }
+
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.vm.close_palette();
+        self.sync_after_vm_change(window, cx);
+    }
+
+    fn execute_palette_index(
+        &mut self,
+        index: IndexPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.vm
+            .execute_palette_section_row(index.section, index.row);
+        if self.vm.palette_open() {
+            self.palette_state.update(cx, |state, cx| {
+                state.set_query("", window, cx);
+            });
+        }
+        self.sync_after_vm_change(window, cx);
+    }
+
+    fn dispatch_vm_action(
+        &mut self,
+        action: PbAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.vm.reset_chords();
+        match action {
+            PbAction::OpenPalette => self.open_palette_mode(PaletteMode::Normal, window, cx),
+            PbAction::SearchChats => self.open_palette_mode(PaletteMode::SearchChats, window, cx),
+            PbAction::OpenLinksAndMedia => self.open_palette_mode(PaletteMode::Links, window, cx),
+            PbAction::MoveViewUp | PbAction::MoveViewDown => {
+                let moved = if matches!(action, PbAction::MoveViewUp) {
+                    self.vm.palette_move_view_up()
+                } else {
+                    self.vm.palette_move_view_down()
+                };
+                if moved
+                    && self.palette_state.read(cx).matched_count() > 0
+                    && let Some((section, row)) = self.vm.palette_selected_section_row()
+                {
+                    let target = IndexPath::new(row).section(section);
+                    self.palette_state.update(cx, |state, cx| {
+                        state.set_selected_index(Some(target), window, cx);
+                    });
+                }
+                self.sync_after_vm_change(window, cx);
+            }
+            other => {
+                let now = self.now_ms();
+                self.vm.handle_action(other, now);
+                self.sync_after_vm_change(window, cx);
+            }
+        }
+    }
+
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        let mods = event.keystroke.modifiers;
+        let now = self.now_ms();
+
+        // Alt+G, Alt+G jump-to-latest chord
+        if mods.alt
+            && !mods.control
+            && !mods.shift
+            && !mods.platform
+            && key.eq_ignore_ascii_case("g")
+        {
+            self.vm.reset_inbox_chord();
+            self.vm.handle_alt_g(now, event.is_held);
+            self.sync_after_vm_change(window, cx);
+            return;
+        }
+
+        // Any non-Alt+G keydown resets the Alt+G double-tap chord.
+        self.vm.reset_latest_chord();
+
+        // G then I combined inbox chord (unmodified single char outside text inputs/overlays).
+        // Any modified key or multi-char named key (tab, enter, arrows, etc.) resets it.
+        let mods_active = mods.control || mods.alt || mods.platform || mods.shift;
+        if !mods_active && key.len() == 1 {
+            if let Some(ch) = key.chars().next()
+                && self
+                    .vm
+                    .handle_inbox_chord_key(ch, now, event.is_held, false)
+            {
+                self.sync_after_vm_change(window, cx);
+            }
+        } else {
+            self.vm.reset_inbox_chord();
+        }
+    }
+
+    fn render_view_rail(&self, p: &ShadcnPalette, cx: &mut Context<Self>) -> AnyElement {
+        let active_is_inbox = matches!(
+            self.vm.active_view(),
+            Some(postbox_core::ViewTab::CombinedInbox)
+        );
+        let accounts = self.vm.accounts().to_vec();
+        let active_view_key = self
+            .vm
+            .active_view()
+            .map(postbox_core::ViewTab::view_key)
+            .unwrap_or_default();
+
+        let mut rail = div()
+            .id("view-rail")
+            .test_support()
+            .w(px(VIEW_RAIL_WIDTH_PX))
+            .h_full()
+            .bg(rgb(p.sidebar))
+            .border_r_1()
+            .border_color(rgb(p.border))
+            .flex()
+            .flex_col()
+            .items_center()
+            .py_3()
+            .gap_2()
+            .child(
+                div()
+                    .id("view-tab-inbox")
+                    .test_support()
+                    .w(px(34.0))
+                    .h(px(34.0))
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(TYPE_LABEL_PX))
+                    .bg(rgb(if active_is_inbox {
+                        p.primary
+                    } else {
+                        p.secondary
+                    }))
+                    .text_color(rgb(if active_is_inbox {
+                        p.primary_foreground
+                    } else {
+                        p.foreground
+                    }))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.vm.switch_to_combined_inbox();
+                        this.sync_after_vm_change(window, cx);
+                    }))
+                    .child("All"),
+            );
+
+        for (idx, account) in accounts.into_iter().enumerate() {
+            let key = account.view_key();
+            let is_active = key == active_view_key;
+            let badge = provider_badge(account.provider);
+            let element_id = SharedString::from(format!("view-tab-{}", idx + 2));
+            rail = rail.child(
+                div()
+                    .id(element_id)
+                    .test_support()
+                    .w(px(34.0))
+                    .h(px(34.0))
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(TYPE_LABEL_PX))
+                    .bg(rgb(if is_active { p.primary } else { p.secondary }))
+                    .text_color(rgb(if is_active {
+                        p.primary_foreground
+                    } else {
+                        p.foreground
+                    }))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.vm.switch_to_view_key(&key);
+                        this.sync_after_vm_change(window, cx);
+                    }))
+                    .child(badge),
+            );
+        }
+
+        rail.into_any_element()
+    }
+
+    fn render_chat_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(row) = self.sidebar_rows_cache.get(ix) else {
+            return div().into_any_element();
+        };
+        let p = ShadcnPalette::for_choice(self.vm.theme());
+        let geom = self.vm.row_geometry();
+
+        let row_bg = if row.active { p.accent } else { p.sidebar };
+        let title_color = if row.chat.is_archived() {
+            archived_row_color(p.foreground, row_bg)
+        } else {
+            p.foreground
+        };
+        let preview_color = if row.draft_preview.is_some() {
+            p.draft_color(row_bg)
+        } else if row.chat.is_archived() {
+            archived_text_color(p.muted_foreground, row_bg)
+        } else {
+            p.muted_foreground
+        };
+        let preview_text = row
+            .draft_preview
+            .clone()
+            .unwrap_or_else(|| row.chat.last_msg_preview.clone());
+
+        let mut top_line = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_1()
+            .w_full()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .flex_1()
+                    .overflow_hidden()
+                    .when_some(row.slot_badge, |el, slot| {
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("ctrl-badge-{slot}")))
+                                .test_support()
+                                .child(slot_kbd_badge(slot)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(geom.name_font_px))
+                            .text_color(rgb(title_color))
+                            .truncate()
+                            .child(row.chat.title.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(geom.time_font_px))
+                    .text_color(rgb(p.muted_foreground))
+                    .child(format_time_hm(&row.chat.last_msg_ts)),
+            );
+
+        if row.chat.pinned {
+            top_line = top_line.child(
+                div()
+                    .text_size(px(TYPE_LABEL_PX))
+                    .text_color(rgb(p.muted_foreground))
+                    .child("Pin"),
+            );
+        }
+
+        let mut bottom_line = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .w_full()
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(geom.preview_font_px))
+                    .text_color(rgb(preview_color))
+                    .truncate()
+                    .child(preview_text),
+            );
+
+        if row.chat.is_archived() {
+            bottom_line = bottom_line.child(
+                div()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_sm()
+                    .bg(rgb(p.muted))
+                    .text_size(px(TYPE_LABEL_PX))
+                    .text_color(rgb(p.muted_foreground))
+                    .child("Archived"),
+            );
+        }
+
+        if row.chat.unread_count > 0 {
+            bottom_line = bottom_line.child(
+                div()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_full()
+                    .bg(rgb(p.primary))
+                    .text_size(px(TYPE_LABEL_PX))
+                    .text_color(rgb(p.primary_foreground))
+                    .child(row.chat.unread_count.to_string()),
+            );
+        }
+
+        div()
+            .id(SharedString::from(format!("chat-row-{ix}")))
+            .test_support()
+            .w_full()
+            .h(px(geom.height))
+            .px_3()
+            .py(px(geom.padding))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .bg(rgb(row_bg))
+            .border_b_1()
+            .border_color(rgb(if row.bulk_selected { p.ring } else { p.border }))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.vm.select_chat_index(ix);
+                this.vm.set_focus(FocusTarget::ChatList);
+                this.sync_after_vm_change(window, cx);
+            }))
+            .child(top_line)
+            .child(bottom_line)
+            .into_any_element()
+    }
+
+    fn render_timeline_row(&self, ix: usize) -> AnyElement {
+        let Some(item) = self.vm.timeline_items().get(ix) else {
+            return div().into_any_element();
+        };
+        let p = ShadcnPalette::for_choice(self.vm.theme());
+        let scale = self.vm.font_scale().percent();
+        let body_px = scaled_px(BASE_FONT_PX, scale);
+        let time_px = scaled_px(TYPE_TIME_PX, scale);
+        let label_px = scaled_px(TYPE_LABEL_PX, scale);
+
+        match item {
+            TimelineItem::DateDivider { date_label } => div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .py_2()
+                .child(
+                    div()
+                        .px_2p5()
+                        .py_0p5()
+                        .rounded_full()
+                        .bg(rgb(p.muted))
+                        .border_1()
+                        .border_color(rgb(p.border))
+                        .text_size(px(label_px))
+                        .text_color(rgb(p.muted_foreground))
+                        .child(date_label.clone()),
+                )
+                .into_any_element(),
+
+            TimelineItem::MessageRow {
+                message,
+                grouped_with_prev,
+                selected,
+                marked,
+                ..
+            } => {
+                let bubble_bg = if message.from_me {
+                    p.bubble_outgoing
+                } else {
+                    p.bubble_incoming
+                };
+                let bubble_fg = if message.from_me {
+                    p.bubble_outgoing_foreground
+                } else {
+                    p.foreground
+                };
+                let bubble_meta = if message.from_me {
+                    p.bubble_outgoing_muted
+                } else {
+                    p.muted_foreground
+                };
+
+                let mut bubble = div()
+                    .max_w(px(620.0))
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .bg(rgb(bubble_bg))
+                    .border_1()
+                    .border_color(rgb(if *selected { p.ring } else { p.border }))
+                    .flex()
+                    .flex_col()
+                    .gap_1();
+
+                if !grouped_with_prev && !message.from_me {
+                    bubble = bubble.child(
+                        div()
+                            .text_size(px(label_px))
+                            .text_color(rgb(bubble_meta))
+                            .child(message.sender_name.clone()),
+                    );
+                }
+
+                if let Some(reply_id) = &message.reply_to_id {
+                    bubble = bubble.child(
+                        div()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_sm()
+                            .bg(rgb(p.secondary))
+                            .text_size(px(label_px))
+                            .text_color(rgb(p.muted_foreground))
+                            .child(format!("Replying to {reply_id}")),
+                    );
+                }
+
+                let body_text = if message.deleted {
+                    "Message deleted".to_owned()
+                } else {
+                    message.body.clone()
+                };
+
+                bubble = bubble
+                    .child(
+                        div()
+                            .text_size(px(body_px))
+                            .text_color(rgb(bubble_fg))
+                            .child(body_text),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .text_size(px(time_px))
+                            .text_color(rgb(bubble_meta))
+                            .when(*marked, |el| el.child("Marked"))
+                            .child(format_time_hm(&message.ts)),
+                    );
+
+                let row_wrapper = div()
+                    .w_full()
+                    .max_w(px(CHAT_COLUMN_MAX_WIDTH_PX))
+                    .mx_auto()
+                    .px_4()
+                    .pt(px(if *grouped_with_prev { 2.0 } else { 8.0 }))
+                    .pb(px(2.0))
+                    .flex()
+                    .when(message.from_me, |el| el.justify_end())
+                    .when(!message.from_me, |el| el.justify_start())
+                    .child(bubble);
+
+                row_wrapper.into_any_element()
+            }
+        }
+    }
+
+    fn render_palette_overlay(&self, p: &ShadcnPalette, cx: &mut Context<Self>) -> AnyElement {
+        let shell_query = cx.entity();
+        let shell_select = cx.entity();
+        let shell_confirm = cx.entity();
+
+        let mut cmd = Command::new(&self.palette_state)
+            .filterable(false)
+            .placeholder(self.vm.palette_placeholder())
+            .max_h(px(380.0))
+            .on_query(move |query, _window, cx| {
+                shell_query.update(cx, |this, cx| {
+                    this.vm.set_palette_query(query);
+                    this.sync_sidebar_cache();
+                    cx.notify();
+                });
+            })
+            .on_select(move |index: IndexPath, _window, cx| {
+                shell_select.update(cx, |this, _cx| {
+                    this.vm.select_palette_section_row(index.section, index.row);
+                });
+            })
+            .on_confirm(move |index: IndexPath, window, cx| {
+                shell_confirm.update(cx, |this, cx| {
+                    this.execute_palette_index(index, window, cx);
+                });
+            });
+
+        for section in self.vm.palette_sections() {
+            let mut group = CommandGroup::new().label(section.heading);
+            for entry in section.items {
+                let label = if let Some(shortcut) = &entry.shortcut {
+                    format!("{}  [{}]", entry.label, shortcut)
+                } else {
+                    entry.label
+                };
+                group = group.item(CommandItem::new().label(label));
+            }
+            cmd = cmd.group(group);
+        }
+
+        div()
+            .id("command-palette-backdrop")
+            .test_support()
+            .key_context("PostboxPalette")
+            .absolute()
+            .inset_0()
+            .bg(hsla(0.0, 0.0, 0.0, 0.55))
+            .flex()
+            .items_start()
+            .justify_center()
+            .pt(px(72.0))
+            .on_action(cx.listener(|this, _: &Cancel, window, cx| {
+                this.close_palette(window, cx);
+            }))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.close_palette(window, cx);
+            }))
+            .child(
+                div()
+                    .id("command-palette-overlay")
+                    .test_support()
+                    .w(px(580.0))
+                    .rounded_lg()
+                    .bg(rgb(p.popover))
+                    .border_1()
+                    .border_color(rgb(p.border))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(cmd),
+            )
+            .into_any_element()
+    }
+
+    fn render_shortcuts_overlay(&self, p: &ShadcnPalette, cx: &mut Context<Self>) -> AnyElement {
+        let groups = f1_shortcut_groups();
+        let left_groups = &groups[..3];
+        let right_groups = &groups[3..];
+
+        let render_column = |col_groups: &[postbox_keymap::ShortcutGroup]| {
+            let mut col = div().flex_1().flex().flex_col().gap_4();
+            for group in col_groups {
+                let mut card = div().flex().flex_col().gap_1p5().child(
+                    div()
+                        .text_size(px(TYPE_CHAT_NAME_PX))
+                        .text_color(rgb(p.foreground))
+                        .pb_1()
+                        .border_b_1()
+                        .border_color(rgb(p.border))
+                        .child(group.name),
+                );
+                for item in group.items {
+                    card = card.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .py_0p5()
+                            .child(
+                                div()
+                                    .text_size(px(TYPE_TIME_PX))
+                                    .text_color(rgb(p.muted_foreground))
+                                    .child(item.desc),
+                            )
+                            .child(
+                                div()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .bg(rgb(p.muted))
+                                    .border_1()
+                                    .border_color(rgb(p.border))
+                                    .font_family(FONT_MONO)
+                                    .text_size(px(TYPE_LABEL_PX))
+                                    .text_color(rgb(p.foreground))
+                                    .child(item.key),
+                            ),
+                    );
+                }
+                col = col.child(card);
+            }
+            col
+        };
+
+        div()
+            .id("f1-shortcuts-backdrop")
+            .test_support()
+            .absolute()
+            .inset_0()
+            .bg(hsla(0.0, 0.0, 0.0, 0.55))
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_6()
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.vm.close_shortcuts();
+                this.sync_after_vm_change(window, cx);
+            }))
+            .child(
+                div()
+                    .id("f1-shortcuts-modal")
+                    .test_support()
+                    .w(px(860.0))
+                    .max_h(px(640.0))
+                    .rounded_lg()
+                    .bg(rgb(p.popover))
+                    .border_1()
+                    .border_color(rgb(p.border))
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(18.0))
+                                    .text_color(rgb(p.foreground))
+                                    .child("Keyboard Shortcuts"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(TYPE_TIME_PX))
+                                    .text_color(rgb(p.muted_foreground))
+                                    .child("Press Esc or F1 to close"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_6()
+                            .child(render_column(left_groups))
+                            .child(render_column(right_groups)),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+impl Focusable for PostboxShell {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.root_focus.clone()
     }
 }
 
 impl Render for PostboxShell {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let palette = ShadcnPalette::for_choice(self.theme);
-        let title = self.view.window_title(env!("CARGO_PKG_VERSION"));
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = self.vm.window_title();
+        if title != self.last_window_title {
+            window.set_window_title(&title);
+            self.last_window_title = title;
+        }
 
-        div()
+        let p = ShadcnPalette::for_choice(self.vm.theme());
+        let shell_for_timeline = cx.entity();
+
+        let sidebar_pane = div()
+            .id("chat-sidebar")
+            .test_support()
+            .track_focus(&self.sidebar_focus)
+            .key_context("PostboxChatList")
+            .w(px(SIDEBAR_WIDTH_PX))
+            .h_full()
+            .bg(rgb(p.sidebar))
+            .border_r_1()
+            .border_color(rgb(p.border))
             .flex()
-            .size_full()
-            .bg(rgb(palette.background))
-            .text_color(rgb(palette.foreground))
-            .child(
-                div()
-                    .w(px(300.0))
-                    .h_full()
-                    .bg(rgb(palette.sidebar))
-                    .border_r_1()
-                    .border_color(rgb(palette.border))
-                    .p_3()
-                    .child(title),
-            )
-            .child(
+            .flex_col()
+            .child(if self.sidebar_rows_cache.is_empty() {
                 div()
                     .flex_1()
-                    .h_full()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_color(rgb(palette.muted_foreground))
-                    .child("Press Ctrl+K to open the Postbox command palette"),
+                    .p_4()
+                    .text_size(px(TYPE_TIME_PX))
+                    .text_color(rgb(p.muted_foreground))
+                    .child("No chats in this view. Press Ctrl+K for commands.")
+                    .into_any_element()
+            } else {
+                v_virtual_list(
+                    cx.entity(),
+                    "chat-sidebar-list",
+                    self.sidebar_item_sizes.clone(),
+                    |this, visible_range, _window, cx| {
+                        visible_range
+                            .map(|ix| this.render_chat_row(ix, cx))
+                            .collect()
+                    },
+                )
+                .track_scroll(&self.sidebar_scroll)
+                .flex_1()
+                .w_full()
+                .into_any_element()
+            });
+
+        let timeline_pane = if self.vm.timeline_items().is_empty() {
+            div()
+                .id("message-timeline-empty")
+                .test_support()
+                .flex_1()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(p.muted_foreground))
+                .child("Press Ctrl+K to open the command palette or F1 for shortcuts")
+                .into_any_element()
+        } else {
+            MessageScroller::new(
+                "message-timeline",
+                self.timeline_state.clone(),
+                move |ix, _window, cx| shell_for_timeline.read(cx).render_timeline_row(ix),
             )
+            .flex_1()
+            .w_full()
+            .with_bottom_fade(rgb(p.background))
+            .into_any_element()
+        };
+
+        let mut composer_section = div()
+            .id("composer-container")
+            .test_support()
+            .key_context(if self.vm.composer_text().is_empty() {
+                "PostboxComposerEmpty"
+            } else {
+                "PostboxComposer"
+            })
+            .w_full()
+            .max_w(px(CHAT_COLUMN_MAX_WIDTH_PX))
+            .mx_auto()
+            .px_4()
+            .py_3()
+            .flex()
+            .flex_col()
+            .gap_1p5();
+
+        if let Some(reply_id) = self.vm.reply_to_msg_id() {
+            composer_section = composer_section.child(
+                div()
+                    .px_2p5()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(p.secondary))
+                    .border_1()
+                    .border_color(rgb(p.border))
+                    .text_size(px(TYPE_LABEL_PX))
+                    .text_color(rgb(p.muted_foreground))
+                    .child(format!("Replying to {reply_id} (Esc to cancel)")),
+            );
+        }
+
+        composer_section = composer_section.child(
+            Textarea::new(&self.composer)
+                .aria_label("Message composer")
+                .bordered(true),
+        );
+
+        let main_column = div()
+            .id("chat-main-column")
+            .test_support()
+            .track_focus(&self.message_list_focus)
+            .key_context("PostboxMessageList")
+            .flex_1()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(p.background))
+            .child(timeline_pane)
+            .child(
+                div()
+                    .w_full()
+                    .border_t_1()
+                    .border_color(rgb(p.border))
+                    .bg(rgb(p.card))
+                    .child(composer_section),
+            );
+
+        // ZERO TOOLBAR: Root container holds only View Rail + Virtualized Sidebar + Timeline/Composer + Overlays.
+        let mut root = div()
+            .id("postbox-root")
+            .test_support()
+            .track_focus(&self.root_focus)
+            .key_context("PostboxWorkspace")
+            .relative()
+            .flex()
+            .flex_row()
+            .size_full()
+            .bg(rgb(p.background))
+            .text_color(rgb(p.foreground))
+            .font_family(FONT_SANS)
+            .on_modifiers_changed(cx.listener(
+                |this, event: &ModifiersChangedEvent, _window, cx| {
+                    let ctrl_only = event.modifiers.control
+                        && !event.modifiers.alt
+                        && !event.modifiers.shift
+                        && !event.modifiers.platform;
+                    let changed = if ctrl_only {
+                        this.vm.on_ctrl_down()
+                    } else {
+                        this.vm.on_ctrl_up()
+                    };
+                    if changed {
+                        this.sync_sidebar_cache();
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_key_down(cx.listener(Self::handle_key_down))
+            .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
+                this.dispatch_vm_action(PbAction::OpenPalette, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShowShortcutsHelp, window, cx| {
+                this.dispatch_vm_action(PbAction::ShowShortcutsHelp, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SearchChats, window, cx| {
+                this.dispatch_vm_action(PbAction::SearchChats, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ClearSearchOrBack, window, cx| {
+                this.dispatch_vm_action(PbAction::ClearSearchOrBack, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleUnread, window, cx| {
+                this.dispatch_vm_action(PbAction::ToggleUnread, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleArchived, window, cx| {
+                this.dispatch_vm_action(PbAction::ToggleArchived, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ArchiveSelected, window, cx| {
+                this.dispatch_vm_action(PbAction::ArchiveSelected, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &KeepArchivedSelected, window, cx| {
+                this.dispatch_vm_action(PbAction::KeepArchivedSelected, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectAllChats, window, cx| {
+                this.dispatch_vm_action(PbAction::SelectAllChats, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &Refresh, window, cx| {
+                this.dispatch_vm_action(PbAction::Refresh, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &Quit, window, cx| {
+                this.dispatch_vm_action(PbAction::Quit, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextChat, window, cx| {
+                this.dispatch_vm_action(PbAction::NextChat, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrevChat, window, cx| {
+                this.dispatch_vm_action(PbAction::PrevChat, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FirstChat, window, cx| {
+                this.dispatch_vm_action(PbAction::FirstChat, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &LastChat, window, cx| {
+                this.dispatch_vm_action(PbAction::LastChat, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PageUpChats, window, cx| {
+                this.dispatch_vm_action(PbAction::PageUpChats, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PageDownChats, window, cx| {
+                this.dispatch_vm_action(PbAction::PageDownChats, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenChatSlot1, window, cx| {
+                this.dispatch_vm_action(PbAction::OpenChatSlot(1), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenChatSlot2, window, cx| {
+                this.dispatch_vm_action(PbAction::OpenChatSlot(2), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenChatSlot3, window, cx| {
+                this.dispatch_vm_action(PbAction::OpenChatSlot(3), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenChatSlot4, window, cx| {
+                this.dispatch_vm_action(PbAction::OpenChatSlot(4), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenChatSlot5, window, cx| {
+                this.dispatch_vm_action(PbAction::OpenChatSlot(5), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenChatSlot6, window, cx| {
+                this.dispatch_vm_action(PbAction::OpenChatSlot(6), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenChatSlot7, window, cx| {
+                this.dispatch_vm_action(PbAction::OpenChatSlot(7), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenChatSlot8, window, cx| {
+                this.dispatch_vm_action(PbAction::OpenChatSlot(8), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenChatSlot9, window, cx| {
+                this.dispatch_vm_action(PbAction::OpenChatSlot(9), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitchCombinedInbox, window, cx| {
+                this.dispatch_vm_action(PbAction::SwitchCombinedInbox, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitchAccountView2, window, cx| {
+                this.dispatch_vm_action(PbAction::SwitchAccountView(2), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitchAccountView3, window, cx| {
+                this.dispatch_vm_action(PbAction::SwitchAccountView(3), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitchAccountView4, window, cx| {
+                this.dispatch_vm_action(PbAction::SwitchAccountView(4), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitchAccountView5, window, cx| {
+                this.dispatch_vm_action(PbAction::SwitchAccountView(5), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitchAccountView6, window, cx| {
+                this.dispatch_vm_action(PbAction::SwitchAccountView(6), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitchAccountView7, window, cx| {
+                this.dispatch_vm_action(PbAction::SwitchAccountView(7), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitchAccountView8, window, cx| {
+                this.dispatch_vm_action(PbAction::SwitchAccountView(8), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitchAccountView9, window, cx| {
+                this.dispatch_vm_action(PbAction::SwitchAccountView(9), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextMessage, window, cx| {
+                this.dispatch_vm_action(PbAction::NextMessage, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrevMessage, window, cx| {
+                this.dispatch_vm_action(PbAction::PrevMessage, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PageUpMessages, window, cx| {
+                this.dispatch_vm_action(PbAction::PageUpMessages, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PageDownMessages, window, cx| {
+                this.dispatch_vm_action(PbAction::PageDownMessages, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JumpLatest, window, cx| {
+                this.dispatch_vm_action(PbAction::JumpLatest, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ReplyToMessage, window, cx| {
+                this.dispatch_vm_action(PbAction::ReplyToMessage, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenLinksAndMedia, window, cx| {
+                this.dispatch_vm_action(PbAction::OpenLinksAndMedia, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
+                this.dispatch_vm_action(PbAction::FocusComposer, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FontSmaller, window, cx| {
+                this.dispatch_vm_action(PbAction::FontSmaller, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FontLarger, window, cx| {
+                this.dispatch_vm_action(PbAction::FontLarger, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FontReset, window, cx| {
+                this.dispatch_vm_action(PbAction::FontReset, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveViewUp, window, cx| {
+                this.dispatch_vm_action(PbAction::MoveViewUp, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveViewDown, window, cx| {
+                this.dispatch_vm_action(PbAction::MoveViewDown, window, cx);
+            }))
+            .child(self.render_view_rail(&p, cx))
+            .child(sidebar_pane)
+            .child(main_column);
+
+        if self.vm.palette_open() {
+            root = root.child(self.render_palette_overlay(&p, cx));
+        } else if self.vm.shortcuts_open() {
+            root = root.child(self.render_shortcuts_overlay(&p, cx));
+        }
+
+        root
     }
 }
 
-pub fn run_desktop() {
-    gpui_kit::application().run(|cx| {
-        gpui_kit::init(cx);
-        gpui_kit::open_window(WindowOptions::default(), cx, |_window, cx| {
-            cx.new(|_cx| PostboxShell::new())
+/// Launches the real GPUI + `gpui-kit 0.11.0` desktop window with the provided launch context.
+pub fn run_desktop(launch_ctx: PostboxLaunchContext) {
+    let settings = launch_ctx.store.load_ui_settings().unwrap_or_default();
+    let initial_title = postbox_core::ViewTab::CombinedInbox.window_title(&launch_ctx.version);
+
+    gpui_kit::application()
+        .with_assets(Assets)
+        .run(move |cx: &mut App| {
+            gpui_kit::init(cx);
+            register_bundled_fonts(cx);
+            bind_postbox_keys(cx, &launch_ctx.keymap);
+            apply_postbox_theme(cx, settings.theme, settings.font_scale);
+
+            let options = WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some(initial_title.clone().into()),
+                    ..Default::default()
+                }),
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size: size(px(1240.0), px(820.0)),
+                })),
+                app_id: Some("postbox".to_owned()),
+                ..Default::default()
+            };
+
+            gpui_kit::open_window(options, cx, move |window, cx| {
+                window.set_window_title(&initial_title);
+                cx.new(|cx| PostboxShell::new(launch_ctx, window, cx))
+            })
+            .expect("failed to open Postbox window");
+        });
+}
+
+#[cfg(all(test, feature = "desktop-test"))]
+mod desktop_tests {
+    use super::*;
+    use gpui_kit::base::Root;
+    use gpui_kit::test::{TestEventExt as _, TestWindowExt as _};
+    use gpui_kit::{TestAppContext, WindowHandle};
+    use postbox_core::{Account, Chat, ChatKey, Message, ReadStatus};
+    use postbox_store::Store;
+
+    fn seeded_launch_ctx() -> PostboxLaunchContext {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .upsert_account(&Account {
+                provider: Provider::Whatsapp,
+                account_id: "main".into(),
+                label: "WhatsApp".into(),
+                state: "connected".into(),
+                sort_order: 1,
+                last_event_at: None,
+            })
+            .unwrap();
+        store
+            .upsert_account(&Account {
+                provider: Provider::Slack,
+                account_id: "T1".into(),
+                label: "Acme Slack".into(),
+                state: "connected".into(),
+                sort_order: 2,
+                last_event_at: None,
+            })
+            .unwrap();
+        let alice = Chat {
+            key: ChatKey::new(Provider::Whatsapp, "main", "alice@s.whatsapp.net"),
+            title: "Alice".into(),
+            is_group: false,
+            archived_local: false,
+            archived_remote: false,
+            pinned: false,
+            unread_count: 1,
+            last_msg_ts: "2025-01-15T12:00:00Z".into(),
+            last_msg_preview: "Hello from Alice".into(),
+            avatar_hash: None,
+        };
+        let bob = Chat {
+            key: ChatKey::new(Provider::Slack, "T1", "C-bob"),
+            title: "Bob".into(),
+            is_group: false,
+            archived_local: false,
+            archived_remote: false,
+            pinned: false,
+            unread_count: 0,
+            last_msg_ts: "2025-01-15T11:00:00Z".into(),
+            last_msg_preview: "Hello from Bob".into(),
+            avatar_hash: None,
+        };
+        store.upsert_chat(&alice, 100).unwrap();
+        store.upsert_chat(&bob, 90).unwrap();
+        store
+            .upsert_message(&Message {
+                chat: alice.key,
+                msg_id: "m1".into(),
+                sender_id: "alice".into(),
+                sender_name: "Alice".into(),
+                from_me: false,
+                ts: "2025-01-15T12:00:00Z".into(),
+                body: "Hello from Alice".into(),
+                reply_to_id: None,
+                reply_broadcast: false,
+                media_kind: None,
+                mime_type: None,
+                filename: None,
+                reactions: vec![],
+                read_status: ReadStatus::Read,
+                deleted: false,
+            })
+            .unwrap();
+
+        PostboxLaunchContext {
+            store,
+            keymap: Keymap::postbox_defaults(),
+            version: "0.1.0".into(),
+            started_at: Instant::now(),
+        }
+    }
+
+    fn open_shell(cx: &mut TestAppContext) -> (WindowHandle<Root>, Entity<PostboxShell>) {
+        let launch_ctx = seeded_launch_ctx();
+        let keymap = launch_ctx.keymap.clone();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            register_bundled_fonts(cx);
+            bind_postbox_keys(cx, &keymap);
+            apply_postbox_theme(cx, ThemeChoice::ZincDark, FontScale::default());
+        });
+
+        cx.update(|cx| {
+            let bounds = Bounds {
+                origin: Point::default(),
+                size: size(px(1200.0), px(800.0)),
+            };
+            let (window, shell) = gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                cx,
+                move |window, cx| cx.new(|cx| PostboxShell::new(launch_ctx, window, cx)),
+            )
+            .expect("open Postbox test window");
+            (window.downcast::<Root>().expect("Base Root"), shell)
         })
-        .expect("failed to open Postbox window");
-    });
+    }
+
+    #[gpui_kit::test]
+    fn renders_shell_with_zero_toolbar_and_window_title(cx: &mut TestAppContext) {
+        let (handle, shell) = open_shell(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("postbox-root").is_some());
+            assert!(window.try_find("view-rail").is_some());
+            assert!(window.try_find("chat-sidebar").is_some());
+            assert!(window.try_find("chat-main-column").is_some());
+            assert!(window.try_find("composer-container").is_some());
+            assert!(window.try_find("toolbar").is_none());
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert_eq!(
+                shell.read(cx).view_model().window_title(),
+                "Combined inbox - Postbox v0.1.0"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn hold_ctrl_shows_and_clears_slot_badges(cx: &mut TestAppContext) {
+        let (handle, _shell) = open_shell(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("ctrl-badge-1").is_none());
+            window.change_modifiers(Modifiers::control(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("ctrl-badge-1").is_some());
+            window.change_modifiers(Modifiers::none(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("ctrl-badge-1").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn ctrl_k_opens_palette_and_switches_theme(cx: &mut TestAppContext) {
+        let (handle, shell) = open_shell(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-k", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("command-palette-overlay").is_some());
+            window.input("Theme: Light", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("command-palette-overlay").is_none());
+        })
+        .unwrap();
+
+        cx.update(|cx| {
+            assert_eq!(shell.read(cx).view_model().theme(), ThemeChoice::Light);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn f1_toggles_shortcuts_overlay_and_esc_closes(cx: &mut TestAppContext) {
+        let (handle, _shell) = open_shell(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("f1", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("f1-shortcuts-modal").is_some());
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("f1-shortcuts-modal").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn font_scaling_shortcuts_update_scale_and_persist(cx: &mut TestAppContext) {
+        let (handle, shell) = open_shell(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-=", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-=", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let vm = shell.read(cx).view_model();
+            assert_eq!(vm.font_scale().percent(), 120);
+            assert_eq!(
+                vm.store().load_ui_settings().unwrap().font_scale.percent(),
+                120
+            );
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-0", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(shell.read(cx).view_model().font_scale().percent(), 100);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn chat_list_shortcuts_fire_in_desktop_mode(cx: &mut TestAppContext) {
+        let (handle, shell) = open_shell(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("j", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(
+                shell.read(cx).view_model().selected_chat().unwrap().title,
+                "Bob"
+            );
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("k", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(
+                shell.read(cx).view_model().selected_chat().unwrap().title,
+                "Alice"
+            );
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("u", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let vm = shell.read(cx).view_model();
+            assert!(vm.unread_only());
+            assert_eq!(vm.chats().len(), 1);
+            assert_eq!(vm.chats()[0].title, "Alice");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn esc_closing_palette_does_not_clear_underlying_marked_message(cx: &mut TestAppContext) {
+        let (handle, shell) = open_shell(cx);
+        cx.update(|cx| {
+            shell.update(cx, |this, cx| {
+                this.vm.toggle_mark_message("m1");
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-k", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("command-palette-overlay").is_some());
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("command-palette-overlay").is_none());
+        })
+        .unwrap();
+
+        cx.update(|cx| {
+            let vm = shell.read(cx).view_model();
+            assert!(!vm.palette_open());
+            assert_eq!(vm.marked_messages_count(), 1);
+        });
+
+        // A second Esc (now with palette closed) clears the marked message cascade layer.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(shell.read(cx).view_model().marked_messages_count(), 0);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn sort_views_palette_syncs_selection_and_reorders_views(cx: &mut TestAppContext) {
+        let (handle, shell) = open_shell(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-k", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.input("Sort views", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("down", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let vm = shell.read(cx).view_model();
+            assert_eq!(vm.palette_mode(), PaletteMode::SortViews);
+            assert_eq!(vm.palette_selected_index(), 1);
+            assert_eq!(vm.accounts()[0].label, "WhatsApp");
+            assert_eq!(vm.accounts()[1].label, "Acme Slack");
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-up", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        cx.update(|cx| {
+            let shell_ref = shell.read(cx);
+            let vm = shell_ref.view_model();
+            assert_eq!(vm.accounts()[0].label, "Acme Slack");
+            assert_eq!(vm.accounts()[1].label, "WhatsApp");
+            assert_eq!(vm.palette_selected_index(), 0);
+            assert_eq!(
+                shell_ref.palette_state.read(cx).selected_index(),
+                Some(IndexPath::new(0).section(0))
+            );
+        });
+    }
 }

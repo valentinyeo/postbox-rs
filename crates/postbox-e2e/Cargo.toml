@@ -1,0 +1,42 @@
+[package]
+name = "postbox-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+m1_ui = []
+m2_hub_sync = []
+m3_media = []
+m4_audio = []
+m5_dictation = []
+m6_video = []
+m7_os = []
+m8-full = [
+    "m1_ui",
+    "m2_hub_sync",
+    "m3_media",
+    "m4_audio",
+    "m5_dictation",
+    "m6_video",
+    "m7_os",
+]
+
+[dependencies]
+postbox-core = { workspace = true }
+postbox-hub = { path = "../postbox-hub" }
+postbox-keymap = { workspace = true }
+postbox-platform = { path = "../postbox-platform" }
+postbox-store = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+postbox-ui = { workspace = true }

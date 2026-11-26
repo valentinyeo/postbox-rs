@@ -3,11 +3,15 @@ name: ci
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 jobs:
   core-linux:
@@ -27,6 +31,131 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
-      - run: cargo check -p postbox-app --features desktop
+      - run: cargo clippy -p postbox-app --features desktop -- -D warnings
+      - run: cargo test -p postbox-ui --features desktop-test
+
+  release-windows:
+    needs: [core-linux, desktop-windows]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release -p postbox-app --features desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --release -p postbox-ctl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package Windows bundle and checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = "dist/postbox-windows-x64"
+          if (Test-Path "dist") { Remove-Item -Recurse -Force "dist" }
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          Copy-Item "target/release/postbox.exe" "$stage/postbox.exe"
+          Copy-Item "target/release/postboxctl.exe" "$stage/postboxctl.exe"
+          Copy-Item "assets/IBMPlex*.ttf" "$stage/"
+          Copy-Item "assets/IBM-Plex-LICENSE.txt" "$stage/IBM-Plex-LICENSE.txt"
+
+          $required = @(
+            "postbox.exe",
+            "postboxctl.exe",
+            "IBMPlexSans-Regular.ttf",
+            "IBMPlexSans-Medium.ttf",
+            "IBMPlexSans-SemiBold.ttf",
+            "IBMPlexSans-Bold.ttf",
+            "IBMPlexSans-Italic.ttf",
+            "IBMPlexMono-Regular.ttf",
+            "IBM-Plex-LICENSE.txt"
+          )
+          foreach ($file in $required) {
+            if (-not (Test-Path "$stage/$file")) {
+              throw "Missing required bundle file: $file"
+            }
+          }
+
+          $zipPath = "dist/postbox-windows-x64.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zipPath -Force
+
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $zipPath).Hash.ToLowerInvariant()
+          $size = (Get-Item $zipPath).Length
+          [System.IO.File]::WriteAllText(
+            (Join-Path (Get-Location) "dist/SHA256SUMS.txt"),
+            "$hash  postbox-windows-x64.zip`n",
+            (New-Object System.Text.UTF8Encoding($false))
+          )
+
+          if ($env:GITHUB_REF.StartsWith("refs/tags/v")) {
+            $tag = $env:GITHUB_REF_NAME
+            $version = $tag.TrimStart('v')
+            $repo = $env:GITHUB_REPOSITORY
+            $update = [ordered]@{
+              version  = $version
+              tag      = $tag
+              tag_name = $tag
+              asset    = "postbox-windows-x64.zip"
+              sha256   = $hash
+              size     = $size
+              body     = ""
+              assets   = @(
+                [ordered]@{
+                  name                 = "postbox-windows-x64.zip"
+                  browser_download_url = "https://github.com/$repo/releases/download/$tag/postbox-windows-x64.zip"
+                  size                 = $size
+                  digest               = "sha256:$hash"
+                }
+              )
+            }
+            $json = ($update | ConvertTo-Json -Depth 4) + "`n"
+            [System.IO.File]::WriteAllText(
+              (Join-Path (Get-Location) "dist/update.json"),
+              $json,
+              (New-Object System.Text.UTF8Encoding($false))
+            )
+          }
+      - name: Upload Windows release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: postbox-windows-x64
+          path: |
+            dist/postbox-windows-x64.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $repo = $env:GITHUB_REPOSITORY
+          $assets = @(
+            "dist/postbox-windows-x64.zip",
+            "dist/SHA256SUMS.txt",
+            "dist/update.json"
+          )
+
+          $ErrorActionPreference = 'Continue'
+          gh release view $tag --repo $repo 2>$null | Out-Null
+          $exists = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = 'Stop'
+
+          if ($exists) {
+            gh release upload $tag @assets --repo $repo --clobber
+          } else {
+            gh release create $tag @assets --repo $repo --verify-tag --title "Postbox $tag" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

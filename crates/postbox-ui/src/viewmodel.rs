@@ -1,0 +1,1938 @@
+use crate::geometry::RowGeometry;
+use crate::palette::{
+    PaletteCatalogContext, PaletteCommand, PaletteEntry, PaletteEntryKind, PaletteFilterInput,
+    PaletteMode, PaletteSection, PaletteState, build_palette_items, filter_palette,
+};
+use crate::timeline::{TimelineItem, build_timeline_items, extract_links_and_media};
+use postbox_core::dictation::DictationLanguage;
+use postbox_core::{
+    Account, Chat, ChatKey, Draft, FontScale, Message, Provider, ReadStatus, ThemeChoice,
+    UiSettings, ViewTab,
+};
+use postbox_keymap::{
+    Action, CtrlBadgeState, InboxChord, Keymap, LatestChord, LatestChordOutcome,
+    ctrl_a_selects_chats,
+};
+use postbox_store::{OutboxPhase, OutboxRecord, Store};
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+const MAX_CHATS_QUERY: usize = 500;
+const MAX_MESSAGES_QUERY: usize = 200;
+const MAX_FTS_HITS: usize = 20;
+const PAGE_STEP_CHATS: usize = 10;
+const PAGE_STEP_MESSAGES: usize = 10;
+
+/// Launch bundle passed from `postbox-app` to either desktop GPUI or headless mode.
+pub struct PostboxLaunchContext {
+    pub store: Store,
+    pub keymap: Keymap,
+    pub version: String,
+    pub started_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusTarget {
+    ChatList,
+    MessageList,
+    Composer,
+    Palette,
+    ShortcutsOverlay,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarChatRow {
+    pub chat: Chat,
+    pub draft_preview: Option<String>,
+    pub bulk_selected: bool,
+    pub active: bool,
+    pub slot_badge: Option<u8>,
+}
+
+fn provider_sort_rank(provider: Provider) -> u8 {
+    match provider {
+        Provider::Whatsapp => 0,
+        Provider::Slack => 1,
+        Provider::Telegram => 2,
+        Provider::Signal => 3,
+    }
+}
+
+fn now_epoch_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn now_epoch_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Formats a Unix epoch timestamp (seconds) as UTC RFC3339 (`YYYY-MM-DDTHH:MM:SSZ`)
+/// using Howard Hinnant's civil-from-days algorithm without external dependencies.
+fn format_utc_rfc3339(epoch_secs: i64) -> String {
+    let days = epoch_secs.div_euclid(86_400);
+    let secs_of_day = epoch_secs.rem_euclid(86_400);
+    let hour = secs_of_day / 3_600;
+    let minute = (secs_of_day % 3_600) / 60;
+    let second = secs_of_day % 60;
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(month <= 2);
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Pure headless view-model/controller driving Postbox UI state from `Store` and `Keymap`.
+/// Compiles and executes without GPU on both Linux and Windows.
+pub struct PostboxViewModel {
+    store: Store,
+    keymap: Keymap,
+    version: String,
+
+    theme: ThemeChoice,
+    font_scale: FontScale,
+    view_order: Vec<String>,
+    show_archived_inline: bool,
+    dictation_language: DictationLanguage,
+    playback_speed_pct: u16,
+    slack_threads_enabled: bool,
+    slack_reply_style: bool,
+
+    active_view: Option<ViewTab>,
+    accounts: Vec<Account>,
+    show_archived_only: bool,
+    unread_only: bool,
+    search_filter: String,
+
+    chats: Vec<Chat>,
+    selected_chat_idx: Option<usize>,
+    bulk_selected: BTreeSet<ChatKey>,
+    drafts: BTreeMap<ChatKey, Draft>,
+
+    messages: Vec<Message>,
+    timeline_items: Vec<TimelineItem>,
+    selected_message_idx: Option<usize>,
+    marked_messages: BTreeSet<String>,
+    reply_to_msg_id: Option<String>,
+
+    composer_text: String,
+    focus: FocusTarget,
+    palette: PaletteState,
+    shortcuts_open: bool,
+    ctrl_badges: CtrlBadgeState,
+    inbox_chord: InboxChord,
+    latest_chord: LatestChord,
+
+    status_notice: Option<String>,
+    title_notice: Option<String>,
+    quit_requested: bool,
+    sync_requested: bool,
+    scroll_to_latest_pending: bool,
+    refresh_count: u64,
+    local_send_seq: u64,
+}
+
+impl PostboxViewModel {
+    /// Creates a ViewModel before any view is active (`window_title() == "Postbox v<ver>"`).
+    pub fn new_uninitialized(store: Store, keymap: Keymap, version: impl Into<String>) -> Self {
+        let settings = store.load_ui_settings().unwrap_or_default();
+        let mut drafts = BTreeMap::new();
+        if let Ok(loaded) = store.list_drafts() {
+            for draft in loaded {
+                if !draft.text_body.is_empty() {
+                    drafts.insert(draft.chat.clone(), draft);
+                }
+            }
+        }
+        Self {
+            store,
+            keymap,
+            version: version.into(),
+            theme: settings.theme,
+            font_scale: settings.font_scale,
+            view_order: settings.view_order,
+            show_archived_inline: settings.show_archived,
+            dictation_language: DictationLanguage::Automatic,
+            playback_speed_pct: 100,
+            slack_threads_enabled: true,
+            slack_reply_style: false,
+            active_view: None,
+            accounts: Vec::new(),
+            show_archived_only: false,
+            unread_only: false,
+            search_filter: String::new(),
+            chats: Vec::new(),
+            selected_chat_idx: None,
+            bulk_selected: BTreeSet::new(),
+            drafts,
+            messages: Vec::new(),
+            timeline_items: Vec::new(),
+            selected_message_idx: None,
+            marked_messages: BTreeSet::new(),
+            reply_to_msg_id: None,
+            composer_text: String::new(),
+            focus: FocusTarget::ChatList,
+            palette: PaletteState::default(),
+            shortcuts_open: false,
+            ctrl_badges: CtrlBadgeState::default(),
+            inbox_chord: InboxChord::default(),
+            latest_chord: LatestChord::default(),
+            status_notice: None,
+            title_notice: None,
+            quit_requested: false,
+            sync_requested: false,
+            scroll_to_latest_pending: false,
+            refresh_count: 0,
+            local_send_seq: 0,
+        }
+    }
+
+    /// Creates a fully initialized ViewModel with `CombinedInbox` active, accounts ordered,
+    /// chats loaded, and initial chat messages populated.
+    pub fn new(store: Store, keymap: Keymap, version: impl Into<String>) -> Self {
+        let mut vm = Self::new_uninitialized(store, keymap, version);
+        vm.active_view = Some(ViewTab::CombinedInbox);
+        vm.refresh_all();
+        vm
+    }
+
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    pub fn store_mut(&mut self) -> &mut Store {
+        &mut self.store
+    }
+
+    pub fn keymap(&self) -> &Keymap {
+        &self.keymap
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub fn theme(&self) -> ThemeChoice {
+        self.theme
+    }
+
+    pub fn font_scale(&self) -> FontScale {
+        self.font_scale
+    }
+
+    pub fn row_geometry(&self) -> RowGeometry {
+        RowGeometry::for_font_scale(self.font_scale)
+    }
+
+    pub fn active_view(&self) -> Option<&ViewTab> {
+        self.active_view.as_ref()
+    }
+
+    pub fn accounts(&self) -> &[Account] {
+        &self.accounts
+    }
+
+    pub fn view_order(&self) -> &[String] {
+        &self.view_order
+    }
+
+    pub fn chats(&self) -> &[Chat] {
+        &self.chats
+    }
+
+    pub fn selected_chat_idx(&self) -> Option<usize> {
+        self.selected_chat_idx
+    }
+
+    pub fn selected_chat(&self) -> Option<&Chat> {
+        self.selected_chat_idx.and_then(|idx| self.chats.get(idx))
+    }
+
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    pub fn timeline_items(&self) -> &[TimelineItem] {
+        &self.timeline_items
+    }
+
+    pub fn selected_message_idx(&self) -> Option<usize> {
+        self.selected_message_idx
+    }
+
+    pub fn selected_message(&self) -> Option<&Message> {
+        self.selected_message_idx
+            .and_then(|idx| self.messages.get(idx))
+    }
+
+    pub fn focus(&self) -> FocusTarget {
+        self.focus
+    }
+
+    pub fn set_focus(&mut self, focus: FocusTarget) {
+        self.focus = focus;
+    }
+
+    pub fn composer_focused(&self) -> bool {
+        self.focus == FocusTarget::Composer
+    }
+
+    pub fn set_composer_focused(&mut self, focused: bool) {
+        if focused {
+            self.focus = FocusTarget::Composer;
+        } else if self.focus == FocusTarget::Composer {
+            self.focus = FocusTarget::ChatList;
+        }
+    }
+
+    pub fn composer_text(&self) -> &str {
+        &self.composer_text
+    }
+
+    pub fn set_composer_text(&mut self, text: impl Into<String>) {
+        self.composer_text = text.into();
+        self.persist_active_draft();
+    }
+
+    pub fn reply_to_msg_id(&self) -> Option<&str> {
+        self.reply_to_msg_id.as_deref()
+    }
+
+    pub fn cancel_reply(&mut self) {
+        self.reply_to_msg_id = None;
+    }
+
+    pub fn unread_only(&self) -> bool {
+        self.unread_only
+    }
+
+    pub fn show_archived_inline(&self) -> bool {
+        self.show_archived_inline
+    }
+
+    pub fn show_archived_only(&self) -> bool {
+        self.show_archived_only
+    }
+
+    pub fn search_filter(&self) -> &str {
+        &self.search_filter
+    }
+
+    pub fn bulk_selected_count(&self) -> usize {
+        self.bulk_selected.len()
+    }
+
+    pub fn marked_messages_count(&self) -> usize {
+        self.marked_messages.len()
+    }
+
+    pub fn status_notice(&self) -> Option<&str> {
+        self.status_notice.as_deref()
+    }
+
+    pub fn set_title_notice(&mut self, notice: Option<String>) {
+        self.title_notice = notice;
+    }
+
+    pub fn quit_requested(&self) -> bool {
+        self.quit_requested
+    }
+
+    pub fn sync_requested(&self) -> bool {
+        self.sync_requested
+    }
+
+    pub fn refresh_count(&self) -> u64 {
+        self.refresh_count
+    }
+
+    pub fn take_scroll_to_latest_pending(&mut self) -> bool {
+        std::mem::take(&mut self.scroll_to_latest_pending)
+    }
+
+    pub fn window_title(&self) -> String {
+        ViewTab::window_title_with_status(
+            self.active_view.as_ref(),
+            &self.version,
+            self.marked_messages.len(),
+            self.title_notice.as_deref(),
+        )
+    }
+
+    pub fn ctrl_badges_visible(&self) -> bool {
+        self.ctrl_badges.visible()
+    }
+
+    pub fn on_ctrl_down(&mut self) -> bool {
+        self.ctrl_badges.on_ctrl_down()
+    }
+
+    pub fn on_ctrl_up(&mut self) -> bool {
+        self.ctrl_badges.on_ctrl_up()
+    }
+
+    pub fn on_window_blur(&mut self) -> bool {
+        self.inbox_chord.reset();
+        self.latest_chord.reset();
+        self.ctrl_badges.on_blur()
+    }
+
+    pub fn sidebar_rows(&self) -> Vec<SidebarChatRow> {
+        let show_badges = self.ctrl_badges.visible();
+        self.chats
+            .iter()
+            .enumerate()
+            .map(|(idx, chat)| {
+                let draft_preview = self
+                    .drafts
+                    .get(&chat.key)
+                    .filter(|d| !d.text_body.trim().is_empty())
+                    .map(Draft::sidebar_preview);
+                SidebarChatRow {
+                    chat: chat.clone(),
+                    draft_preview,
+                    bulk_selected: self.bulk_selected.contains(&chat.key),
+                    active: self.selected_chat_idx == Some(idx),
+                    slot_badge: if show_badges && idx < 9 {
+                        Some((idx + 1) as u8)
+                    } else {
+                        None
+                    },
+                }
+            })
+            .collect()
+    }
+
+    fn persist_ui_settings(&self) {
+        let settings = UiSettings {
+            theme: self.theme,
+            font_scale: self.font_scale,
+            view_order: self.view_order.clone(),
+            show_archived: self.show_archived_inline,
+        };
+        let _ = self.store.save_ui_settings(&settings);
+    }
+
+    pub fn set_theme(&mut self, theme: ThemeChoice) {
+        self.theme = theme;
+        self.status_notice = Some(format!("Theme: {}", theme.label()));
+        self.persist_ui_settings();
+    }
+
+    pub fn set_font_scale(&mut self, scale: FontScale) {
+        self.font_scale = scale;
+        self.status_notice = Some(format!("Text size: {}%", scale.percent()));
+        self.persist_ui_settings();
+    }
+
+    pub fn font_larger(&mut self) {
+        self.set_font_scale(self.font_scale.larger());
+    }
+
+    pub fn font_smaller(&mut self) {
+        self.set_font_scale(self.font_scale.smaller());
+    }
+
+    pub fn font_reset(&mut self) {
+        self.set_font_scale(self.font_scale.reset());
+    }
+
+    pub fn refresh_all(&mut self) {
+        self.refresh_accounts();
+        self.refresh_chats();
+        self.refresh_count = self.refresh_count.saturating_add(1);
+    }
+
+    pub fn refresh_accounts(&mut self) {
+        let mut accounts = self.store.list_accounts().unwrap_or_default();
+        let saved_order = &self.view_order;
+        accounts.sort_by(|a, b| {
+            let pos_a = saved_order.iter().position(|k| k == &a.view_key());
+            let pos_b = saved_order.iter().position(|k| k == &b.view_key());
+            match (pos_a, pos_b) {
+                (Some(ia), Some(ib)) => ia.cmp(&ib),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => provider_sort_rank(a.provider)
+                    .cmp(&provider_sort_rank(b.provider))
+                    .then_with(|| a.sort_order.cmp(&b.sort_order))
+                    .then_with(|| a.label.cmp(&b.label)),
+            }
+        });
+        self.accounts = accounts;
+    }
+
+    pub fn refresh_chats(&mut self) {
+        let prev_key = self.selected_chat().map(|c| c.key.clone());
+        let view = self.active_view.clone().unwrap_or(ViewTab::CombinedInbox);
+        let mut chats = self
+            .store
+            .list_chats_filtered(
+                &view,
+                self.show_archived_inline,
+                self.show_archived_only,
+                self.unread_only,
+                MAX_CHATS_QUERY,
+            )
+            .unwrap_or_default();
+
+        if !self.search_filter.trim().is_empty() {
+            let needle = self.search_filter.trim().to_ascii_lowercase();
+            chats.retain(|c| {
+                c.title.to_ascii_lowercase().contains(&needle)
+                    || c.key.id.to_ascii_lowercase().contains(&needle)
+            });
+        }
+
+        self.chats = chats;
+
+        let fallback = (!self.chats.is_empty()).then_some(0);
+        let new_idx = prev_key
+            .as_ref()
+            .and_then(|key| self.chats.iter().position(|c| &c.key == key))
+            .or(fallback);
+
+        let chat_changed =
+            new_idx.and_then(|i| self.chats.get(i)).map(|c| &c.key) != prev_key.as_ref();
+
+        self.selected_chat_idx = new_idx;
+        if chat_changed {
+            self.load_active_draft();
+            self.reply_to_msg_id = None;
+            self.marked_messages.clear();
+        }
+        self.refresh_messages();
+    }
+
+    pub fn refresh_messages(&mut self) {
+        let Some(chat_key) = self.selected_chat().map(|c| c.key.clone()) else {
+            self.messages.clear();
+            self.timeline_items.clear();
+            self.selected_message_idx = None;
+            return;
+        };
+
+        let prev_msg_id = self.selected_message().map(|m| m.msg_id.clone());
+        self.messages = self
+            .store
+            .list_messages(&chat_key, MAX_MESSAGES_QUERY, None)
+            .unwrap_or_default();
+
+        self.selected_message_idx = prev_msg_id
+            .as_deref()
+            .and_then(|id| self.messages.iter().position(|m| m.msg_id == id))
+            .or_else(|| self.messages.len().checked_sub(1));
+
+        self.rebuild_timeline();
+    }
+
+    fn rebuild_timeline(&mut self) {
+        self.timeline_items = build_timeline_items(
+            &self.messages,
+            self.selected_message_idx,
+            &self.marked_messages,
+        );
+    }
+
+    fn persist_active_draft(&mut self) {
+        let Some(chat_key) = self.selected_chat().map(|c| c.key.clone()) else {
+            return;
+        };
+        if self.composer_text.trim().is_empty() {
+            self.drafts.remove(&chat_key);
+            let _ = self.store.delete_draft(&chat_key);
+        } else {
+            let draft = Draft {
+                chat: chat_key.clone(),
+                text_body: self.composer_text.clone(),
+                reply_to_id: self.reply_to_msg_id.clone(),
+                staged_image_path: None,
+                updated_at: now_epoch_secs(),
+            };
+            let _ = self.store.save_draft(&draft);
+            self.drafts.insert(chat_key, draft);
+        }
+    }
+
+    fn load_active_draft(&mut self) {
+        let Some(chat_key) = self.selected_chat().map(|c| c.key.clone()) else {
+            self.composer_text.clear();
+            return;
+        };
+        if let Some(draft) = self.drafts.get(&chat_key) {
+            self.composer_text = draft.text_body.clone();
+            self.reply_to_msg_id = draft.reply_to_id.clone();
+        } else {
+            self.composer_text.clear();
+        }
+    }
+
+    pub fn select_chat_index(&mut self, idx: usize) -> bool {
+        if idx >= self.chats.len() {
+            return false;
+        }
+        if self.selected_chat_idx == Some(idx) {
+            return true;
+        }
+        self.persist_active_draft();
+        self.selected_chat_idx = Some(idx);
+        self.reply_to_msg_id = None;
+        self.marked_messages.clear();
+        self.load_active_draft();
+        self.refresh_messages();
+        self.scroll_to_latest_pending = true;
+        true
+    }
+
+    pub fn select_chat_key(&mut self, key: &ChatKey) -> bool {
+        if let Some(idx) = self.chats.iter().position(|c| &c.key == key) {
+            return self.select_chat_index(idx);
+        }
+        // Chat might be in another view or archived: switch to Combined Inbox and reveal if needed.
+        if let Ok(Some(chat)) = self.store.get_chat(key) {
+            self.active_view = Some(ViewTab::CombinedInbox);
+            self.search_filter.clear();
+            self.unread_only = false;
+            self.show_archived_only = chat.is_archived();
+            self.refresh_chats();
+            if let Some(idx) = self.chats.iter().position(|c| &c.key == key) {
+                return self.select_chat_index(idx);
+            }
+        }
+        false
+    }
+
+    pub fn open_chat_slot(&mut self, slot: u8) -> bool {
+        if !(1..=9).contains(&slot) {
+            return false;
+        }
+        let idx = (slot - 1) as usize;
+        if self.select_chat_index(idx) {
+            self.focus = FocusTarget::Composer;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn next_chat(&mut self) {
+        if self.chats.is_empty() {
+            return;
+        }
+        let next = self
+            .selected_chat_idx
+            .map(|i| (i + 1).min(self.chats.len() - 1))
+            .unwrap_or(0);
+        self.select_chat_index(next);
+    }
+
+    pub fn prev_chat(&mut self) {
+        if self.chats.is_empty() {
+            return;
+        }
+        let prev = self
+            .selected_chat_idx
+            .map(|i| i.saturating_sub(1))
+            .unwrap_or(0);
+        self.select_chat_index(prev);
+    }
+
+    pub fn first_chat(&mut self) {
+        if !self.chats.is_empty() {
+            self.select_chat_index(0);
+        }
+    }
+
+    pub fn last_chat(&mut self) {
+        if let Some(last) = self.chats.len().checked_sub(1) {
+            self.select_chat_index(last);
+        }
+    }
+
+    pub fn page_up_chats(&mut self) {
+        if self.chats.is_empty() {
+            return;
+        }
+        let target = self
+            .selected_chat_idx
+            .unwrap_or(0)
+            .saturating_sub(PAGE_STEP_CHATS);
+        self.select_chat_index(target);
+    }
+
+    pub fn page_down_chats(&mut self) {
+        if self.chats.is_empty() {
+            return;
+        }
+        let target = self
+            .selected_chat_idx
+            .unwrap_or(0)
+            .saturating_add(PAGE_STEP_CHATS)
+            .min(self.chats.len() - 1);
+        self.select_chat_index(target);
+    }
+
+    pub fn switch_to_combined_inbox(&mut self) {
+        self.persist_active_draft();
+        self.active_view = Some(ViewTab::CombinedInbox);
+        self.show_archived_only = false;
+        self.bulk_selected.clear();
+        self.refresh_chats();
+        self.status_notice = Some("Combined inbox".into());
+    }
+
+    pub fn switch_to_account_slot(&mut self, slot: u8) -> bool {
+        if !(2..=9).contains(&slot) {
+            return false;
+        }
+        let idx = (slot - 2) as usize;
+        let Some(account) = self.accounts.get(idx).cloned() else {
+            return false;
+        };
+        self.persist_active_draft();
+        self.active_view = Some(account.to_view_tab());
+        self.show_archived_only = false;
+        self.bulk_selected.clear();
+        self.refresh_chats();
+        self.status_notice = Some(account.label);
+        true
+    }
+
+    pub fn switch_to_view_key(&mut self, view_key: &str) -> bool {
+        if view_key == "all" {
+            self.switch_to_combined_inbox();
+            return true;
+        }
+        let Some(account) = self
+            .accounts
+            .iter()
+            .find(|a| a.view_key() == view_key)
+            .cloned()
+        else {
+            return false;
+        };
+        self.persist_active_draft();
+        self.active_view = Some(account.to_view_tab());
+        self.show_archived_only = false;
+        self.bulk_selected.clear();
+        self.refresh_chats();
+        self.status_notice = Some(account.label);
+        true
+    }
+
+    pub fn toggle_unread_only(&mut self) {
+        self.unread_only = !self.unread_only;
+        self.refresh_chats();
+        self.status_notice = Some(if self.unread_only {
+            "Showing unread chats".into()
+        } else {
+            "Showing all chats".into()
+        });
+    }
+
+    pub fn toggle_archived_inline(&mut self) {
+        self.show_archived_inline = !self.show_archived_inline;
+        self.persist_ui_settings();
+        self.refresh_chats();
+        self.status_notice = Some(if self.show_archived_inline {
+            "Archived chats shown in this view".into()
+        } else {
+            "Archived chats hidden in this view".into()
+        });
+    }
+
+    pub fn toggle_archived_only(&mut self) {
+        self.show_archived_only = !self.show_archived_only;
+        self.refresh_chats();
+        self.status_notice = Some(if self.show_archived_only {
+            "Showing archived chats".into()
+        } else {
+            "Showing inbox chats".into()
+        });
+    }
+
+    pub fn select_all_chats(&mut self) {
+        let text_focused = matches!(self.focus, FocusTarget::Composer | FocusTarget::Palette);
+        let compose_focused = self.focus == FocusTarget::Composer;
+        let compose_empty = self.composer_text.is_empty();
+        if !ctrl_a_selects_chats(text_focused, compose_focused, compose_empty) {
+            return;
+        }
+        self.bulk_selected = self.chats.iter().map(|c| c.key.clone()).collect();
+        self.status_notice = Some(format!("{} chats selected", self.bulk_selected.len()));
+    }
+
+    pub fn archive_selected(&mut self) {
+        if !self.bulk_selected.is_empty() {
+            let keys: Vec<ChatKey> = self.bulk_selected.iter().cloned().collect();
+            let now = now_epoch_secs();
+            for key in &keys {
+                if let Ok(Some(mut chat)) = self.store.get_chat(key) {
+                    chat.archived_local = true;
+                    let _ = self.store.upsert_chat(&chat, now);
+                }
+            }
+            let count = keys.len();
+            self.bulk_selected.clear();
+            self.refresh_chats();
+            self.status_notice = Some(format!("Archived {count} chats"));
+            return;
+        }
+        let Some(mut chat) = self.selected_chat().cloned() else {
+            return;
+        };
+        let next_archived = !chat.is_archived();
+        chat.archived_local = next_archived;
+        if !next_archived {
+            chat.archived_remote = false;
+        }
+        let _ = self.store.upsert_chat(&chat, now_epoch_secs());
+        self.refresh_chats();
+        self.status_notice = Some(if next_archived {
+            format!("Archived {}", chat.title)
+        } else {
+            format!("Unarchived {}", chat.title)
+        });
+    }
+
+    pub fn keep_archived_selected(&mut self) {
+        let Some(mut chat) = self.selected_chat().cloned() else {
+            return;
+        };
+        chat.archived_local = true;
+        let _ = self.store.upsert_chat(&chat, now_epoch_secs());
+        self.refresh_chats();
+        self.status_notice = Some(format!("Kept {} archived", chat.title));
+    }
+
+    pub fn toggle_pin_selected(&mut self) {
+        let Some(mut chat) = self.selected_chat().cloned() else {
+            return;
+        };
+        chat.pinned = !chat.pinned;
+        let _ = self.store.upsert_chat(&chat, now_epoch_secs());
+        self.refresh_chats();
+        self.status_notice = Some(if chat.pinned {
+            format!("Pinned {}", chat.title)
+        } else {
+            format!("Unpinned {}", chat.title)
+        });
+    }
+
+    pub fn select_message_index(&mut self, idx: usize) -> bool {
+        if idx >= self.messages.len() {
+            return false;
+        }
+        self.selected_message_idx = Some(idx);
+        self.rebuild_timeline();
+        true
+    }
+
+    pub fn next_message(&mut self) {
+        if self.messages.is_empty() {
+            return;
+        }
+        let next = self
+            .selected_message_idx
+            .map(|i| (i + 1).min(self.messages.len() - 1))
+            .unwrap_or(0);
+        self.select_message_index(next);
+    }
+
+    pub fn prev_message(&mut self) {
+        if self.messages.is_empty() {
+            return;
+        }
+        let prev = self
+            .selected_message_idx
+            .map(|i| i.saturating_sub(1))
+            .unwrap_or(self.messages.len() - 1);
+        self.select_message_index(prev);
+    }
+
+    pub fn page_up_messages(&mut self) {
+        if self.messages.is_empty() {
+            return;
+        }
+        let target = self
+            .selected_message_idx
+            .unwrap_or(self.messages.len() - 1)
+            .saturating_sub(PAGE_STEP_MESSAGES);
+        self.select_message_index(target);
+    }
+
+    pub fn page_down_messages(&mut self) {
+        if self.messages.is_empty() {
+            return;
+        }
+        let target = self
+            .selected_message_idx
+            .unwrap_or(0)
+            .saturating_add(PAGE_STEP_MESSAGES)
+            .min(self.messages.len() - 1);
+        self.select_message_index(target);
+    }
+
+    pub fn jump_to_latest(&mut self) {
+        if let Some(last) = self.messages.len().checked_sub(1) {
+            self.selected_message_idx = Some(last);
+            self.rebuild_timeline();
+        }
+        self.scroll_to_latest_pending = true;
+        self.status_notice = Some(LatestChord::JUMPED_STATUS.into());
+    }
+
+    pub fn toggle_mark_message(&mut self, msg_id: &str) {
+        if !self.marked_messages.remove(msg_id) {
+            self.marked_messages.insert(msg_id.to_owned());
+        }
+        self.rebuild_timeline();
+    }
+
+    pub fn start_reply_selected(&mut self) {
+        if let Some(msg) = self.selected_message() {
+            self.reply_to_msg_id = Some(msg.msg_id.clone());
+            self.focus = FocusTarget::Composer;
+        }
+    }
+
+    /// Submits the current composer text into the durable outbox and appends an optimistic
+    /// outgoing message to SQLite so the timeline updates immediately.
+    pub fn submit_composer_message(&mut self) -> bool {
+        let trimmed = self.composer_text.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let Some(mut chat) = self.selected_chat().cloned() else {
+            return false;
+        };
+
+        self.local_send_seq = self.local_send_seq.saturating_add(1);
+        let now_ms = now_epoch_millis();
+        let now_s = now_epoch_secs();
+        let client_id = format!("local-{now_ms}-{}", self.local_send_seq);
+        let ts = format_utc_rfc3339(now_s);
+
+        let _ = self.store.enqueue_outbox(&OutboxRecord {
+            client_id: client_id.clone(),
+            chat: chat.key.clone(),
+            kind: "text".into(),
+            phase: OutboxPhase::Ready,
+            attempt_serial: 0,
+            text_body: trimmed.to_owned(),
+            reply_to_id: self.reply_to_msg_id.clone(),
+            reply_broadcast: false,
+            not_before_ms: now_ms,
+            created_at_ms: now_ms,
+        });
+
+        let msg = Message {
+            chat: chat.key.clone(),
+            msg_id: client_id,
+            sender_id: "me".into(),
+            sender_name: "You".into(),
+            from_me: true,
+            ts: ts.clone(),
+            body: trimmed.to_owned(),
+            reply_to_id: self.reply_to_msg_id.clone(),
+            reply_broadcast: false,
+            media_kind: None,
+            mime_type: None,
+            filename: None,
+            reactions: Vec::new(),
+            read_status: ReadStatus::Sending,
+            deleted: false,
+        };
+        let _ = self.store.upsert_message(&msg);
+
+        chat.last_msg_ts = ts;
+        chat.last_msg_preview = trimmed.to_owned();
+        let _ = self.store.upsert_chat(&chat, now_s);
+
+        self.composer_text.clear();
+        self.reply_to_msg_id = None;
+        self.drafts.remove(&chat.key);
+        let _ = self.store.delete_draft(&chat.key);
+
+        self.refresh_chats();
+        self.scroll_to_latest_pending = true;
+        true
+    }
+
+    // -------------------------------------------------------------------------
+    // Shortcuts Overlay (F1)
+    // -------------------------------------------------------------------------
+
+    pub fn shortcuts_open(&self) -> bool {
+        self.shortcuts_open
+    }
+
+    pub fn toggle_shortcuts(&mut self) {
+        self.shortcuts_open = !self.shortcuts_open;
+        if self.shortcuts_open {
+            self.palette.open = false;
+            self.focus = FocusTarget::ShortcutsOverlay;
+        } else {
+            self.focus = FocusTarget::ChatList;
+        }
+    }
+
+    pub fn close_shortcuts(&mut self) {
+        if self.shortcuts_open {
+            self.shortcuts_open = false;
+            self.focus = FocusTarget::ChatList;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Unified Ctrl+K Palette
+    // -------------------------------------------------------------------------
+
+    pub fn palette_open(&self) -> bool {
+        self.palette.open
+    }
+
+    pub fn palette_mode(&self) -> PaletteMode {
+        self.palette.mode
+    }
+
+    pub fn palette_query(&self) -> &str {
+        &self.palette.query
+    }
+
+    pub fn palette_placeholder(&self) -> &'static str {
+        self.palette.placeholder()
+    }
+
+    pub fn palette_entries(&self) -> &[PaletteEntry] {
+        &self.palette.entries
+    }
+
+    pub fn palette_sections(&self) -> Vec<PaletteSection> {
+        self.palette.sections()
+    }
+
+    pub fn palette_selected_index(&self) -> usize {
+        self.palette.selected_index
+    }
+
+    pub fn open_palette(&mut self) {
+        self.open_palette_with_mode(PaletteMode::Normal);
+    }
+
+    pub fn open_search_palette(&mut self) {
+        self.open_palette_with_mode(PaletteMode::SearchChats);
+    }
+
+    pub fn open_sort_views_palette(&mut self) {
+        self.open_palette_with_mode(PaletteMode::SortViews);
+    }
+
+    pub fn open_links_palette(&mut self) {
+        self.open_palette_with_mode(PaletteMode::Links);
+    }
+
+    fn open_palette_with_mode(&mut self, mode: PaletteMode) {
+        self.shortcuts_open = false;
+        self.palette.open = true;
+        self.palette.mode = mode;
+        self.palette.query.clear();
+        self.palette.selected_index = 0;
+        self.palette.archive_snapshot = self
+            .selected_chat()
+            .map(|c| (c.key.clone(), c.is_archived()));
+        self.focus = FocusTarget::Palette;
+        self.rebuild_palette_entries();
+    }
+
+    pub fn close_palette(&mut self) {
+        if !self.palette.open {
+            return;
+        }
+        let was_search = self.palette.mode == PaletteMode::SearchChats;
+        self.palette.open = false;
+        self.palette.query.clear();
+        self.palette.selected_index = 0;
+        self.focus = FocusTarget::ChatList;
+        if was_search && !self.search_filter.is_empty() {
+            self.search_filter.clear();
+            self.refresh_chats();
+        }
+    }
+
+    pub fn set_palette_query(&mut self, query: &str) {
+        self.palette.query = query.to_owned();
+        self.palette.selected_index = 0;
+        if self.palette.mode == PaletteMode::SearchChats {
+            self.search_filter = query.trim().to_owned();
+            self.refresh_chats();
+        }
+        self.rebuild_palette_entries();
+    }
+
+    pub fn palette_next(&mut self) {
+        self.palette.move_next();
+    }
+
+    pub fn palette_prev(&mut self) {
+        self.palette.move_prev();
+    }
+
+    pub fn select_palette_section_row(&mut self, section: usize, row: usize) -> bool {
+        if let Some(flat_idx) = self.palette.flat_index_for_section_row(section, row) {
+            self.palette.selected_index = flat_idx;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn palette_selected_section_row(&self) -> Option<(usize, usize)> {
+        self.palette
+            .section_row_for_flat_index(self.palette.selected_index)
+    }
+
+    pub fn palette_move_view_up(&mut self) -> bool {
+        self.move_palette_view(-1)
+    }
+
+    pub fn palette_move_view_down(&mut self) -> bool {
+        self.move_palette_view(1)
+    }
+
+    fn move_palette_view(&mut self, delta: isize) -> bool {
+        if !self.palette.open || self.palette.mode != PaletteMode::SortViews {
+            return false;
+        }
+        let Some(PaletteEntryKind::AccountView { view_key }) =
+            self.palette.selected_entry().map(|e| &e.kind).cloned()
+        else {
+            return false;
+        };
+        let Some(pos) = self.accounts.iter().position(|a| a.view_key() == view_key) else {
+            return false;
+        };
+        let target = pos as isize + delta;
+        if target < 0 || (target as usize) >= self.accounts.len() {
+            return false;
+        }
+        let target = target as usize;
+        self.accounts.swap(pos, target);
+        self.view_order = self.accounts.iter().map(Account::view_key).collect();
+        self.persist_ui_settings();
+        self.rebuild_palette_entries();
+        if let Some(new_sel) = self.palette.entries.iter().position(|e| {
+            matches!(
+                &e.kind,
+                PaletteEntryKind::AccountView { view_key: k } if k == &view_key
+            )
+        }) {
+            self.palette.selected_index = new_sel;
+        }
+        true
+    }
+
+    fn rebuild_palette_entries(&mut self) {
+        let catalog_ctx = PaletteCatalogContext {
+            version: &self.version,
+            theme: self.theme,
+            font_scale: self.font_scale,
+            dictation_language: self.dictation_language,
+            playback_speed_pct: self.playback_speed_pct,
+            show_archived_inline: self.show_archived_inline,
+            show_archived_only: self.show_archived_only,
+            slack_threads_enabled: self.slack_threads_enabled,
+            slack_reply_style: self.slack_reply_style,
+            accounts: &self.accounts,
+            selected_chat: self.selected_chat(),
+            selected_message: self.selected_message(),
+            bulk_selected_count: self.bulk_selected.len(),
+            marked_messages_count: self.marked_messages.len(),
+        };
+        let commands = build_palette_items(&catalog_ctx);
+
+        let trimmed = self.palette.query.trim();
+        let archived_chats = if !trimmed.is_empty()
+            && matches!(
+                self.palette.mode,
+                PaletteMode::Normal | PaletteMode::SearchChats
+            ) {
+            self.store
+                .list_chats_filtered(&ViewTab::CombinedInbox, true, true, false, MAX_CHATS_QUERY)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let fts_hits = if !trimmed.is_empty()
+            && matches!(
+                self.palette.mode,
+                PaletteMode::Normal | PaletteMode::SearchChats
+            ) {
+            self.store
+                .search_messages_fts(trimmed, MAX_FTS_HITS)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let links = if self.palette.mode == PaletteMode::Links {
+            self.selected_message()
+                .map(extract_links_and_media)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        self.palette.entries = filter_palette(PaletteFilterInput {
+            mode: self.palette.mode,
+            query: &self.palette.query,
+            commands: &commands,
+            visible_chats: &self.chats,
+            archived_chats: &archived_chats,
+            fts_hits: &fts_hits,
+            accounts: &self.accounts,
+            links: &links,
+        });
+        if self.palette.selected_index >= self.palette.entries.len() {
+            self.palette.selected_index = 0;
+        }
+    }
+
+    pub fn execute_palette_selected(&mut self) -> bool {
+        let Some(entry) = self.palette.selected_entry().cloned() else {
+            return false;
+        };
+        self.execute_palette_entry(&entry)
+    }
+
+    pub fn execute_palette_section_row(&mut self, section: usize, row: usize) -> bool {
+        let Some(entry) = self.palette.entry_for_section_row(section, row).cloned() else {
+            return false;
+        };
+        self.execute_palette_entry(&entry)
+    }
+
+    pub fn execute_palette_entry(&mut self, entry: &PaletteEntry) -> bool {
+        let archive_snapshot = self.palette.archive_snapshot.clone();
+        match &entry.kind {
+            PaletteEntryKind::Chat { key, .. } => {
+                self.palette.open = false;
+                self.palette.query.clear();
+                self.search_filter.clear();
+                self.refresh_chats();
+                self.focus = FocusTarget::Composer;
+                self.select_chat_key(key)
+            }
+            PaletteEntryKind::MessageHit { chat, msg_id, .. } => {
+                self.palette.open = false;
+                self.palette.query.clear();
+                self.search_filter.clear();
+                self.refresh_chats();
+                self.select_chat_key(chat);
+                if let Some(idx) = self.messages.iter().position(|m| m.msg_id == *msg_id) {
+                    self.select_message_index(idx);
+                }
+                self.focus = FocusTarget::MessageList;
+                true
+            }
+            PaletteEntryKind::AccountView { view_key } => {
+                self.palette.open = false;
+                self.palette.query.clear();
+                self.focus = FocusTarget::ChatList;
+                self.switch_to_view_key(view_key)
+            }
+            PaletteEntryKind::Link { target } => {
+                self.palette.open = false;
+                self.palette.query.clear();
+                self.focus = FocusTarget::MessageList;
+                self.status_notice = Some(format!("Selected link: {target}"));
+                true
+            }
+            PaletteEntryKind::Command(cmd) => {
+                self.execute_palette_command(cmd, archive_snapshot.as_ref())
+            }
+        }
+    }
+
+    fn execute_palette_command(
+        &mut self,
+        cmd: &PaletteCommand,
+        archive_snapshot: Option<&(ChatKey, bool)>,
+    ) -> bool {
+        match cmd {
+            PaletteCommand::SearchChats => {
+                self.open_search_palette();
+                return true;
+            }
+            PaletteCommand::SortViews => {
+                self.open_sort_views_palette();
+                return true;
+            }
+            PaletteCommand::OpenLinksInMessage => {
+                self.open_links_palette();
+                return true;
+            }
+            PaletteCommand::ShowShortcuts => {
+                self.palette.open = false;
+                self.shortcuts_open = true;
+                self.focus = FocusTarget::ShortcutsOverlay;
+                return true;
+            }
+            _ => {
+                self.palette.open = false;
+                self.palette.query.clear();
+                self.focus = FocusTarget::ChatList;
+            }
+        }
+
+        match cmd {
+            PaletteCommand::ComposeMessage => self.focus = FocusTarget::Composer,
+            PaletteCommand::ToggleSlackThreadsForAccount => {
+                self.slack_threads_enabled = !self.slack_threads_enabled;
+                self.status_notice = Some(if self.slack_threads_enabled {
+                    "Slack threads enabled".into()
+                } else {
+                    "Slack threads disabled".into()
+                });
+            }
+            PaletteCommand::VersionInfo => {
+                self.status_notice = Some(format!("Postbox v{}", self.version));
+            }
+            PaletteCommand::Dictate => {
+                self.status_notice = Some("Dictation available in Milestone 5".into());
+            }
+            PaletteCommand::RecordVoiceNote => {
+                self.status_notice = Some("Voice recording available in Milestone 4".into());
+            }
+            PaletteCommand::SetDictationLanguage(lang) => {
+                self.dictation_language = *lang;
+                self.status_notice = Some(format!("Dictation language set: {lang:?}"));
+            }
+            PaletteCommand::SelectMicrophoneDefault => {
+                self.status_notice = Some("Microphone: System default".into());
+            }
+            PaletteCommand::SetPlaybackSpeed(speed) => {
+                self.playback_speed_pct = *speed;
+                self.status_notice =
+                    Some(format!("Playback speed: {:.1}x", f32::from(*speed) / 100.0));
+            }
+            PaletteCommand::FontSmaller => self.font_smaller(),
+            PaletteCommand::FontLarger => self.font_larger(),
+            PaletteCommand::FontReset => self.font_reset(),
+            PaletteCommand::SetFontPreset(scale) => self.set_font_scale(*scale),
+            PaletteCommand::SetTheme(theme) => self.set_theme(*theme),
+            PaletteCommand::ToggleUnreadChats => self.toggle_unread_only(),
+            PaletteCommand::ShowCombinedInbox => self.switch_to_combined_inbox(),
+            PaletteCommand::ShowAccountView(view_key) => {
+                self.switch_to_view_key(view_key);
+            }
+            PaletteCommand::TogglePinSelected => self.toggle_pin_selected(),
+            PaletteCommand::ToggleArchivedInline => self.toggle_archived_inline(),
+            PaletteCommand::ArchiveBulkSelected => self.archive_selected(),
+            PaletteCommand::CancelBulkSelection => {
+                self.bulk_selected.clear();
+                self.status_notice = Some("Selection cleared".into());
+            }
+            PaletteCommand::SetReplyStyleSlack(slack) => {
+                self.slack_reply_style = *slack;
+                self.status_notice = Some(if *slack {
+                    "Replies: Slack style".into()
+                } else {
+                    "Replies: WhatsApp style".into()
+                });
+            }
+            PaletteCommand::ToggleArchivedOnlyView => self.toggle_archived_only(),
+            PaletteCommand::ArchiveOrUnarchiveSelected { expected_archived } => {
+                let current_matches = self.selected_chat().is_some_and(|chat| {
+                    let same_chat = archive_snapshot
+                        .map(|(k, _)| k == &chat.key)
+                        .unwrap_or(true);
+                    same_chat && chat.is_archived() == *expected_archived
+                });
+                if current_matches {
+                    self.archive_selected();
+                } else {
+                    self.status_notice = Some("Archive state changed; skipped stale action".into());
+                }
+            }
+            PaletteCommand::KeepSelectedArchived => self.keep_archived_selected(),
+            PaletteCommand::ReplyToSelected => self.start_reply_selected(),
+            PaletteCommand::SelectNextMessage => self.next_message(),
+            PaletteCommand::SelectPrevMessage => self.prev_message(),
+            PaletteCommand::JumpToLatest => self.jump_to_latest(),
+            PaletteCommand::NextChat => self.next_chat(),
+            PaletteCommand::PrevChat => self.prev_chat(),
+            PaletteCommand::SendMessage => {
+                self.submit_composer_message();
+            }
+            PaletteCommand::Refresh => {
+                self.refresh_all();
+                self.status_notice = Some("Refreshed".into());
+            }
+            PaletteCommand::RestartLiveSync => {
+                self.sync_requested = true;
+                self.status_notice = Some("Live sync requested".into());
+            }
+            PaletteCommand::ManageAccounts => {
+                self.status_notice = Some("Manage accounts on the hub".into());
+            }
+            PaletteCommand::Quit => {
+                self.quit_requested = true;
+            }
+            PaletteCommand::PickMention
+            | PaletteCommand::ResendFailedMessage
+            | PaletteCommand::DeleteMessageForEveryone
+            | PaletteCommand::ReactToSelected
+            | PaletteCommand::CopyMessageText
+            | PaletteCommand::CopyMessageLink
+            | PaletteCommand::CopyTranscript
+            | PaletteCommand::CopyAllTranscripts
+            | PaletteCommand::PlayPauseVoice
+            | PaletteCommand::ToggleTranscript
+            | PaletteCommand::InsertEmoji
+            | PaletteCommand::SendGif
+            | PaletteCommand::QuickReact(_)
+            | PaletteCommand::OpenVideoExternal
+            | PaletteCommand::OpenImageExternal
+            | PaletteCommand::AttachFile
+            | PaletteCommand::CheckForUpdates => {
+                self.status_notice = Some("Command queued".into());
+            }
+            PaletteCommand::SearchChats
+            | PaletteCommand::SortViews
+            | PaletteCommand::OpenLinksInMessage
+            | PaletteCommand::ShowShortcuts => unreachable!(),
+        }
+        true
+    }
+
+    // -------------------------------------------------------------------------
+    // Chords, Esc Cascade & Action Dispatch
+    // -------------------------------------------------------------------------
+
+    pub fn handle_inbox_chord_key(
+        &mut self,
+        key: char,
+        now_ms: u64,
+        repeated: bool,
+        modifiers_active: bool,
+    ) -> bool {
+        let allowed = !modifiers_active
+            && !self.palette.open
+            && !self.shortcuts_open
+            && matches!(self.focus, FocusTarget::ChatList | FocusTarget::MessageList);
+        if self.inbox_chord.on_key(key, now_ms, allowed, repeated) {
+            self.switch_to_combined_inbox();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn handle_alt_g(&mut self, now_ms: u64, repeated: bool) -> LatestChordOutcome {
+        let outcome = self.latest_chord.on_alt_g(now_ms, repeated);
+        match outcome {
+            LatestChordOutcome::Ignored => {}
+            LatestChordOutcome::ArmedHint => {
+                self.status_notice = Some(LatestChord::HINT_STATUS.into());
+            }
+            LatestChordOutcome::JumpLatest => {
+                self.jump_to_latest();
+            }
+        }
+        outcome
+    }
+
+    pub fn reset_latest_chord(&mut self) {
+        self.latest_chord.reset();
+    }
+
+    pub fn reset_inbox_chord(&mut self) {
+        self.inbox_chord.reset();
+    }
+
+    pub fn reset_chords(&mut self) {
+        self.inbox_chord.reset();
+        self.latest_chord.reset();
+    }
+
+    /// Exact Postbox `Esc` cascade (`main.zig:21364-21513`).
+    pub fn handle_escape(&mut self) {
+        if self.shortcuts_open {
+            self.close_shortcuts();
+            return;
+        }
+        if self.palette.open {
+            self.close_palette();
+            return;
+        }
+        if !self.marked_messages.is_empty() {
+            self.marked_messages.clear();
+            self.rebuild_timeline();
+            return;
+        }
+        if !self.bulk_selected.is_empty() {
+            self.bulk_selected.clear();
+            self.status_notice = Some("Selection cleared".into());
+            return;
+        }
+        if self.chats.is_empty()
+            && (!self.search_filter.is_empty()
+                || self.unread_only
+                || self.show_archived_only
+                || !matches!(self.active_view, Some(ViewTab::CombinedInbox)))
+        {
+            self.search_filter.clear();
+            self.unread_only = false;
+            self.show_archived_only = false;
+            self.active_view = Some(ViewTab::CombinedInbox);
+            self.refresh_chats();
+            return;
+        }
+        if self.reply_to_msg_id.is_some() {
+            self.reply_to_msg_id = None;
+            return;
+        }
+        if !self.search_filter.is_empty() {
+            self.search_filter.clear();
+            self.refresh_chats();
+            return;
+        }
+        if self.focus == FocusTarget::Composer {
+            self.focus = FocusTarget::ChatList;
+        }
+    }
+
+    pub fn handle_action(&mut self, action: Action, _now_ms: u64) {
+        match action {
+            Action::OpenPalette => self.open_palette(),
+            Action::ShowShortcutsHelp => self.toggle_shortcuts(),
+            Action::SearchChats => self.open_search_palette(),
+            Action::ClearSearchOrBack => self.handle_escape(),
+            Action::ToggleUnread => self.toggle_unread_only(),
+            Action::ToggleArchived => self.toggle_archived_inline(),
+            Action::ArchiveSelected => self.archive_selected(),
+            Action::KeepArchivedSelected => self.keep_archived_selected(),
+            Action::SelectAllChats => self.select_all_chats(),
+            Action::Refresh => self.refresh_all(),
+            Action::Quit => self.quit_requested = true,
+            Action::NextChat => self.next_chat(),
+            Action::PrevChat => self.prev_chat(),
+            Action::FirstChat => self.first_chat(),
+            Action::LastChat => self.last_chat(),
+            Action::PageUpChats => self.page_up_chats(),
+            Action::PageDownChats => self.page_down_chats(),
+            Action::OpenChatSlot(slot) => {
+                self.open_chat_slot(slot);
+            }
+            Action::SwitchCombinedInbox => self.switch_to_combined_inbox(),
+            Action::SwitchAccountView(slot) => {
+                self.switch_to_account_slot(slot);
+            }
+            Action::NextMessage => self.next_message(),
+            Action::PrevMessage => self.prev_message(),
+            Action::PageUpMessages => self.page_up_messages(),
+            Action::PageDownMessages => self.page_down_messages(),
+            Action::JumpLatest => self.jump_to_latest(),
+            Action::ReplyToMessage => self.start_reply_selected(),
+            Action::OpenLinksAndMedia => self.open_links_palette(),
+            Action::FocusComposer => self.focus = FocusTarget::Composer,
+            Action::SendMessage => {
+                self.submit_composer_message();
+            }
+            Action::FontSmaller => self.font_smaller(),
+            Action::FontLarger => self.font_larger(),
+            Action::FontReset => self.font_reset(),
+            Action::PaletteNext => self.palette_next(),
+            Action::PalettePrev => self.palette_prev(),
+            Action::PaletteActivate => {
+                self.execute_palette_selected();
+            }
+            Action::ClosePalette => self.close_palette(),
+            Action::MoveViewUp => {
+                self.palette_move_view_up();
+            }
+            Action::MoveViewDown => {
+                self.palette_move_view_down();
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::palette::PaletteGroupKind;
+
+    fn seeded_store() -> Store {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .upsert_account(&Account {
+                provider: Provider::Whatsapp,
+                account_id: "main".into(),
+                label: "WhatsApp".into(),
+                state: "connected".into(),
+                sort_order: 1,
+                last_event_at: None,
+            })
+            .unwrap();
+        store
+            .upsert_account(&Account {
+                provider: Provider::Slack,
+                account_id: "T1".into(),
+                label: "Acme Slack".into(),
+                state: "connected".into(),
+                sort_order: 2,
+                last_event_at: None,
+            })
+            .unwrap();
+
+        let c1 = Chat {
+            key: ChatKey::new(Provider::Whatsapp, "main", "alice@s.whatsapp.net"),
+            title: "Alice Light".into(),
+            is_group: false,
+            archived_local: false,
+            archived_remote: false,
+            pinned: false,
+            unread_count: 2,
+            last_msg_ts: "2025-01-15T12:00:00Z".into(),
+            last_msg_preview: "See you soon".into(),
+            avatar_hash: None,
+        };
+        let c2 = Chat {
+            key: ChatKey::new(Provider::Slack, "T1", "C-eng"),
+            title: "Engineering".into(),
+            is_group: true,
+            archived_local: false,
+            archived_remote: false,
+            pinned: true,
+            unread_count: 0,
+            last_msg_ts: "2025-01-15T11:00:00Z".into(),
+            last_msg_preview: "Build is green".into(),
+            avatar_hash: None,
+        };
+        let c3 = Chat {
+            key: ChatKey::new(Provider::Slack, "T1", "C-old"),
+            title: "Light Archive Room".into(),
+            is_group: true,
+            archived_local: true,
+            archived_remote: false,
+            pinned: false,
+            unread_count: 0,
+            last_msg_ts: "2025-01-14T10:00:00Z".into(),
+            last_msg_preview: "Old notes".into(),
+            avatar_hash: None,
+        };
+        store.upsert_chat(&c1, 100).unwrap();
+        store.upsert_chat(&c2, 100).unwrap();
+        store.upsert_chat(&c3, 100).unwrap();
+
+        store
+            .upsert_message(&Message {
+                chat: c1.key.clone(),
+                msg_id: "m1".into(),
+                sender_id: "alice".into(),
+                sender_name: "Alice".into(),
+                from_me: false,
+                ts: "2025-01-14T18:00:00Z".into(),
+                body: "Check https://postbox.example/release".into(),
+                reply_to_id: None,
+                reply_broadcast: false,
+                media_kind: None,
+                mime_type: None,
+                filename: None,
+                reactions: vec![],
+                read_status: ReadStatus::Read,
+                deleted: false,
+            })
+            .unwrap();
+        store
+            .upsert_message(&Message {
+                chat: c1.key.clone(),
+                msg_id: "m2".into(),
+                sender_id: "me".into(),
+                sender_name: "You".into(),
+                from_me: true,
+                ts: "2025-01-15T12:00:00Z".into(),
+                body: "Light mode contrast verified".into(),
+                reply_to_id: None,
+                reply_broadcast: false,
+                media_kind: None,
+                mime_type: None,
+                filename: None,
+                reactions: vec![],
+                read_status: ReadStatus::Read,
+                deleted: false,
+            })
+            .unwrap();
+
+        store
+    }
+
+    #[test]
+    fn window_title_enforces_pre_view_combined_account_marked_and_notice() {
+        let store = seeded_store();
+        let vm_uninit =
+            PostboxViewModel::new_uninitialized(store, Keymap::postbox_defaults(), "0.1.0");
+        assert_eq!(vm_uninit.window_title(), "Postbox v0.1.0");
+
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+        assert_eq!(vm.window_title(), "Combined inbox - Postbox v0.1.0");
+
+        vm.toggle_mark_message("m1");
+        assert_eq!(
+            vm.window_title(),
+            "Combined inbox \u{00B7} 1 messages marked - Postbox v0.1.0"
+        );
+        vm.set_title_notice(Some("Copied transcript".into()));
+        assert_eq!(
+            vm.window_title(),
+            "Combined inbox \u{00B7} 1 messages marked \u{00B7} Copied transcript - Postbox v0.1.0"
+        );
+
+        assert!(vm.switch_to_account_slot(3)); // Slack (switching chats clears marked messages)
+        assert_eq!(
+            vm.window_title(),
+            "Acme Slack \u{00B7} Copied transcript - Postbox v0.1.0"
+        );
+        vm.toggle_mark_message("slack-m1");
+        assert_eq!(
+            vm.window_title(),
+            "Acme Slack \u{00B7} 1 messages marked \u{00B7} Copied transcript - Postbox v0.1.0"
+        );
+    }
+
+    #[test]
+    fn theme_and_font_scale_persist_to_sqlite_settings() {
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+        assert_eq!(vm.theme(), ThemeChoice::ZincDark);
+        assert_eq!(vm.font_scale(), FontScale::default());
+
+        vm.set_theme(ThemeChoice::Amoled);
+        vm.font_larger();
+        vm.font_larger();
+        assert_eq!(vm.font_scale().percent(), 120);
+
+        let persisted = vm.store().load_ui_settings().unwrap();
+        assert_eq!(persisted.theme, ThemeChoice::Amoled);
+        assert_eq!(persisted.font_scale.percent(), 120);
+
+        vm.font_reset();
+        assert_eq!(vm.font_scale().percent(), 100);
+    }
+
+    #[test]
+    fn hold_ctrl_badges_appear_clear_on_blur_and_slot_jumps_focus_composer() {
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+        assert!(!vm.ctrl_badges_visible());
+        assert!(vm.sidebar_rows().iter().all(|r| r.slot_badge.is_none()));
+
+        assert!(vm.on_ctrl_down());
+        let rows = vm.sidebar_rows();
+        assert_eq!(rows[0].slot_badge, Some(1));
+        assert_eq!(rows[1].slot_badge, Some(2));
+
+        assert!(vm.open_chat_slot(2));
+        assert_eq!(vm.selected_chat().unwrap().title, "Engineering");
+        assert_eq!(vm.focus(), FocusTarget::Composer);
+
+        assert!(vm.on_window_blur());
+        assert!(!vm.ctrl_badges_visible());
+        assert!(vm.sidebar_rows().iter().all(|r| r.slot_badge.is_none()));
+    }
+
+    #[test]
+    fn ctrl_k_palette_ranks_chats_above_fts_above_commands_and_executes_theme() {
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+        vm.open_palette();
+        assert!(vm.palette_open());
+
+        vm.set_palette_query("light");
+        let entries = vm.palette_entries();
+        let first_chat = entries
+            .iter()
+            .position(|e| e.group == PaletteGroupKind::Chats)
+            .unwrap();
+        let first_msg = entries
+            .iter()
+            .position(|e| e.group == PaletteGroupKind::Messages)
+            .unwrap();
+        let first_cmd = entries
+            .iter()
+            .position(|e| e.group == PaletteGroupKind::Commands)
+            .unwrap();
+        assert!(first_chat < first_msg);
+        assert!(first_msg < first_cmd);
+
+        // Execute "Theme: Light" directly via query
+        vm.set_palette_query("Theme: Light");
+        assert!(vm.execute_palette_selected());
+        assert!(!vm.palette_open());
+        assert_eq!(vm.theme(), ThemeChoice::Light);
+    }
+
+    #[test]
+    fn sort_views_palette_reorders_accounts_and_persists_view_order() {
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+        assert_eq!(vm.accounts()[0].label, "WhatsApp");
+        assert_eq!(vm.accounts()[1].label, "Acme Slack");
+
+        vm.open_sort_views_palette();
+        assert_eq!(vm.palette_mode(), PaletteMode::SortViews);
+        assert!(vm.palette_move_view_down());
+        assert_eq!(vm.accounts()[0].label, "Acme Slack");
+        assert_eq!(vm.accounts()[1].label, "WhatsApp");
+
+        let persisted = vm.store().load_ui_settings().unwrap();
+        assert_eq!(
+            persisted.view_order,
+            vec!["slack:T1".to_owned(), "whatsapp:main".to_owned()]
+        );
+    }
+
+    #[test]
+    fn chords_f1_links_composer_and_escape_cascade_work_end_to_end() {
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+
+        // Switch to Slack, then G then I jumps back to Combined Inbox
+        assert!(vm.switch_to_account_slot(3));
+        assert_eq!(vm.active_view().unwrap().label(), "Acme Slack");
+        assert!(!vm.handle_inbox_chord_key('g', 1000, false, false));
+        assert!(vm.handle_inbox_chord_key('i', 1400, false, false));
+        assert_eq!(vm.active_view(), Some(&ViewTab::CombinedInbox));
+
+        // Alt+G, Alt+G jumps to latest message
+        assert!(vm.select_chat_index(0)); // Alice Light (2 messages)
+        vm.select_message_index(0);
+        assert_eq!(vm.selected_message_idx(), Some(0));
+        assert_eq!(vm.handle_alt_g(2000, false), LatestChordOutcome::ArmedHint);
+        assert_eq!(vm.handle_alt_g(2500, false), LatestChordOutcome::JumpLatest);
+        assert_eq!(vm.selected_message_idx(), Some(1));
+        assert!(vm.take_scroll_to_latest_pending());
+
+        // Ctrl+O links mode extracts URL from selected message
+        vm.select_message_index(0);
+        vm.open_links_palette();
+        assert_eq!(vm.palette_entries().len(), 1);
+        assert_eq!(
+            vm.palette_entries()[0].label,
+            "https://postbox.example/release"
+        );
+        vm.handle_escape();
+        assert!(!vm.palette_open());
+
+        // F1 opens and Esc closes shortcuts overlay
+        vm.toggle_shortcuts();
+        assert!(vm.shortcuts_open());
+        vm.handle_escape();
+        assert!(!vm.shortcuts_open());
+
+        // Composer submit writes to SQLite + outbox and updates timeline
+        vm.set_focus(FocusTarget::Composer);
+        vm.set_composer_text("Hello from M1");
+        assert!(vm.submit_composer_message());
+        assert!(vm.composer_text().is_empty());
+        assert_eq!(vm.messages().last().unwrap().body, "Hello from M1");
+    }
+
+    #[test]
+    fn ctrl_f_confirm_chat_and_message_hit_restores_full_sidebar_list() {
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+        assert_eq!(vm.chats().len(), 2);
+
+        // Filter sidebar down to 1 chat via Ctrl+F (SearchChats) and confirm the Chat item.
+        vm.open_search_palette();
+        vm.set_palette_query("Engineering");
+        assert_eq!(vm.chats().len(), 1);
+        assert!(vm.execute_palette_selected());
+        assert!(!vm.palette_open());
+        assert!(vm.search_filter().is_empty());
+        assert_eq!(vm.chats().len(), 2);
+        assert_eq!(vm.selected_chat().unwrap().title, "Engineering");
+        assert_eq!(vm.focus(), FocusTarget::Composer);
+
+        // Filter sidebar down to 1 chat via Ctrl+F and confirm a MessageHit item.
+        vm.open_search_palette();
+        vm.set_palette_query("Alice");
+        assert_eq!(vm.chats().len(), 1);
+        let msg_hit_entry = vm
+            .palette_entries()
+            .iter()
+            .find(|e| matches!(e.kind, PaletteEntryKind::MessageHit { .. }))
+            .cloned()
+            .expect("expected FTS5 message hit for Alice");
+        assert!(vm.execute_palette_entry(&msg_hit_entry));
+        assert!(!vm.palette_open());
+        assert!(vm.search_filter().is_empty());
+        assert_eq!(vm.chats().len(), 2);
+        assert_eq!(vm.selected_chat().unwrap().title, "Alice Light");
+        assert_eq!(vm.focus(), FocusTarget::MessageList);
+    }
+
+    #[test]
+    fn format_utc_rfc3339_and_submit_composer_use_real_utc_timestamps() {
+        assert_eq!(format_utc_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_utc_rfc3339(-1), "1969-12-31T23:59:59Z");
+        assert_eq!(format_utc_rfc3339(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(format_utc_rfc3339(951_868_800), "2000-03-01T00:00:00Z");
+        assert_eq!(format_utc_rfc3339(1_709_164_800), "2024-02-29T00:00:00Z");
+        assert_eq!(format_utc_rfc3339(1_795_731_482), "2026-11-26T22:18:02Z");
+
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+        let before = format_utc_rfc3339(now_epoch_secs());
+        vm.set_composer_text("Timestamped message");
+        assert!(vm.submit_composer_message());
+        let after = format_utc_rfc3339(now_epoch_secs());
+        let sent = vm.messages().last().unwrap();
+        assert_eq!(sent.body, "Timestamped message");
+        assert_eq!(sent.ts.len(), 20);
+        assert!(sent.ts.ends_with('Z'));
+        assert!(
+            sent.ts.as_str() >= before.as_str() && sent.ts.as_str() <= after.as_str(),
+            "expected {} to fall within [{}, {}]",
+            sent.ts,
+            before,
+            after
+        );
+    }
+
+    #[test]
+    fn palette_section_row_sync_and_chord_resets_work() {
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+        vm.open_sort_views_palette();
+        assert_eq!(vm.palette_selected_section_row(), Some((0, 0)));
+        assert!(vm.select_palette_section_row(0, 1));
+        assert_eq!(vm.palette_selected_index(), 1);
+        assert_eq!(vm.palette_selected_section_row(), Some((0, 1)));
+        assert!(vm.palette_move_view_up());
+        assert_eq!(vm.accounts()[0].label, "Acme Slack");
+        assert_eq!(vm.palette_selected_section_row(), Some((0, 0)));
+        vm.close_palette();
+
+        // Resetting chords disarms both G->I and Alt+G->Alt+G
+        assert!(vm.switch_to_account_slot(2));
+        assert!(!vm.handle_inbox_chord_key('g', 1000, false, false));
+        vm.reset_inbox_chord();
+        assert!(!vm.handle_inbox_chord_key('i', 1200, false, false));
+        assert_ne!(vm.active_view(), Some(&ViewTab::CombinedInbox));
+
+        assert_eq!(vm.handle_alt_g(2000, false), LatestChordOutcome::ArmedHint);
+        vm.reset_latest_chord();
+        assert_eq!(vm.handle_alt_g(2200, false), LatestChordOutcome::ArmedHint);
+    }
+}

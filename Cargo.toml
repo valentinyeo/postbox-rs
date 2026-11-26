@@ -18,8 +18,10 @@ license = "MIT"
 
 [workspace.dependencies]
 postbox-core = { path = "crates/postbox-core" }
+postbox-hub = { path = "crates/postbox-hub" }
 postbox-store = { path = "crates/postbox-store" }
 postbox-keymap = { path = "crates/postbox-keymap" }
+postbox-platform = { path = "crates/postbox-platform" }
 postbox-ui = { path = "crates/postbox-ui" }
 
 gpui-kit = { version = "0.11.0", default-features = false, features = ["component", "assets"] }

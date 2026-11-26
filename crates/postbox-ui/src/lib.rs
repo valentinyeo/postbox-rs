@@ -1,7 +1,22 @@
+pub mod geometry;
+pub mod palette;
 pub mod theme;
+pub mod timeline;
+pub mod viewmodel;
 
 #[cfg(feature = "desktop")]
 pub mod desktop;
+
+pub use geometry::RowGeometry;
+pub use palette::{
+    PaletteCommand, PaletteEntry, PaletteEntryKind, PaletteGroupKind, PaletteMode, PaletteSection,
+};
+pub use theme::{
+    ARCHIVED_ROW_FOREGROUND_WEIGHT, ShadcnPalette, archived_row_color, archived_text_color,
+    contrast_ratio, relative_luminance,
+};
+pub use timeline::{TimelineItem, build_timeline_items, extract_links_and_media, format_time_hm};
+pub use viewmodel::{FocusTarget, PostboxLaunchContext, PostboxViewModel, SidebarChatRow};
 
 pub const FONT_SANS: &str = "IBM Plex Sans";
 pub const FONT_MONO: &str = "IBM Plex Mono";

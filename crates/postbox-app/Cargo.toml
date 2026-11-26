@@ -1,0 +1,22 @@
+[package]
+name = "postbox-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "postbox"
+path = "src/main.rs"
+
+[features]
+default = []
+desktop = ["postbox-ui/desktop"]
+
+[dependencies]
+postbox-core.workspace = true
+postbox-keymap.workspace = true
+postbox-store.workspace = true
+postbox-ui.workspace = true

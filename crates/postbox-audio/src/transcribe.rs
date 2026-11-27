@@ -101,6 +101,10 @@ impl DeepgramRestClient {
         if body.is_empty() || body.len() > MAX_TRANSCRIBE_AUDIO_BYTES {
             return Err(TranscriptError::LocalFileUnavailable);
         }
+        if content_type.eq_ignore_ascii_case("audio/wav") && !crate::dictation::wav_has_speech(body)
+        {
+            return Err(TranscriptError::NoSpeech);
+        }
         let mut active_key = initial_api_key.trim().to_owned();
         if active_key.is_empty() {
             return Err(TranscriptError::MissingKey);

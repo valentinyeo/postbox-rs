@@ -8,13 +8,20 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+bytes.workspace = true
+futures-util.workspace = true
 opus-pure.workspace = true
 postbox-core.workspace = true
 postbox-platform.workspace = true
 postbox-store.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
+url.workspace = true
+webpki-roots.workspace = true

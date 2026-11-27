@@ -21,7 +21,7 @@ use thiserror::Error;
 pub use media::{FetchMarker, MediaCacheEntry, SETTING_EMOJI_RECENTS, gone_media_pair_key};
 pub use postbox_core::outbox::{OutboxKind, OutboxPhase, OutboxRecord};
 pub use state::{MAX_PINS, PendingArchiveRow};
-pub use voice::{SETTING_MICROPHONE, SETTING_PLAYBACK_SPEED};
+pub use voice::{SETTING_DICTATION_LANGUAGE, SETTING_MICROPHONE, SETTING_PLAYBACK_SPEED};
 
 pub const MEDIA_TTL_SECS: i64 = 14 * 24 * 60 * 60;
 pub const BUSY_TIMEOUT_MS: u64 = 5_000;

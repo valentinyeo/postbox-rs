@@ -9,6 +9,15 @@ pub mod threads;
 pub mod views;
 pub mod voice;
 
+pub use dictation::{
+    DICTATION_BYTES_PER_SEC, DICTATION_CHANNELS, DICTATION_CLOSE_STREAM_TIMEOUT_MS,
+    DICTATION_MAX_DURATION_SECS, DICTATION_SAMPLE_RATE, DICTATION_TRANSCRIPT_CAPACITY,
+    DictationAnchor, DictationLanguage, DictationPadding, DictationState, MIC_CHOICE_MAX_DEVICES,
+    MIC_CHOICE_NAME_CAP, MIC_PILL_BAR_COUNT, MIC_PILL_HEIGHT_PX, MIC_PILL_TICK_MS,
+    MIC_PILL_WIDTH_PX, PrepareDictationError, PreparedDictation, dictation_padding,
+    prepare_dictation, truncate_mic_name,
+};
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

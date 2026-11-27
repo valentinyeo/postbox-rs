@@ -8,7 +8,9 @@ pub mod wasapi;
 
 use crate::audio::{AudioBackend, AudioCaptureStream, AudioRenderStream};
 use crate::clipboard::{ClipboardBackend, ClipboardPayload, ZoneMarker, mark_downloaded_file_zone};
-use crate::{EnvRegistry, Notifier, PlatformError, SecretLoad, SecretLoadOutcome, SecretStore};
+use crate::{
+    EnvRegistry, Notifier, OsRegistry, PlatformError, SecretLoad, SecretLoadOutcome, SecretStore,
+};
 use postbox_core::ChatKey;
 use postbox_core::voice::AudioDeviceInfo;
 use std::path::Path;
@@ -49,6 +51,24 @@ impl SecretStore for WindowsPlatform {
 impl EnvRegistry for WindowsPlatform {
     fn load_user_env(&self, name: &str) -> Result<Option<String>, PlatformError> {
         registry::load_user_environment(name)
+    }
+}
+
+impl OsRegistry for WindowsPlatform {
+    fn load_dword(&self, name: &str) -> Result<Option<u32>, PlatformError> {
+        registry::load_messages_dword(name)
+    }
+
+    fn save_dword(&self, name: &str, value: u32) -> Result<(), PlatformError> {
+        registry::save_messages_dword(name, value)
+    }
+
+    fn load_string(&self, name: &str) -> Result<Option<String>, PlatformError> {
+        registry::load_messages_string(name)
+    }
+
+    fn save_string(&self, name: &str, value: &str) -> Result<(), PlatformError> {
+        registry::save_messages_string(name, value)
     }
 }
 

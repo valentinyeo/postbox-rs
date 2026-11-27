@@ -10,9 +10,10 @@ use audio_service::spawn_offline_audio_worker;
 use postbox_hub::Endpoint;
 use postbox_keymap::Keymap;
 use postbox_platform::{
-    ApiKeyOutcome, AudioBackend, GiphyKeyOutcome, HubDiscoveryOutcome, NativePlatform,
-    discover_deepgram_api_key_from_system, discover_format_provider_from_system,
-    discover_giphy_api_key_from_system, discover_hub_credentials_from_system,
+    ApiKeyOutcome, AudioBackend, GiphyKeyOutcome, HubDiscoveryOutcome, NativePlatform, OsRegistry,
+    REG_DICTATION_LANGUAGE, discover_deepgram_api_key_from_system,
+    discover_format_provider_from_system, discover_giphy_api_key_from_system,
+    discover_hub_credentials_from_system, load_microphone_choice,
 };
 use postbox_store::Store;
 use postbox_ui::{HubConnectionStatus, PostboxLaunchContext, create_sync_bridge};
@@ -154,6 +155,16 @@ fn build_launch_context(
 
     let format_provider = discover_format_provider_from_system(&platform, &platform);
     let llm_format_key_available = format_provider.is_some();
+
+    // Feature #30/#32: Sync persisted Windows HKCU\Software\Messages dictation language & microphone
+    // into local SQLite Store on startup (no-op on non-Windows where NativePlatform registry is empty).
+    if let Ok(Some(dword)) = platform.load_dword(REG_DICTATION_LANGUAGE) {
+        let lang = postbox_core::dictation::DictationLanguage::from_registry_dword(dword);
+        let _ = store.save_dictation_language(lang);
+    }
+    if let Some(mic) = load_microphone_choice(&platform) {
+        let _ = store.save_microphone_preference(Some(&mic));
+    }
 
     let audio_backend: Arc<dyn AudioBackend> = Arc::new(NativePlatform::default());
 

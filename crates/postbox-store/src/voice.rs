@@ -1,5 +1,6 @@
 use crate::{Store, StoreError, gone_media_pair_key};
 use postbox_core::ChatKey;
+use postbox_core::dictation::DictationLanguage;
 use postbox_core::voice::{
     PLAYED_VOICE_CAP, PlaybackSpeed, TranscriptRecord, VOICE_POS_CAP, VOICE_POS_END_CLEAR_MS,
 };
@@ -8,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 pub const SETTING_PLAYBACK_SPEED: &str = "audio.playback_speed";
 pub const SETTING_MICROPHONE: &str = "audio.microphone";
+pub const SETTING_DICTATION_LANGUAGE: &str = "audio.dictation_language";
 
 impl Store {
     /// Marks a voice message as played, maintaining a 2048-entry FIFO ring cap.
@@ -300,6 +302,32 @@ impl Store {
         )?;
         Ok(())
     }
+
+    pub fn load_dictation_language(&self) -> Result<DictationLanguage, StoreError> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![SETTING_DICTATION_LANGUAGE],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw
+            .as_deref()
+            .and_then(DictationLanguage::parse)
+            .unwrap_or(DictationLanguage::Automatic))
+    }
+
+    pub fn save_dictation_language(&self, lang: DictationLanguage) -> Result<(), StoreError> {
+        self.conn.execute(
+            r#"
+            INSERT INTO settings (key, value) VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+            params![SETTING_DICTATION_LANGUAGE, lang.as_str()],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -439,5 +467,24 @@ mod tests {
         );
         store.save_microphone_preference(None).unwrap();
         assert_eq!(store.load_microphone_preference().unwrap(), None);
+
+        assert_eq!(
+            store.load_dictation_language().unwrap(),
+            DictationLanguage::Automatic
+        );
+        store
+            .save_dictation_language(DictationLanguage::German)
+            .unwrap();
+        assert_eq!(
+            store.load_dictation_language().unwrap(),
+            DictationLanguage::German
+        );
+        store
+            .save_dictation_language(DictationLanguage::English)
+            .unwrap();
+        assert_eq!(
+            store.load_dictation_language().unwrap(),
+            DictationLanguage::English
+        );
     }
 }

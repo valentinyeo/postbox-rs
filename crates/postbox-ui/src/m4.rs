@@ -152,9 +152,12 @@ impl PostboxViewModel {
     }
 
     pub fn select_microphone(&mut self, name: Option<String>) {
-        let normalized = name.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+        let normalized = name
+            .map(|s| postbox_core::dictation::truncate_mic_name(&s).to_owned())
+            .filter(|s| !s.is_empty());
         self.m4.selected_microphone = normalized.clone();
         let _ = self.store.save_microphone_preference(normalized.as_deref());
+        self.emit_sync_command(SyncCommand::SaveMicrophonePreference(normalized.clone()));
         self.status_notice = Some(if normalized.is_none() {
             "Microphone: System default".to_owned()
         } else {
@@ -577,6 +580,10 @@ impl PostboxViewModel {
         }
         if self.m4.recording.is_recording() {
             return self.finish_voice_recording();
+        }
+        if self.is_dictation_active() {
+            self.status_notice = Some("Finish or cancel dictation first".to_owned());
+            return false;
         }
         if self.focus == FocusTarget::ThreadComposer {
             return false;

@@ -11,9 +11,9 @@ use windows::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, ERROR_UNSUPPORTED_TYPE,
 };
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_BINARY, REG_OPTION_NON_VOLATILE, RRF_RT_REG_BINARY,
-    RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteValueW,
-    RegGetValueW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_BINARY, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegCloseKey,
+    RegCreateKeyExW, RegDeleteValueW, RegGetValueW, RegSetValueExW,
 };
 use windows::core::PCWSTR;
 
@@ -283,6 +283,145 @@ pub fn reg_set_binary(subkey: &str, name: &str, data: &[u8]) -> Result<(), Platf
         )));
     }
     Ok(())
+}
+
+pub fn reg_get_dword(subkey: &str, name: &str) -> Result<Option<u32>, PlatformError> {
+    let wide_subkey = to_wide_null(subkey);
+    let wide_name = to_wide_null(name);
+    let mut buf = [0u8; 4];
+    let mut size: u32 = 4;
+
+    // SAFETY: `buf` is a 4-byte stack buffer matching `REG_DWORD` size (`size = 4`).
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(wide_subkey.as_ptr()),
+            PCWSTR(wide_name.as_ptr()),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if status == ERROR_FILE_NOT_FOUND || status == ERROR_UNSUPPORTED_TYPE {
+        return Ok(None);
+    }
+    if status != ERROR_SUCCESS {
+        return Err(PlatformError::RegistryError(format!(
+            "RegGetValueW dword read failed: {}",
+            status.0
+        )));
+    }
+    if size != 4 {
+        return Ok(None);
+    }
+    Ok(Some(u32::from_le_bytes(buf)))
+}
+
+pub fn reg_set_dword(subkey: &str, name: &str, value: u32) -> Result<(), PlatformError> {
+    let wide_subkey = to_wide_null(subkey);
+    let wide_name = to_wide_null(name);
+    let mut hkey = HKEY::default();
+
+    // SAFETY: Creating/opening `HKCU\<subkey>` with `KEY_SET_VALUE`; `RegKeyGuard` closes `hkey`.
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(wide_subkey.as_ptr()),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut hkey,
+            None,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(PlatformError::RegistryError(format!(
+            "RegCreateKeyExW failed: {}",
+            status.0
+        )));
+    }
+    let _guard = RegKeyGuard(hkey);
+
+    let data = value.to_le_bytes();
+    // SAFETY: `hkey` is open with `KEY_SET_VALUE` and `data` is a 4-byte little-endian DWORD.
+    let write_status = unsafe {
+        RegSetValueExW(
+            hkey,
+            PCWSTR(wide_name.as_ptr()),
+            None,
+            REG_DWORD,
+            Some(&data),
+        )
+    };
+    if write_status != ERROR_SUCCESS {
+        return Err(PlatformError::RegistryError(format!(
+            "RegSetValueExW dword failed: {}",
+            write_status.0
+        )));
+    }
+    Ok(())
+}
+
+/// Writes a NUL-terminated UTF-16LE `REG_SZ` value under `HKCU\<subkey>\<name>`.
+/// Explicitly permits empty string `""` (e.g., clearing `Microphone` to System default).
+pub fn reg_set_string(subkey: &str, name: &str, value: &str) -> Result<(), PlatformError> {
+    let wide_subkey = to_wide_null(subkey);
+    let wide_name = to_wide_null(name);
+    let wide_val = to_wide_null(value);
+    let bytes: Vec<u8> = wide_val.iter().flat_map(|u| u.to_le_bytes()).collect();
+    let mut hkey = HKEY::default();
+
+    // SAFETY: Creating/opening `HKCU\<subkey>` with `KEY_SET_VALUE`; `RegKeyGuard` closes `hkey`.
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(wide_subkey.as_ptr()),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut hkey,
+            None,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(PlatformError::RegistryError(format!(
+            "RegCreateKeyExW failed: {}",
+            status.0
+        )));
+    }
+    let _guard = RegKeyGuard(hkey);
+
+    // SAFETY: `hkey` is open with `KEY_SET_VALUE` and `bytes` is a valid NUL-terminated UTF-16LE slice.
+    let write_status =
+        unsafe { RegSetValueExW(hkey, PCWSTR(wide_name.as_ptr()), None, REG_SZ, Some(&bytes)) };
+    if write_status != ERROR_SUCCESS {
+        return Err(PlatformError::RegistryError(format!(
+            "RegSetValueExW string failed: {}",
+            write_status.0
+        )));
+    }
+    Ok(())
+}
+
+pub fn load_messages_dword(name: &str) -> Result<Option<u32>, PlatformError> {
+    reg_get_dword(MESSAGES_SUBKEY, name)
+}
+
+pub fn save_messages_dword(name: &str, value: u32) -> Result<(), PlatformError> {
+    reg_set_dword(MESSAGES_SUBKEY, name, value)
+}
+
+pub fn load_messages_string(name: &str) -> Result<Option<String>, PlatformError> {
+    reg_get_string(MESSAGES_SUBKEY, name)
+}
+
+pub fn save_messages_string(name: &str, value: &str) -> Result<(), PlatformError> {
+    reg_set_string(MESSAGES_SUBKEY, name, value)
 }
 
 pub fn reg_delete_value(subkey: &str, name: &str) -> Result<(), PlatformError> {

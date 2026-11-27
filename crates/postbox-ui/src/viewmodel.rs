@@ -1,6 +1,7 @@
 use crate::geometry::RowGeometry;
 use crate::m3::M3State;
 use crate::m4::M4State;
+use crate::m5::M5State;
 use crate::palette::{
     PaletteCatalogContext, PaletteCommand, PaletteEntry, PaletteEntryKind, PaletteFilterInput,
     PaletteMode, PaletteSection, PaletteState, build_palette_items, filter_palette,
@@ -188,7 +189,7 @@ pub struct PostboxViewModel {
     pub(crate) chats: Vec<Chat>,
     selected_chat_idx: Option<usize>,
     bulk_selected: BTreeSet<ChatKey>,
-    drafts: BTreeMap<ChatKey, Draft>,
+    pub(crate) drafts: BTreeMap<ChatKey, Draft>,
 
     pub(crate) messages: Vec<Message>,
     loaded_message_limit: usize,
@@ -199,9 +200,9 @@ pub struct PostboxViewModel {
     pub(crate) reply_to_msg_id: Option<String>,
     exhausted_chats: BTreeSet<ChatKey>,
 
-    thread_panel: Option<ThreadPanelState>,
+    pub(crate) thread_panel: Option<ThreadPanelState>,
 
-    composer_text: String,
+    pub(crate) composer_text: String,
     pub(crate) focus: FocusTarget,
     pub(crate) palette: PaletteState,
     shortcuts_open: bool,
@@ -219,6 +220,7 @@ pub struct PostboxViewModel {
     pub(crate) local_send_seq: u64,
     pub(crate) m3: M3State,
     pub(crate) m4: M4State,
+    pub(crate) m5: M5State,
 }
 
 impl PostboxViewModel {
@@ -248,6 +250,9 @@ impl PostboxViewModel {
         let saved_speed = store
             .load_playback_speed()
             .unwrap_or(postbox_core::voice::PlaybackSpeed::X1);
+        let saved_dictation_lang = store
+            .load_dictation_language()
+            .unwrap_or(DictationLanguage::Automatic);
         let m4 = M4State {
             playback_speed: saved_speed,
             played_keys: store.list_played_voice_keys().unwrap_or_default(),
@@ -268,7 +273,7 @@ impl PostboxViewModel {
             view_order: settings.view_order,
             show_archived_by_view,
             view_selected_chat: BTreeMap::new(),
-            dictation_language: DictationLanguage::Automatic,
+            dictation_language: saved_dictation_lang,
             playback_speed_pct: saved_speed.percent(),
             slack_threads_by_account: BTreeMap::new(),
             replies_fold_by_chat: BTreeMap::new(),
@@ -311,6 +316,7 @@ impl PostboxViewModel {
             local_send_seq: 0,
             m3,
             m4,
+            m5: M5State::default(),
         }
     }
 
@@ -701,6 +707,37 @@ impl PostboxViewModel {
                 self.set_microphones(devices);
                 0
             }
+            SyncEvent::DictationConnected { generation } => {
+                self.handle_dictation_connected(generation);
+                0
+            }
+            SyncEvent::DictationInterim {
+                generation,
+                revision,
+                text,
+            } => {
+                self.handle_dictation_interim(generation, revision, text);
+                0
+            }
+            SyncEvent::DictationLevel { generation, level } => {
+                self.handle_dictation_level(generation, level);
+                0
+            }
+            SyncEvent::DictationDraining { generation } => {
+                self.handle_dictation_draining(generation);
+                0
+            }
+            SyncEvent::DictationFinal { generation, text } => {
+                self.handle_dictation_final(generation, text);
+                0
+            }
+            SyncEvent::DictationFailed {
+                generation,
+                message,
+            } => {
+                self.handle_dictation_failed(generation, message);
+                0
+            }
             SyncEvent::Notice(msg) => {
                 self.status_notice = Some(msg);
                 0
@@ -877,6 +914,8 @@ impl PostboxViewModel {
         }
         self.composer_text = next;
         self.persist_active_draft();
+        let current = self.composer_text.clone();
+        self.on_composer_user_edit(false, &current);
     }
 
     pub fn set_composer_text(&mut self, text: impl Into<String>) {
@@ -945,6 +984,7 @@ impl PostboxViewModel {
 
     pub fn cancel_reply(&mut self) {
         self.reply_to_msg_id = None;
+        self.observe_dictation_context();
     }
 
     pub fn unread_only(&self) -> bool {
@@ -1413,6 +1453,7 @@ impl PostboxViewModel {
             limit: OLDER_PAGE_LIMIT,
         });
         self.scroll_to_latest_pending = true;
+        self.observe_dictation_context();
         true
     }
 
@@ -1525,6 +1566,7 @@ impl PostboxViewModel {
         self.show_archived_only = false;
         self.bulk_selected.clear();
         self.refresh_chats();
+        self.observe_dictation_context();
         self.status_notice = Some("Combined inbox".into());
     }
 
@@ -1543,6 +1585,7 @@ impl PostboxViewModel {
         self.show_archived_only = false;
         self.bulk_selected.clear();
         self.refresh_chats();
+        self.observe_dictation_context();
         self.status_notice = Some(account.label);
         true
     }
@@ -1567,6 +1610,7 @@ impl PostboxViewModel {
         self.show_archived_only = false;
         self.bulk_selected.clear();
         self.refresh_chats();
+        self.observe_dictation_context();
         self.status_notice = Some(account.label);
         true
     }
@@ -1575,6 +1619,7 @@ impl PostboxViewModel {
         self.unread_only = !self.unread_only;
         self.user_viewed = false;
         self.refresh_chats();
+        self.observe_dictation_context();
         self.status_notice = Some(if self.unread_only {
             "Showing unread chats".into()
         } else {
@@ -1590,6 +1635,7 @@ impl PostboxViewModel {
         self.persist_ui_settings();
         self.user_viewed = false;
         self.refresh_chats();
+        self.observe_dictation_context();
         self.status_notice = Some(if next {
             "Archived chats shown in this view".into()
         } else {
@@ -1601,6 +1647,7 @@ impl PostboxViewModel {
         self.show_archived_only = !self.show_archived_only;
         self.user_viewed = false;
         self.refresh_chats();
+        self.observe_dictation_context();
         self.status_notice = Some(if self.show_archived_only {
             "Showing archived chats".into()
         } else {
@@ -1924,6 +1971,7 @@ impl PostboxViewModel {
             }
             self.reply_to_msg_id = Some(msg.msg_id);
             self.focus = FocusTarget::Composer;
+            self.observe_dictation_context();
         }
     }
 
@@ -1963,6 +2011,7 @@ impl PostboxViewModel {
         });
         self.refresh_thread_panel_messages();
         self.focus = FocusTarget::ThreadComposer;
+        self.observe_dictation_context();
         true
     }
 
@@ -2029,13 +2078,16 @@ impl PostboxViewModel {
             ) {
                 self.focus = FocusTarget::MessageList;
             }
+            self.observe_dictation_context();
         }
     }
 
     pub fn set_thread_composer_text(&mut self, text: impl Into<String>) {
+        let next = text.into();
         if let Some(panel) = &mut self.thread_panel {
-            panel.composer_text = text.into();
+            panel.composer_text = next.clone();
         }
+        self.on_composer_user_edit(true, &next);
     }
 
     pub fn set_thread_broadcast(&mut self, enabled: bool) {
@@ -2476,6 +2528,9 @@ impl PostboxViewModel {
             .selected_chat()
             .map(|c| (c.key.clone(), c.is_archived()));
         self.focus = FocusTarget::Palette;
+        if mode == PaletteMode::Normal {
+            self.emit_sync_command(SyncCommand::RefreshMicrophones);
+        }
         self.rebuild_palette_entries();
     }
 
@@ -2738,6 +2793,12 @@ impl PostboxViewModel {
                 self.focus = FocusTarget::ShortcutsOverlay;
                 return true;
             }
+            PaletteCommand::Dictate => {
+                self.palette.open = false;
+                self.palette.query.clear();
+                self.toggle_dictation(true);
+                return true;
+            }
             _ => {
                 self.palette.open = false;
                 self.palette.query.clear();
@@ -2800,14 +2861,13 @@ impl PostboxViewModel {
                 }
             },
             PaletteCommand::Dictate => {
-                self.status_notice = Some("Dictation available in Milestone 5".into());
+                self.toggle_dictation(true);
             }
             PaletteCommand::RecordVoiceNote => {
                 self.toggle_voice_recording(true);
             }
             PaletteCommand::SetDictationLanguage(lang) => {
-                self.dictation_language = *lang;
-                self.status_notice = Some(format!("Dictation language set: {lang:?}"));
+                self.set_dictation_language(*lang);
             }
             PaletteCommand::SelectMicrophoneDefault => {
                 self.select_microphone(None);
@@ -3025,6 +3085,10 @@ impl PostboxViewModel {
             self.cancel_voice_recording("Voice note cancelled");
             return;
         }
+        if self.is_dictation_active() {
+            self.cancel_dictation();
+            return;
+        }
         if self.thread_panel.is_some() {
             self.close_thread_panel();
             return;
@@ -3214,6 +3278,15 @@ impl PostboxViewModel {
             }
             Action::CancelVoiceRecord => {
                 self.cancel_voice_recording("Voice note cancelled");
+            }
+            Action::ToggleDictation => {
+                self.toggle_dictation(true);
+            }
+            Action::FinishDictation => {
+                self.finish_dictation_and_auto_send();
+            }
+            Action::CancelDictation => {
+                self.cancel_dictation();
             }
             Action::CopyMessageText | Action::SmartCopy => {
                 self.copy_selected_message_text();

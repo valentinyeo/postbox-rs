@@ -240,6 +240,21 @@ pub enum SyncCommand {
     VoiceRecordFinish,
     VoiceRecordCancel,
     RefreshMicrophones,
+    // --- Milestone 5 commands ---
+    DictationStart {
+        generation: u64,
+        origin_chat: ChatKey,
+        language: DictationLanguage,
+        preferred_mic: Option<String>,
+    },
+    DictationStop {
+        generation: u64,
+    },
+    DictationCancel {
+        generation: u64,
+    },
+    SaveDictationLanguage(DictationLanguage),
+    SaveMicrophonePreference(Option<String>),
     Shutdown,
 }
 
@@ -379,6 +394,30 @@ pub enum SyncEvent {
         message: String,
     },
     MicrophonesUpdated(Vec<AudioDeviceInfo>),
+    // --- Milestone 5 events ---
+    DictationConnected {
+        generation: u64,
+    },
+    DictationInterim {
+        generation: u64,
+        revision: u64,
+        text: String,
+    },
+    DictationLevel {
+        generation: u64,
+        level: u8,
+    },
+    DictationDraining {
+        generation: u64,
+    },
+    DictationFinal {
+        generation: u64,
+        text: String,
+    },
+    DictationFailed {
+        generation: u64,
+        message: String,
+    },
     Notice(String),
 }
 

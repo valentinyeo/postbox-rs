@@ -35,6 +35,28 @@ pub trait UrlHandler: Send + Sync {
 pub trait SingleInstance: Send + Sync {
     /// `true` when this process owns the lock, `false` when another instance already does.
     fn try_acquire(&self, user: &str) -> Result<bool, PlatformError>;
+
+    /// Retries [`SingleInstance::try_acquire`] until it wins or `wait` runs out.
+    ///
+    /// The self-updater relaunches itself while the previous process is still shutting down,
+    /// so the fresh build must wait for the old one to release the lock instead of
+    /// forwarding an empty link and exiting.
+    fn try_acquire_waiting(
+        &self,
+        user: &str,
+        wait: std::time::Duration,
+    ) -> Result<bool, PlatformError> {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            if self.try_acquire(user)? {
+                return Ok(true);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
 }
 
 /// The `\\.\pipe\postbox-link-<user>` forwarder.
@@ -96,6 +118,33 @@ pub fn startup(
     };
     let _ = pipe.forward(user, &payload)?;
     Ok(StartupRole::Forwarded { link })
+}
+
+/// Command-line flag the updater passes to the build it launches.
+pub const UPDATE_RELAUNCH_ARG: &str = "--update-relaunch";
+
+/// How long a fresh build waits for the process it replaced to release the single-instance
+/// lock before deciding another copy really is running.
+pub const UPDATE_RELAUNCH_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Startup for the build the updater just swapped in.
+///
+/// The old process is still exiting, so take the lock with a bounded wait instead of
+/// treating its mutex as a second instance. If the wait still loses, this is a genuine
+/// second launch and the caller exits without a window.
+pub fn startup_relaunch(
+    exe_path: &str,
+    user: &str,
+    registry: &dyn UrlHandler,
+    instance: &dyn SingleInstance,
+    wait: std::time::Duration,
+) -> Result<StartupRole, PlatformError> {
+    let _ = registry.register(exe_path)?;
+    if instance.try_acquire_waiting(user, wait)? {
+        Ok(StartupRole::Primary { link: None })
+    } else {
+        Ok(StartupRole::Forwarded { link: None })
+    }
 }
 
 /// Line the link pipe sends when a URL is opened on a running instance.
@@ -239,6 +288,8 @@ impl UrlHandler for MockUrlHandler {
 #[derive(Debug, Default)]
 pub struct MockSingleInstance {
     owner: Mutex<Option<String>>,
+    /// Attempts still refused before the simulated old process lets go.
+    release_after: Mutex<Option<usize>>,
 }
 
 impl MockSingleInstance {
@@ -250,6 +301,15 @@ impl MockSingleInstance {
     pub fn held_by(user: &str) -> Self {
         Self {
             owner: Mutex::new(Some(user.to_owned())),
+            release_after: Mutex::new(None),
+        }
+    }
+
+    /// Simulates a process that lets go after `attempts` refused acquisitions.
+    pub fn held_by_until(user: &str, attempts: usize) -> Self {
+        Self {
+            owner: Mutex::new(Some(user.to_owned())),
+            release_after: Mutex::new(Some(attempts)),
         }
     }
 
@@ -264,6 +324,16 @@ impl SingleInstance for MockSingleInstance {
             .owner
             .lock()
             .map_err(|_| PlatformError::OsUnavailable)?;
+        if let Ok(mut release) = self.release_after.lock()
+            && let Some(remaining) = *release
+        {
+            if remaining > 0 {
+                *release = Some(remaining - 1);
+                return Ok(false);
+            }
+            *release = None;
+            *guard = None;
+        }
         if guard.is_some() {
             return Ok(false);
         }
@@ -328,9 +398,32 @@ pub fn mutex_name(user: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const EXE: &str = r"C:\Program Files\Postbox\postbox.exe";
     const WA: &str = "postbox://whatsapp/biz/491234%40s.whatsapp.net";
+
+    #[test]
+    fn the_relaunched_build_waits_for_the_old_process_lock_instead_of_forwarding() {
+        let registry = MockUrlHandler::new();
+        let instance = MockSingleInstance::held_by_until("valentin", 2);
+
+        let role =
+            startup_relaunch(EXE, "valentin", &registry, &instance, UPDATE_RELAUNCH_WAIT).unwrap();
+
+        assert!(matches!(role, StartupRole::Primary { link: None }));
+        assert_eq!(instance.owner().as_deref(), Some("valentin"));
+    }
+
+    #[test]
+    fn a_relaunch_that_never_gets_the_lock_still_exits_without_a_window() {
+        let registry = MockUrlHandler::new();
+        let instance = MockSingleInstance::held_by("valentin");
+
+        let role = startup_relaunch(EXE, "valentin", &registry, &instance, Duration::ZERO).unwrap();
+
+        assert!(matches!(role, StartupRole::Forwarded { link: None }));
+    }
 
     #[test]
     fn first_launch_registers_the_scheme_and_opens_a_window() {

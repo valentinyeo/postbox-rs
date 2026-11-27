@@ -12,6 +12,8 @@ use postbox_hub::Endpoint;
 use postbox_keymap::Keymap;
 use postbox_media::VideoThumbnailCache;
 use postbox_platform::exit_records::{ExitRecordStore, install_panic_hook};
+#[cfg(all(windows, feature = "desktop"))]
+use postbox_platform::os_integration::startup_relaunch;
 use postbox_platform::os_integration::{StartupRole, link_from_args};
 use postbox_platform::{
     ApiKeyOutcome, AudioBackend, GiphyKeyOutcome, HubDiscoveryOutcome, NativePlatform, OsRegistry,
@@ -36,6 +38,10 @@ struct StartupConfig {
     hub_url: Option<String>,
     /// `postbox://` URL handed to this launch by the protocol handler.
     link: Option<String>,
+    /// Set by the updater relaunch, so a fresh build takes the lock from the old process.
+    update_relaunch: bool,
+    /// Window geometry the updater relaunch passed, so the new build opens maximized there.
+    restore_window: Option<postbox_platform::WindowState>,
     in_memory: bool,
     allow_loopback: bool,
     /// Skips registry registration, the single-instance guard and the pipes (tests, CI).
@@ -69,6 +75,14 @@ impl StartupConfig {
                     }
                 }
                 "--no-os-integration" => cfg.no_os_integration = true,
+                postbox_platform::os_integration::UPDATE_RELAUNCH_ARG => {
+                    cfg.update_relaunch = true;
+                }
+                postbox_platform::window_state::WINDOW_STATE_ARG => {
+                    if let Some(raw) = iter.next() {
+                        cfg.restore_window = Some(postbox_platform::WindowState::decode(&raw));
+                    }
+                }
                 other => {
                     // The protocol handler passes the URL as a bare argument, so a stray
                     // `postbox://` anywhere on the command line counts as the link.
@@ -336,6 +350,7 @@ fn build_launch_context(
         startup_link: None,
         last_exit_record: None,
         os_integration: false,
+        restore_window: cfg.restore_window,
         release_source: update_source::GithubReleaseSource::new()
             .ok()
             .map(|source| Arc::new(source) as Arc<dyn postbox_platform::ReleaseSource>),
@@ -373,6 +388,18 @@ fn resolve_startup_role(cfg: &StartupConfig, data_dir: &std::path::Path) -> Star
         let _ = data_dir;
         let registry = postbox_platform::win::os::WindowsUrlHandler::new();
         let instance = postbox_platform::win::os::WindowsSingleInstance::new();
+        // The updater relaunch replaces a process that is still exiting, so it waits for the
+        // mutex instead of forwarding a focus signal to a window that is about to close.
+        if cfg.update_relaunch {
+            return startup_relaunch(
+                &exe_path,
+                &user,
+                &registry,
+                &instance,
+                postbox_platform::UPDATE_RELAUNCH_WAIT,
+            )
+            .unwrap_or(StartupRole::Primary { link: None });
+        }
         let pipe = postbox_platform::win::os::WindowsLinkPipe::new();
         match startup(
             &exe_path,

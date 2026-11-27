@@ -1238,6 +1238,7 @@ mod desktop_tests {
             last_exit_record: None,
             os_integration: false,
             release_source: None,
+            restore_window: None,
         };
 
         let keymap = launch_ctx.keymap.clone();

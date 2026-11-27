@@ -69,22 +69,48 @@ pub struct LinkAction {
     pub raise_window: bool,
 }
 
-/// Updater state machine, driven from the `Ctrl+K` command.
+/// Updater state machine, driven by the background scheduler and the `Ctrl+K` command.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum UpdatePhase {
     /// Nothing has been checked in this run.
     #[default]
     Idle,
-    /// A check or a download is running.
-    Busy,
+    /// A manifest check is running.
+    Checking,
+    /// A newer release is downloading and being staged in the background.
+    Downloading,
+    /// The download is verified and staged; the restart card is offered.
+    Ready,
+    /// The restart click is swapping the staged binary in.
+    Installing,
     /// The running build is the newest.
     UpToDate,
-    /// A newer build is available and waiting for the user's say-so.
-    Available,
-    /// The update is being applied.
-    Installing,
-    /// The update failed; the installed build is untouched.
+    /// A manual update failed; the installed build is untouched.
     Failed,
+}
+
+/// The non-modal "Restart to update" card, shown once an update is staged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatePrompt {
+    pub tag: String,
+    pub notes: String,
+    pub created_ms: u64,
+}
+
+impl UpdatePrompt {
+    pub fn new(tag: impl Into<String>, notes: impl Into<String>, now_ms: u64) -> Self {
+        let notes: String = notes.into().chars().take(MAX_CARD_NOTE_CHARS).collect();
+        Self {
+            tag: tag.into(),
+            notes,
+            created_ms: now_ms,
+        }
+    }
+
+    /// `Postbox v0.2.0 is ready`.
+    pub fn headline(&self) -> String {
+        format!("Postbox {} is ready", self.tag)
+    }
 }
 
 /// The whole M7 shell state.
@@ -95,6 +121,10 @@ pub struct M7State {
     pub update_phase: UpdatePhase,
     pub pending_asset: Option<Box<UpdateAsset>>,
     pub update_note: Option<String>,
+    /// The staged release the restart card offers, if one is ready.
+    pub update_prompt: Option<UpdatePrompt>,
+    /// Version dismissed this session, so the same card never nags twice.
+    pub dismissed_update_tag: Option<String>,
     pub launched_from_link: bool,
 }
 
@@ -172,22 +202,76 @@ impl M7State {
         }
     }
 
+    /// Enters the checking state. `false` when a cycle is already running.
+    ///
+    /// A manual `Ctrl+K` check also un-dismisses a card the user hid earlier, which is the
+    /// one way to bring it back without a newer release.
+    pub fn begin_check(&mut self, manual: bool) -> bool {
+        if self.busy() {
+            return false;
+        }
+        if manual {
+            self.reshow_update_prompt();
+        }
+        self.update_phase = UpdatePhase::Checking;
+        self.update_note = Some("Checking for updates...".to_owned());
+        true
+    }
+
     /// Folds a manifest into the updater state.
     pub fn apply_manifest(&mut self, manifest: &UpdateManifest, current: Version) -> CheckOutcome {
         let outcome = postbox_core::update::evaluate(manifest, current);
         match &outcome {
             CheckOutcome::UpToDate { current } => {
-                self.update_phase = UpdatePhase::UpToDate;
-                self.pending_asset = None;
-                self.update_note = Some(format!("Postbox {current} is the newest version."));
+                self.mark_up_to_date(current, true);
             }
             CheckOutcome::Available { asset } => {
-                self.update_phase = UpdatePhase::Available;
-                self.pending_asset = Some(asset.clone());
-                self.update_note = Some(format!("Postbox {} is available.", asset.tag));
+                self.offer(asset.as_ref().clone(), true);
             }
         }
         outcome
+    }
+
+    /// The running build is the newest. A staged card, if any, stays offered.
+    pub fn mark_up_to_date(&mut self, current: &str, manual: bool) {
+        self.pending_asset = None;
+        self.update_phase = if self.update_prompt.is_some() {
+            UpdatePhase::Ready
+        } else {
+            UpdatePhase::UpToDate
+        };
+        self.update_note = manual.then(|| format!("Postbox {current} is the newest version."));
+    }
+
+    /// A newer release was found. `true` when it still needs downloading and staging.
+    ///
+    /// An already staged release with the same tag is surfaced again instead of downloaded
+    /// twice, which is what a manual check does.
+    pub fn offer(&mut self, asset: UpdateAsset, manual: bool) -> bool {
+        let already_staged = self.staged_tag() == Some(asset.tag.as_str());
+        if already_staged {
+            self.update_phase = UpdatePhase::Ready;
+            if manual {
+                self.dismissed_update_tag = None;
+            }
+            self.update_note = Some(format!(
+                "Postbox {} is ready. Restart to update.",
+                asset.tag
+            ));
+            self.pending_asset = Some(Box::new(asset));
+            return false;
+        }
+        self.update_phase = UpdatePhase::Downloading;
+        self.update_note = Some("Downloading the update in the background...".to_owned());
+        self.pending_asset = Some(Box::new(asset));
+        true
+    }
+
+    /// The download is verified and extracted beside the live binary.
+    pub fn mark_staged(&mut self, tag: &str, notes: &str, now_ms: u64) {
+        self.update_phase = UpdatePhase::Ready;
+        self.update_prompt = Some(UpdatePrompt::new(tag, notes, now_ms));
+        self.update_note = Some(format!("Postbox {tag} is ready. Restart to update."));
     }
 
     pub fn mark_installing(&mut self) {
@@ -198,24 +282,78 @@ impl M7State {
     pub fn mark_installed(&mut self, tag: &str) {
         self.update_phase = UpdatePhase::UpToDate;
         self.pending_asset = None;
+        self.update_prompt = None;
         self.update_note = Some(format!("Updated to Postbox {tag}. Restarting."));
     }
 
-    pub fn mark_failed(&mut self, reason: &str) {
-        self.update_phase = UpdatePhase::Failed;
-        self.update_note = Some(format!(
-            "Update failed: {reason}. Your installed version is untouched."
-        ));
+    /// A failure the user asked for is reported; a background one fails quietly.
+    pub fn mark_failed(&mut self, reason: &str, manual: bool) {
+        if manual {
+            self.update_phase = UpdatePhase::Failed;
+            self.update_note = Some(format!(
+                "Update failed: {reason}. Your installed version is untouched."
+            ));
+        } else {
+            self.update_phase = UpdatePhase::Idle;
+            self.update_note = None;
+        }
     }
 
-    /// Text the `Ctrl+K` palette entry shows.
+    /// Tag of the staged release, whether or not the card is currently shown.
+    pub fn staged_tag(&self) -> Option<&str> {
+        self.update_prompt
+            .as_ref()
+            .map(|prompt| prompt.tag.as_str())
+    }
+
+    /// The card to paint, when the user has not dismissed this version.
+    pub fn visible_update_prompt(&self) -> Option<&UpdatePrompt> {
+        let prompt = self.update_prompt.as_ref()?;
+        if self.dismissed_update_tag.as_deref() == Some(prompt.tag.as_str()) {
+            return None;
+        }
+        Some(prompt)
+    }
+
+    pub fn prompt_visible(&self) -> bool {
+        self.visible_update_prompt().is_some()
+    }
+
+    /// Hides the card for this version for the rest of the session.
+    pub fn dismiss_update_prompt(&mut self) -> bool {
+        let Some(prompt) = self.visible_update_prompt() else {
+            return false;
+        };
+        self.dismissed_update_tag = Some(prompt.tag.clone());
+        true
+    }
+
+    /// Brings a dismissed card back, for a manual `Ctrl+K` check.
+    pub fn reshow_update_prompt(&mut self) -> bool {
+        if self.update_prompt.is_none() {
+            return false;
+        }
+        self.dismissed_update_tag = None;
+        self.update_phase = UpdatePhase::Ready;
+        true
+    }
+
+    /// Extra `Ctrl+K` entry once a restart is waiting.
+    pub fn restart_label(&self) -> Option<&'static str> {
+        self.update_prompt
+            .as_ref()
+            .map(|_| "Restart to install update")
+    }
+
+    /// Text the `Ctrl+K` check entry shows. A staged update keeps this entry as the check,
+    /// because [`M7State::restart_label`] adds the separate restart entry beside it.
     pub fn update_label(&self) -> &'static str {
         match self.update_phase {
-            UpdatePhase::Idle => "Check for updates now",
-            UpdatePhase::Busy => "Checking for updates...",
-            UpdatePhase::UpToDate => "Postbox is up to date",
-            UpdatePhase::Available => "Install the available update",
+            UpdatePhase::Idle | UpdatePhase::Ready => "Check for updates now",
+            UpdatePhase::Checking => "Checking for updates...",
+            UpdatePhase::Downloading => "Downloading the update...",
             UpdatePhase::Installing => "Installing update...",
+            UpdatePhase::UpToDate => "Postbox is up to date",
             UpdatePhase::Failed => "Retry the update check",
         }
     }
@@ -223,7 +361,7 @@ impl M7State {
     pub fn busy(&self) -> bool {
         matches!(
             self.update_phase,
-            UpdatePhase::Busy | UpdatePhase::Installing
+            UpdatePhase::Checking | UpdatePhase::Downloading | UpdatePhase::Installing
         )
     }
 
@@ -339,14 +477,14 @@ mod tests {
     }
 
     #[test]
-    fn a_newer_manifest_moves_the_updater_to_available() {
+    fn a_newer_manifest_starts_the_background_download() {
         let mut state = M7State::new();
         let outcome = state.apply_manifest(&manifest("v0.2.0"), Version::new(0, 1, 0));
         assert!(matches!(outcome, CheckOutcome::Available { .. }));
-        assert_eq!(state.update_phase, UpdatePhase::Available);
+        assert_eq!(state.update_phase, UpdatePhase::Downloading);
         assert!(state.pending_asset.is_some());
-        assert_eq!(state.update_label(), "Install the available update");
-        assert!(!state.busy());
+        assert_eq!(state.update_label(), "Downloading the update...");
+        assert!(state.busy());
     }
 
     #[test]
@@ -357,20 +495,117 @@ mod tests {
         assert_eq!(state.update_phase, UpdatePhase::UpToDate);
         assert!(state.pending_asset.is_none());
         assert_eq!(state.update_label(), "Postbox is up to date");
+        assert!(state.update_note.is_some());
     }
 
     #[test]
-    fn a_failed_update_says_the_installed_version_is_untouched() {
+    fn a_staged_update_shows_the_restart_card_and_dismissal_hides_that_version() {
         let mut state = M7State::new();
-        state.apply_manifest(&manifest("v0.2.0"), Version::new(0, 1, 0));
-        state.mark_installing();
+        assert!(state.begin_check(false));
         assert!(state.busy());
-        state.mark_failed("digest mismatch");
+        state.mark_staged("v0.2.0", "- Toasts open the right chat", 1_000);
+
+        assert_eq!(state.update_phase, UpdatePhase::Ready);
+        assert_eq!(
+            state.update_label(),
+            "Check for updates now",
+            "the check entry stays a check"
+        );
+        assert_eq!(state.restart_label(), Some("Restart to install update"));
+        let prompt = state.visible_update_prompt().expect("the card is offered");
+        assert_eq!(prompt.headline(), "Postbox v0.2.0 is ready");
+        assert_eq!(prompt.notes, "- Toasts open the right chat");
+
+        assert!(state.dismiss_update_prompt());
+        assert!(!state.prompt_visible());
+        assert!(
+            !state.dismiss_update_prompt(),
+            "dismissing twice is harmless"
+        );
+        assert_eq!(
+            state.staged_tag(),
+            Some("v0.2.0"),
+            "it stays staged on disk"
+        );
+    }
+
+    #[test]
+    fn a_dismissed_card_comes_back_for_a_manual_check_or_a_newer_version() {
+        let mut state = M7State::new();
+        state.mark_staged("v0.2.0", "", 1_000);
+        assert!(state.dismiss_update_prompt());
+        assert!(!state.prompt_visible());
+
+        // `Ctrl+K` asks for a check: the same staged version is surfaced again.
+        assert!(state.begin_check(true));
+        assert!(state.prompt_visible(), "the manual check surfaces the card");
+        state.mark_up_to_date("0.1.0", true);
+        assert!(state.dismiss_update_prompt());
+
+        // A newer release replaces the staged one and re-prompts on its own.
+        let asset = manifest("v0.3.0").select_asset().expect("the newer asset");
+        assert!(state.offer(asset, false), "a new tag needs a download");
+        assert_eq!(state.update_phase, UpdatePhase::Downloading);
+        state.mark_staged("v0.3.0", "", 2_000);
+        assert!(state.prompt_visible(), "a newer version re-prompts");
+        assert_eq!(state.staged_tag(), Some("v0.3.0"));
+    }
+
+    #[test]
+    fn a_manual_check_of_an_already_staged_version_does_not_download_again() {
+        let mut state = M7State::new();
+        state.mark_staged("v0.2.0", "", 1_000);
+        state.dismiss_update_prompt();
+        let asset = manifest("v0.2.0").select_asset().expect("the asset");
+
+        assert!(!state.offer(asset, true), "the staged bytes are reused");
+        assert_eq!(state.update_phase, UpdatePhase::Ready);
+        assert!(state.prompt_visible(), "the card is surfaced again");
+    }
+
+    #[test]
+    fn a_background_failure_is_quiet_while_a_manual_one_is_reported() {
+        let mut state = M7State::new();
+        assert!(state.begin_check(false));
+        state.mark_failed("offline", false);
+        assert_eq!(state.update_phase, UpdatePhase::Idle);
+        assert!(state.update_note.is_none(), "no nagging status line");
+
+        assert!(state.begin_check(true));
+        state.mark_failed("digest mismatch", true);
         assert_eq!(state.update_phase, UpdatePhase::Failed);
         let note = state.update_note.as_deref().unwrap();
         assert!(note.contains("digest mismatch"), "{note}");
         assert!(note.contains("untouched"), "{note}");
         assert_eq!(state.update_label(), "Retry the update check");
+    }
+
+    #[test]
+    fn a_failed_restart_says_the_installed_version_is_untouched() {
+        let mut state = M7State::new();
+        state.mark_staged("v0.2.0", "", 1_000);
+        state.mark_installing();
+        assert!(state.busy());
+        state.mark_failed("another copy is running", true);
+        assert_eq!(state.update_phase, UpdatePhase::Failed);
+        let note = state.update_note.as_deref().unwrap();
+        assert!(note.contains("untouched"), "{note}");
+        assert!(state.prompt_visible(), "the card still offers a retry");
+    }
+
+    #[test]
+    fn a_running_cycle_is_not_started_twice() {
+        let mut state = M7State::new();
+        assert!(state.begin_check(false));
+        assert!(
+            !state.begin_check(false),
+            "a second tick does not stack checks"
+        );
+        state.mark_installed("v0.2.0");
+        assert!(!state.busy());
+        assert_eq!(state.update_phase, UpdatePhase::UpToDate);
+        assert!(state.visible_update_prompt().is_none());
+        assert!(state.restart_label().is_none());
     }
 
     #[test]

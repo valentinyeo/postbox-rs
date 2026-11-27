@@ -73,6 +73,9 @@ pub struct PostboxLaunchContext {
     /// Milestone 7: manifest/archive source for "Check for updates". `None` keeps the shell
     /// offline; the app injects the GitHub Releases source.
     pub release_source: Option<std::sync::Arc<dyn postbox_platform::ReleaseSource>>,
+    /// Milestone 7: window geometry the updater relaunch should restore, so the new build
+    /// opens maximized on the same monitor.
+    pub restore_window: Option<postbox_platform::WindowState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +251,8 @@ pub struct PostboxViewModel {
     pub(crate) notification_gate: postbox_core::toast::NotificationGate,
     /// Milestone 7: set by the palette command, cleared by whoever starts the real check.
     pub(crate) update_check_requested: bool,
+    /// Milestone 7: set by the "Restart to install update" palette entry.
+    pub(crate) update_restart_requested: bool,
 }
 
 impl PostboxViewModel {
@@ -350,6 +355,7 @@ impl PostboxViewModel {
             m7: crate::m7::M7State::default(),
             notification_gate: postbox_core::toast::NotificationGate::new(),
             update_check_requested: false,
+            update_restart_requested: false,
         }
     }
 
@@ -2703,6 +2709,7 @@ impl PostboxViewModel {
             bulk_selected_count: self.bulk_selected.len(),
             marked_messages_count: self.marked_voice_messages_count(),
             update_label: self.m7.update_label(),
+            restart_label: self.m7.restart_label(),
         };
         let commands = build_palette_items(&catalog_ctx);
 
@@ -3037,8 +3044,14 @@ impl PostboxViewModel {
             }
             PaletteCommand::CheckForUpdates => {
                 // The desktop shell kicks off the real check; headless keeps a visible notice.
+                self.m7.reshow_update_prompt();
                 self.status_notice = Some(self.m7.update_label().to_owned());
                 self.update_check_requested = true;
+            }
+            PaletteCommand::RestartToUpdate => {
+                // The desktop shell performs the swap and relaunch off this request.
+                self.status_notice = Some("Restarting to install the update...".to_owned());
+                self.update_restart_requested = true;
             }
             PaletteCommand::CopyMessageLink
             | PaletteCommand::OpenVideoExternal
@@ -3178,6 +3191,21 @@ impl PostboxViewModel {
     /// `true` once, when the user asked for an update check from `Ctrl+K`.
     pub fn take_update_check_request(&mut self) -> bool {
         std::mem::take(&mut self.update_check_requested)
+    }
+
+    /// `true` once, when the user asked to restart into the staged update from `Ctrl+K`.
+    pub fn take_update_restart_request(&mut self) -> bool {
+        std::mem::take(&mut self.update_restart_requested)
+    }
+
+    /// The staged update the restart card offers, when it has not been dismissed.
+    pub fn update_prompt(&self) -> Option<&crate::m7::UpdatePrompt> {
+        self.m7.visible_update_prompt()
+    }
+
+    /// Hides the restart card for this version during this session.
+    pub fn dismiss_update_prompt(&mut self) -> bool {
+        self.m7.dismiss_update_prompt()
     }
 
     /// The palette label for the update command, so it reads as state rather than an action
@@ -3322,6 +3350,11 @@ impl PostboxViewModel {
         if !self.search_filter.is_empty() {
             self.search_filter.clear();
             self.refresh_chats();
+            return;
+        }
+        // The restart card is non-modal, so `Esc` only reaches it when nothing else is open,
+        // which keeps every modal's `Esc` behaviour unchanged.
+        if self.m7.dismiss_update_prompt() {
             return;
         }
         if self.focus == FocusTarget::Composer {

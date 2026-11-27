@@ -49,12 +49,14 @@ pub use hub_auth::{
 };
 pub use os_integration::{
     LinkOutcome, LinkPipe, MockLinkPipe, MockSingleInstance, MockUrlHandler, SingleInstance,
-    StartupRole, UrlHandler, link_from_args, route_line, startup,
+    StartupRole, UPDATE_RELAUNCH_ARG, UPDATE_RELAUNCH_WAIT, UrlHandler, link_from_args, route_line,
+    startup, startup_relaunch,
 };
 pub use update_source::{MockReleaseSource, ReleaseSource, manifest_from_file};
 pub use updater::{
     ArchiveExtractor, AtomicReplacer, InstallReport, NativeReplacer, PlainFileExtractor,
-    ProcessRelauncher, Relauncher, UpdateError, install, swap_with_rollback, verify_download,
+    ProcessRelauncher, Relauncher, StagedUpdate, UpdateError, commit, discard, install, stage,
+    swap_with_rollback, verify_download,
 };
 pub use video::{
     MockVideoBackend, MockVideoConfig, MockVideoSession, THUMBNAIL_SEEK_MS, VideoAudioChunk,
@@ -74,7 +76,7 @@ pub use voice_auth::{
     refresh_deepgram_api_key_if_changed_from_system, save_dictation_language,
     save_microphone_choice,
 };
-pub use window_state::{MonitorRect, WINDOW_STATE_VALUE, WindowState};
+pub use window_state::{MonitorRect, WINDOW_STATE_ARG, WINDOW_STATE_VALUE, WindowState};
 pub use zip::{CTL_ASSET_NAME, ZipEntry, ZipExtractor, extract_entry, find_zip_entry};
 
 #[derive(Debug, Error)]

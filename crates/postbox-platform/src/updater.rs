@@ -1,11 +1,14 @@
 //! Self-updater: stage, verify, swap atomically, roll back, relaunch.
 //!
 //! The product invariant is **the installed app always keeps a runnable executable**. That
-//! is why the sequence is:
+//! is why the sequence is split into two halves:
 //!
+//! `stage` (background, no user action):
 //! 1. download the release zip to `*.staged` beside the live binary,
 //! 2. verify its SHA-256 against the manifest,
-//! 3. extract the new binary to `*.staged.exe` beside the live binary,
+//! 3. extract the new binary to `*.staged.exe` beside the live binary.
+//!
+//! `commit` (the restart click):
 //! 4. copy the live binary to `*.backup.exe`,
 //! 5. replace the live binary with the staged one in one `MoveFileExW`
 //!    (`REPLACE_EXISTING | WRITE_THROUGH`) on Windows, one `rename` on Unix,
@@ -193,6 +196,106 @@ pub struct UpToDate {
     pub current: String,
 }
 
+/// A verified download extracted beside the live binary, waiting for the restart click.
+///
+/// Nothing here has touched the installed executable: `commit` is the only function that
+/// swaps it, so the app stays runnable while the card waits for the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedUpdate {
+    pub tag: String,
+    pub version: postbox_core::update::Version,
+    pub sha256: String,
+    /// The verified release archive, kept until `commit` removes it.
+    pub staged_archive: PathBuf,
+    /// The extracted replacement executable beside the live one.
+    pub pending_exe: PathBuf,
+    pub install_dir: PathBuf,
+    pub exe_name: String,
+}
+
+/// Steps 1-3 of the install: write the download, verify its SHA-256 and extract the new
+/// executable beside the live binary.
+///
+/// A digest mismatch deletes the download and returns an error before anything is extracted,
+/// which is what keeps a bad hash from ever offering a restart card.
+pub fn stage(
+    asset: &UpdateAsset,
+    archive_bytes: &[u8],
+    install_dir: &Path,
+    exe_name: &str,
+    extractor: &dyn ArchiveExtractor,
+) -> Result<StagedUpdate, UpdateError> {
+    let staged = staged_archive_path(install_dir, &asset_asset_name(asset));
+    std::fs::create_dir_all(install_dir)?;
+    std::fs::write(&staged, archive_bytes)?;
+
+    // Refuse a bad download before anything is extracted or replaced.
+    if let Err(err) = verify_download(archive_bytes, asset) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(err);
+    }
+
+    let pending = pending_exe_path(install_dir, exe_name);
+    let _ = std::fs::remove_file(&pending);
+    let extracted = match extractor.extract_executable(&staged, &pending) {
+        Ok(path) => path,
+        Err(err) => {
+            let _ = std::fs::remove_file(&staged);
+            return Err(err.into());
+        }
+    };
+    if !extracted.exists() {
+        let _ = std::fs::remove_file(&staged);
+        return Err(UpdateError::MissingExecutable);
+    }
+
+    Ok(StagedUpdate {
+        tag: asset.tag.clone(),
+        version: asset.version,
+        sha256: asset.sha256.clone(),
+        staged_archive: staged,
+        pending_exe: extracted,
+        install_dir: install_dir.to_path_buf(),
+        exe_name: exe_name.to_owned(),
+    })
+}
+
+/// Deletes a staged download and its extracted executable, for a release that a newer one
+/// has replaced. The live binary is never touched.
+pub fn discard(staged: &StagedUpdate) {
+    let _ = std::fs::remove_file(&staged.staged_archive);
+    let _ = std::fs::remove_file(&staged.pending_exe);
+}
+
+/// Steps 4-6: back up the live binary, swap the staged one in atomically and clean up.
+///
+/// The swap either replaces the live executable or leaves it exactly as it was, and a failed
+/// replace restores the backup, so this never leaves the install without a runnable exe.
+pub fn commit(
+    staged: &StagedUpdate,
+    replacer: &dyn AtomicReplacer,
+) -> Result<InstallReport, UpdateError> {
+    if !staged.pending_exe.exists() {
+        return Err(UpdateError::MissingExecutable);
+    }
+    let live = staged.install_dir.join(&staged.exe_name);
+    let backup = backup_exe_path(&staged.install_dir, &staged.exe_name);
+    if live.exists() {
+        std::fs::copy(&live, &backup)?;
+    }
+
+    swap_with_rollback(replacer, &staged.pending_exe, &live, &backup)?;
+
+    let _ = std::fs::remove_file(&staged.staged_archive);
+
+    Ok(InstallReport {
+        staged_archive: None,
+        verified_sha256: staged.sha256.clone(),
+        backup: backup.exists().then_some(backup),
+        installed_exe: live,
+    })
+}
+
 /// Runs the whole install with injected pieces and no network.
 ///
 /// `download` returns the archive bytes; every side effect goes through a trait so tests
@@ -205,43 +308,8 @@ pub fn install(
     extractor: &dyn ArchiveExtractor,
     replacer: &dyn AtomicReplacer,
 ) -> Result<InstallReport, UpdateError> {
-    let staged = staged_archive_path(install_dir, &asset_asset_name(asset));
-    std::fs::create_dir_all(install_dir)?;
-    std::fs::write(&staged, archive_bytes)?;
-
-    // Step 2: refuse a bad download before anything is extracted or replaced.
-    if let Err(err) = verify_download(archive_bytes, asset) {
-        let _ = std::fs::remove_file(&staged);
-        return Err(err);
-    }
-
-    // Step 3: extract beside the live binary.
-    let pending = pending_exe_path(install_dir, exe_name);
-    let _ = std::fs::remove_file(&pending);
-    let extracted = extractor.extract_executable(&staged, &pending)?;
-    if !extracted.exists() {
-        return Err(UpdateError::MissingExecutable);
-    }
-
-    // Step 4: keep a copy of what is installed right now.
-    let live = install_dir.join(exe_name);
-    let backup = backup_exe_path(install_dir, exe_name);
-    if live.exists() {
-        std::fs::copy(&live, &backup)?;
-    }
-
-    // Step 5: the single atomic move.
-    swap_with_rollback(replacer, &extracted, &live, &backup)?;
-
-    // Step 6: the staged archive is no longer needed.
-    let _ = std::fs::remove_file(&staged);
-
-    Ok(InstallReport {
-        staged_archive: None,
-        verified_sha256: asset.sha256.clone(),
-        backup: backup.exists().then_some(backup),
-        installed_exe: live,
-    })
+    let staged = stage(asset, archive_bytes, install_dir, exe_name, extractor)?;
+    commit(&staged, replacer)
 }
 
 fn asset_asset_name(asset: &UpdateAsset) -> String {
@@ -417,6 +485,109 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn staging_verifies_the_download_and_never_touches_the_live_binary() {
+        let dir = temp_dir("stage");
+        let live = dir.join("postbox.exe");
+        std::fs::write(&live, b"installed build").unwrap();
+        let bytes = b"downloaded build";
+
+        let staged = stage(
+            &asset_for(bytes),
+            bytes,
+            &dir,
+            "postbox.exe",
+            &PlainFileExtractor,
+        )
+        .expect("staging succeeds");
+
+        assert_eq!(staged.tag, "v0.2.0");
+        assert_eq!(staged.sha256, digest_hex(bytes));
+        assert!(staged.staged_archive.exists(), "the archive waits on disk");
+        assert_eq!(std::fs::read(&staged.pending_exe).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(&live).unwrap(),
+            b"installed build",
+            "the running binary is untouched until the restart click"
+        );
+        assert!(!backup_exe_path(&dir, "postbox.exe").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_a_bad_hash_fails_closed_and_leaves_no_pending_binary() {
+        let dir = temp_dir("stagebad");
+        let live = dir.join("postbox.exe");
+        std::fs::write(&live, b"installed build").unwrap();
+        let mut asset = asset_for(b"expected bytes");
+        asset.size = 0; // exercise the digest check on its own
+
+        let err = stage(
+            &asset,
+            b"tampered bytes",
+            &dir,
+            "postbox.exe",
+            &PlainFileExtractor,
+        )
+        .expect_err("a bad digest is refused");
+
+        assert!(matches!(err, UpdateError::DigestMismatch { .. }), "{err:?}");
+        assert_eq!(std::fs::read(&live).unwrap(), b"installed build");
+        assert!(!pending_exe_path(&dir, "postbox.exe").exists());
+        let archive = staged_archive_path(&dir, "postbox-windows-x64.zip");
+        assert!(!archive.exists(), "the refused archive is cleaned up");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn committing_a_staged_update_swaps_it_in_and_cleans_the_archive() {
+        let dir = temp_dir("commit");
+        let live = dir.join("postbox.exe");
+        std::fs::write(&live, b"old build").unwrap();
+        let bytes = b"new build bytes";
+        let staged = stage(
+            &asset_for(bytes),
+            bytes,
+            &dir,
+            "postbox.exe",
+            &PlainFileExtractor,
+        )
+        .unwrap();
+
+        let report = commit(&staged, &NativeReplacer).expect("the restart click commits");
+
+        assert_eq!(std::fs::read(&live).unwrap(), bytes);
+        assert_eq!(report.installed_exe, live);
+        assert_eq!(report.verified_sha256, digest_hex(bytes));
+        assert!(!staged.staged_archive.exists(), "the archive is cleaned up");
+        assert!(!staged.pending_exe.exists(), "the pending exe was moved");
+        let backup = report.backup.expect("the previous build is kept");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old build");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn committing_a_staged_update_whose_pending_exe_vanished_fails_closed() {
+        let dir = temp_dir("commitgone");
+        let live = dir.join("postbox.exe");
+        std::fs::write(&live, b"old build").unwrap();
+        let bytes = b"new build bytes";
+        let staged = stage(
+            &asset_for(bytes),
+            bytes,
+            &dir,
+            "postbox.exe",
+            &PlainFileExtractor,
+        )
+        .unwrap();
+        std::fs::remove_file(&staged.pending_exe).unwrap();
+
+        let err = commit(&staged, &NativeReplacer).expect_err("nothing to swap in");
+        assert!(matches!(err, UpdateError::MissingExecutable), "{err:?}");
+        assert_eq!(std::fs::read(&live).unwrap(), b"old build");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

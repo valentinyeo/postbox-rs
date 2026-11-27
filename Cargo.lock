@@ -5453,6 +5453,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "postbox-e2e"
+version = "0.1.0"
+dependencies = [
+ "postbox-core",
+ "postbox-hub",
+ "postbox-keymap",
+ "postbox-platform",
+ "postbox-store",
+ "postbox-ui",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "postbox-hub"
 version = "0.1.0"
 dependencies = [

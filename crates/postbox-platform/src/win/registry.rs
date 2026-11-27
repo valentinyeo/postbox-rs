@@ -11,8 +11,8 @@ use windows::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, ERROR_UNSUPPORTED_TYPE,
 };
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_BINARY, REG_DWORD, REG_OPTION_NON_VOLATILE,
-    REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegCloseKey,
+    HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_BINARY, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegCloseKey,
     RegCreateKeyExW, RegDeleteValueW, RegGetValueW, RegSetValueExW,
 };
 use windows::core::PCWSTR;
@@ -397,15 +397,8 @@ pub fn reg_set_string(subkey: &str, name: &str, value: &str) -> Result<(), Platf
     let _guard = RegKeyGuard(hkey);
 
     // SAFETY: `hkey` is open with `KEY_SET_VALUE` and `bytes` is a valid NUL-terminated UTF-16LE slice.
-    let write_status = unsafe {
-        RegSetValueExW(
-            hkey,
-            PCWSTR(wide_name.as_ptr()),
-            None,
-            REG_SZ,
-            Some(&bytes),
-        )
-    };
+    let write_status =
+        unsafe { RegSetValueExW(hkey, PCWSTR(wide_name.as_ptr()), None, REG_SZ, Some(&bytes)) };
     if write_status != ERROR_SUCCESS {
         return Err(PlatformError::RegistryError(format!(
             "RegSetValueExW string failed: {}",

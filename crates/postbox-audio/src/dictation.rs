@@ -83,9 +83,7 @@ impl DictationError {
             Self::TranscriptionFailed => {
                 "Dictation failed; check the microphone and DEEPGRAM_API_KEY"
             }
-            Self::UnsupportedLanguage => {
-                "Automatic dictation supports English and German only"
-            }
+            Self::UnsupportedLanguage => "Automatic dictation supports English and German only",
             Self::IncompleteTranscript => "Dictation ended before final transcript arrived",
             Self::FinalTranscriptTimeout => "Dictation timed out waiting for final transcript",
             Self::NoSpeech => "No speech detected",
@@ -158,8 +156,8 @@ fn build_ws_request(
     let mut req = ws_url
         .into_client_request()
         .map_err(|_| DictationError::InvalidEndpoint)?;
-    let auth = HeaderValue::from_str(&format!("Token {key}"))
-        .map_err(|_| DictationError::MissingKey)?;
+    let auth =
+        HeaderValue::from_str(&format!("Token {key}")).map_err(|_| DictationError::MissingKey)?;
     req.headers_mut().insert(AUTHORIZATION, auth);
     Ok(req)
 }
@@ -548,8 +546,8 @@ pub fn wav_has_speech(wav: &[u8]) -> bool {
 
     while pos + 8 <= wav.len() {
         let id = &wav[pos..pos + 4];
-        let size = u32::from_le_bytes([wav[pos + 4], wav[pos + 5], wav[pos + 6], wav[pos + 7]])
-            as usize;
+        let size =
+            u32::from_le_bytes([wav[pos + 4], wav[pos + 5], wav[pos + 6], wav[pos + 7]]) as usize;
         pos += 8;
         if pos + size > wav.len() {
             return true;
@@ -815,7 +813,12 @@ async fn connect_deepgram_ws(
 
     let connect_res = tokio::time::timeout(
         connect_timeout,
-        tokio_tungstenite::connect_async_tls_with_config(req, Some(ws_config), false, Some(connector)),
+        tokio_tungstenite::connect_async_tls_with_config(
+            req,
+            Some(ws_config),
+            false,
+            Some(connector),
+        ),
     )
     .await
     .map_err(|_| DictationError::NetworkFailed)?;
@@ -955,7 +958,8 @@ async fn run_dictation_session(
     snap.phase = LiveDictationPhase::Recording;
     publish_snapshot(&state_tx, &snap);
 
-    let mut capture_interval = tokio::time::interval(config.capture_poll_interval.max(Duration::from_millis(1)));
+    let mut capture_interval =
+        tokio::time::interval(config.capture_poll_interval.max(Duration::from_millis(1)));
     capture_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // 3. Recording loop: capture -> resample -> stream PCM16 + receive live interims/finals.
@@ -1263,6 +1267,8 @@ mod tests {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
+            // Tungstenite requires its unboxed HTTP ErrorResponse in this callback.
+            #[allow(clippy::result_large_err)]
             let accept_res = tokio_tungstenite::accept_hdr_async(
                 stream,
                 move |req: &ServerRequest, resp: ServerResponse| {
@@ -1317,7 +1323,10 @@ mod tests {
             alt.insert("words".into(), Value::Array(arr));
         }
         if let Some(langs) = alt_langs {
-            let arr: Vec<Value> = langs.iter().map(|l| Value::String((*l).to_owned())).collect();
+            let arr: Vec<Value> = langs
+                .iter()
+                .map(|l| Value::String((*l).to_owned()))
+                .collect();
             alt.insert("languages".into(), Value::Array(arr));
         }
         serde_json::json!({
@@ -1464,11 +1473,17 @@ mod tests {
         // 6. Metadata ignored, Error -> TranscriptionFailed, Auto fail-closed (words overrides languages!)
         let mut t6 = LiveTranscript::new();
         assert_eq!(
-            t6.receive_json(r#"{"type":"Metadata","duration":1.2}"#, DictationLanguage::Automatic),
+            t6.receive_json(
+                r#"{"type":"Metadata","duration":1.2}"#,
+                DictationLanguage::Automatic
+            ),
             Ok(false)
         );
         assert_eq!(
-            t6.receive_json(r#"{"type":"Error","description":"boom"}"#, DictationLanguage::Automatic),
+            t6.receive_json(
+                r#"{"type":"Error","description":"boom"}"#,
+                DictationLanguage::Automatic
+            ),
             Err(DictationError::TranscriptionFailed)
         );
         // Non-empty words containing "fr" MUST reject even when languages says ["en"]!
@@ -1567,7 +1582,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_session_streams_resampled_48k_stereo_and_drains_closestream_without_duplication() {
+    async fn live_session_streams_resampled_48k_stereo_and_drains_closestream_without_duplication()
+    {
         let received_bytes = Arc::new(AtomicUsize::new(0));
         let received_bytes_clone = Arc::clone(&received_bytes);
         let saw_close_stream = Arc::new(AtomicUsize::new(0));
@@ -1695,7 +1711,10 @@ mod tests {
 
         let hs = handshake.lock().unwrap().take().unwrap();
         assert_eq!(hs.auth.as_deref(), Some("Token dg-live-secret"));
-        assert!(hs.uri.contains("language=multi&language_hint=en&language_hint=de&tag=postbox"));
+        assert!(
+            hs.uri
+                .contains("language=multi&language_hint=en&language_hint=de&tag=postbox")
+        );
     }
 
     #[tokio::test]
@@ -1803,7 +1822,14 @@ mod tests {
                 .unwrap();
             assert_eq!(term.phase, LiveDictationPhase::Ready);
             assert_eq!(term.text, "ok");
-            assert!(hs.lock().unwrap().as_ref().unwrap().uri.contains(expected_param));
+            assert!(
+                hs.lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .uri
+                    .contains(expected_param)
+            );
         }
     }
 
@@ -1841,7 +1867,9 @@ mod tests {
         // 4. Server sends {"type":"Error"} then closes -> TranscriptionFailed
         let (url_err, _) = spawn_mock_deepgram_ws(None, |mut ws| async move {
             let _ = ws
-                .send(Message::Text(r#"{"type":"Error","description":"bad audio"}"#.into()))
+                .send(Message::Text(
+                    r#"{"type":"Error","description":"bad audio"}"#.into(),
+                ))
                 .await;
             let _ = ws.send(Message::Close(None)).await;
         })
@@ -1875,8 +1903,15 @@ mod tests {
                 {
                     let _ = ws
                         .send(Message::Text(
-                            make_results_json("dangling", false, 0.0, 0.4, Some(&[Some("en")]), None)
-                                .into(),
+                            make_results_json(
+                                "dangling",
+                                false,
+                                0.0,
+                                0.4,
+                                Some(&[Some("en")]),
+                                None,
+                            )
+                            .into(),
                         ))
                         .await;
                     let _ = ws.send(Message::Close(None)).await;
@@ -1962,8 +1997,15 @@ mod tests {
                     Message::Text(txt) if txt.as_str() == CLOSE_STREAM_PAYLOAD => {
                         let _ = ws
                             .send(Message::Text(
-                                make_results_json("capped", true, 0.0, 0.1, Some(&[Some("en")]), None)
-                                    .into(),
+                                make_results_json(
+                                    "capped",
+                                    true,
+                                    0.0,
+                                    0.1,
+                                    Some(&[Some("en")]),
+                                    None,
+                                )
+                                .into(),
                             ))
                             .await;
                         let _ = ws.send(Message::Close(None)).await;
@@ -2004,7 +2046,10 @@ mod tests {
 
         let bytes = recorded.lock().unwrap();
         assert_eq!(bytes.len(), 3200);
-        assert!(bytes.iter().all(|&b| b == 0), "silent packet must emit pure zeros");
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "silent packet must emit pure zeros"
+        );
     }
 
     #[tokio::test]

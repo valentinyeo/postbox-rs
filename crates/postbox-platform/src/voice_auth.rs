@@ -99,7 +99,9 @@ pub fn load_deepgram_key_detailed(
         .and_then(|v| trim_api_key(&v))
         .or_else(|| process_env(ENV_DEEPGRAM_API_KEY).and_then(|v| trim_api_key(&v)));
 
-    let (stored, stored_outcome) = match secrets.load_secret_with_outcome(DEEPGRAM_API_KEY_SECRET_NAME) {
+    let (stored, stored_outcome) = match secrets
+        .load_secret_with_outcome(DEEPGRAM_API_KEY_SECRET_NAME)
+    {
         Ok(Some(loaded)) => {
             if loaded.outcome == SecretLoadOutcome::MigrationFailed {
                 return Err(format!(
@@ -111,7 +113,9 @@ pub fn load_deepgram_key_detailed(
         Ok(None) => (None, None),
         Err(err) => {
             if seed.is_none() {
-                return Err(format!("Failed to read {DEEPGRAM_API_KEY_SECRET_NAME}: {err}"));
+                return Err(format!(
+                    "Failed to read {DEEPGRAM_API_KEY_SECRET_NAME}: {err}"
+                ));
             }
             (None, None)
         }
@@ -413,7 +417,10 @@ mod tests {
 
     #[test]
     fn decide_deepgram_key_covers_all_five_zig_cases() {
-        assert_eq!(decide_deepgram_key(None, None), (None, DeepgramKeyAction::None));
+        assert_eq!(
+            decide_deepgram_key(None, None),
+            (None, DeepgramKeyAction::None)
+        );
         assert_eq!(
             decide_deepgram_key(None, Some("seed-1")),
             (Some("seed-1"), DeepgramKeyAction::Save)
@@ -443,7 +450,8 @@ mod tests {
 
         // 2. Seed from HKCU\Environment with full ASCII whitespace (\x0b, \x0c) -> Save
         plat.set_user_env(ENV_DEEPGRAM_API_KEY, "\x0b\x0c  dg-v1 \r\n\t");
-        let saved = load_deepgram_key_detailed(&plat, &plat, |_| Some("proc-ignored".into())).unwrap();
+        let saved =
+            load_deepgram_key_detailed(&plat, &plat, |_| Some("proc-ignored".into())).unwrap();
         assert_eq!(saved.key.as_deref(), Some("dg-v1"));
         assert_eq!(saved.action, DeepgramKeyAction::Save);
         assert!(saved.seed_saved);
@@ -461,7 +469,10 @@ mod tests {
         let from_dpapi = load_deepgram_key_detailed(&plat, &plat, |_| None).unwrap();
         assert_eq!(from_dpapi.key.as_deref(), Some("dg-v1"));
         assert_eq!(from_dpapi.action, DeepgramKeyAction::Load);
-        assert_eq!(from_dpapi.stored_outcome, Some(SecretLoadOutcome::Encrypted));
+        assert_eq!(
+            from_dpapi.stored_outcome,
+            Some(SecretLoadOutcome::Encrypted)
+        );
 
         // 5. Changed env var -> Update DPAPI blob
         plat.set_user_env(ENV_DEEPGRAM_API_KEY, "dg-v2");

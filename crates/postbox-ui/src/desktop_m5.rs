@@ -68,7 +68,9 @@ impl PostboxShell {
         }
 
         let elapsed_label = match d.phase {
-            DictationPhase::Draining => format!("{} · Transcribing...", format_voice_clock(d.elapsed_ms)),
+            DictationPhase::Draining => {
+                format!("{} · Transcribing...", format_voice_clock(d.elapsed_ms))
+            }
             _ => format_voice_clock(d.elapsed_ms),
         };
 

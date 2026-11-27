@@ -2417,7 +2417,9 @@ impl Render for PostboxShell {
                         .live_dictation()
                         .is_some_and(|d| !d.in_thread && d.phase.is_active()),
                 ) {
-                    (true, true, true) => "PostboxComposerEmpty PostboxShortcodePopup PostboxDictating",
+                    (true, true, true) => {
+                        "PostboxComposerEmpty PostboxShortcodePopup PostboxDictating"
+                    }
                     (true, true, false) => "PostboxComposerEmpty PostboxShortcodePopup",
                     (true, false, true) => "PostboxComposerEmpty PostboxDictating",
                     (true, false, false) => "PostboxComposerEmpty",
@@ -3082,6 +3084,55 @@ mod desktop_tests {
 
     fn open_shell(cx: &mut TestAppContext) -> (WindowHandle<Root>, Entity<PostboxShell>) {
         open_shell_with_ctx(cx, seeded_launch_ctx())
+    }
+
+    #[gpui_kit::test]
+    fn m5_real_composer_cursor_interims_final_and_meter_lifecycle(cx: &mut TestAppContext) {
+        let (handle, shell) = open_shell(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.activate_window();
+            shell.update(cx, |this, cx| {
+                this.vm.set_composer_text("links rechts");
+                this.vm.set_focus(FocusTarget::Composer);
+                this.sync_after_vm_change(window, cx);
+                this.composer.update(cx, |input, cx| input.set_selected_range(6..6, cx));
+            });
+            window.render_frame(cx);
+            window.press("ctrl-d", cx);
+        }).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            let generation = shell.read(cx).vm.live_dictation().unwrap().generation;
+            shell.update(cx, |this, cx| {
+                this.apply_sync_events(vec![
+                    SyncEvent::DictationConnected { generation },
+                    SyncEvent::DictationInterim { generation, revision: 1, text: "Grüße".into() },
+                    SyncEvent::DictationLevel { generation, level: 200 },
+                ], window, cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(shell.read(cx).composer.read(cx).value().as_ref(), "links Grüße rechts");
+            assert_eq!(shell.read(cx).composer.read(cx).selected_range(), 13..13);
+            assert!(!shell.read(cx).vm.live_dictation().unwrap().live_detached);
+            assert!(shell.read(cx).dictation_timer_task.is_some());
+            assert!(window.try_find("dictation-mic-pill").is_some());
+            for i in 0..8 {
+                assert!(window.try_find(format!("dictation-wave-bar-{i}").as_str()).is_some());
+            }
+            window.press("ctrl-d", cx);
+        }).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            let generation = shell.read(cx).vm.live_dictation().unwrap().generation;
+            shell.update(cx, |this, cx| {
+                this.apply_sync_events(vec![SyncEvent::DictationFinal { generation, text: "Grüße!".into() }], window, cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(shell.read(cx).composer.read(cx).value().as_ref(), "links Grüße! rechts");
+            assert_eq!(shell.read(cx).composer.read(cx).selected_range(), 14..14);
+            assert!(shell.read(cx).dictation_timer_task.is_none());
+            assert!(window.try_find("dictation-mic-pill").is_none());
+        }).unwrap();
     }
 
     #[gpui_kit::test]

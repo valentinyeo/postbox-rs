@@ -260,8 +260,7 @@ pub fn prepare_dictation(
     }
 
     let pad = dictation_padding(original, start, end);
-    let insertion_len =
-        usize::from(pad.before) + normalized.len() + usize::from(pad.after);
+    let insertion_len = usize::from(pad.before) + normalized.len() + usize::from(pad.after);
     let whole_len = original.len() - (end - start) + insertion_len;
     if whole_len > MAX_DRAFT_TEXT_BYTES {
         return Err(PrepareDictationError::DraftTooLong);
@@ -352,8 +351,14 @@ mod tests {
             );
             assert!(!lang.label().is_empty());
             assert!(lang.status_text().starts_with("Dictation language: "));
-            assert!(lang.deepgram_live_listen_path().contains("encoding=linear16"));
-            assert!(lang.deepgram_live_listen_path().contains("sample_rate=16000"));
+            assert!(
+                lang.deepgram_live_listen_path()
+                    .contains("encoding=linear16")
+            );
+            assert!(
+                lang.deepgram_live_listen_path()
+                    .contains("sample_rate=16000")
+            );
             assert!(lang.deepgram_live_listen_path().contains("tag=postbox"));
         }
         assert_eq!(DictationLanguage::parse("french"), None);
@@ -474,4 +479,3 @@ mod tests {
         assert!(cut_mixed.is_ascii());
     }
 }
-

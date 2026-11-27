@@ -5521,6 +5521,7 @@ name = "postbox-ui"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "futures-util",
  "gpui-kit",
  "image",
  "postbox-audio",
@@ -5529,7 +5530,10 @@ dependencies = [
  "postbox-media",
  "postbox-platform",
  "postbox-store",
+ "serde_json",
  "smallvec",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

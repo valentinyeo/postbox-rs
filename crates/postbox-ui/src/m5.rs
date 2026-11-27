@@ -5,7 +5,9 @@
 //! and 8-bar `micPill` waveform history.
 
 use crate::sync_bridge::SyncCommand;
-use crate::viewmodel::{FocusTarget, PostboxViewModel, now_epoch_millis_public, now_epoch_secs_public};
+use crate::viewmodel::{
+    FocusTarget, PostboxViewModel, now_epoch_millis_public, now_epoch_secs_public,
+};
 use postbox_core::dictation::{
     DictationLanguage, MIC_PILL_BAR_COUNT, MIC_PILL_TICK_MS, PrepareDictationError,
     dictation_padding, prepare_dictation,
@@ -107,10 +109,7 @@ pub use postbox_core::dictation::dictation_padding as ui_dictation_padding;
 
 impl PostboxViewModel {
     pub fn is_dictation_active(&self) -> bool {
-        self.m5
-            .active
-            .as_ref()
-            .is_some_and(|s| s.phase.is_active())
+        self.m5.active.as_ref().is_some_and(|s| s.phase.is_active())
     }
 
     pub fn live_dictation(&self) -> Option<&LiveDictationUiState> {
@@ -181,10 +180,7 @@ impl PostboxViewModel {
         DictationContextSnapshot {
             origin_chat,
             in_thread,
-            thread_root_msg_id: self
-                .thread_panel
-                .as_ref()
-                .map(|p| p.root_msg_id.clone()),
+            thread_root_msg_id: self.thread_panel.as_ref().map(|p| p.root_msg_id.clone()),
             active_view: self.active_view().cloned(),
             show_archived_only: self.show_archived_only(),
             show_archived_inline: self.show_archived_inline(),
@@ -215,10 +211,7 @@ impl PostboxViewModel {
             {
                 return false;
             }
-        } else if self
-            .thread_panel
-            .as_ref()
-            .map(|p| p.root_msg_id.as_str())
+        } else if self.thread_panel.as_ref().map(|p| p.root_msg_id.as_str())
             != expected.thread_root_msg_id.as_deref()
         {
             return false;
@@ -369,7 +362,10 @@ impl PostboxViewModel {
         let Some(state) = self.m5.active.as_mut() else {
             return false;
         };
-        if matches!(state.phase, DictationPhase::Starting | DictationPhase::Listening) {
+        if matches!(
+            state.phase,
+            DictationPhase::Starting | DictationPhase::Listening
+        ) {
             state.phase = DictationPhase::Draining;
             state.latest_level = 0;
             let generation = state.generation;
@@ -521,7 +517,10 @@ impl PostboxViewModel {
                 state.auto_send_armed = false;
                 state.armed_text = None;
                 state.armed_selection = None;
-                if matches!(state.phase, DictationPhase::Starting | DictationPhase::Listening) {
+                if matches!(
+                    state.phase,
+                    DictationPhase::Starting | DictationPhase::Listening
+                ) {
                     state.phase = DictationPhase::Draining;
                     state.latest_level = 0;
                     emit_stop_gen = Some(state.generation);
@@ -561,7 +560,10 @@ impl PostboxViewModel {
     pub(crate) fn handle_dictation_level(&mut self, generation: u64, level: u8) {
         if let Some(state) = self.m5.active.as_mut()
             && state.generation == generation
-            && matches!(state.phase, DictationPhase::Starting | DictationPhase::Listening)
+            && matches!(
+                state.phase,
+                DictationPhase::Starting | DictationPhase::Listening
+            )
         {
             state.latest_level = level;
         }
@@ -762,9 +764,7 @@ impl PostboxViewModel {
                         self.m5.composer_selection_set = true;
                         self.m5.pending_composer_selection = Some(state.pre_selection);
                     }
-                } else if same_ctx
-                    && let Some(panel) = self.thread_panel.as_mut()
-                {
+                } else if same_ctx && let Some(panel) = self.thread_panel.as_mut() {
                     panel.composer_text = state.pre_text;
                     self.m5.thread_selection = state.pre_selection.clone();
                     self.m5.thread_selection_set = true;
@@ -781,9 +781,7 @@ impl PostboxViewModel {
 
         let caret = prepared.new_end;
         if state.in_thread {
-            if same_ctx
-                && let Some(panel) = self.thread_panel.as_mut()
-            {
+            if same_ctx && let Some(panel) = self.thread_panel.as_mut() {
                 panel.composer_text = prepared.whole.clone();
                 self.m5.thread_selection = caret..caret;
                 self.m5.thread_selection_set = true;

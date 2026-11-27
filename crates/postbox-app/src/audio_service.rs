@@ -665,7 +665,9 @@ async fn run_live_dictation_bridge(
             }
             LiveDictationPhase::Cancelled => return,
             LiveDictationPhase::Failed => {
-                let err = terminal.error.unwrap_or(DictationError::TranscriptionFailed);
+                let err = terminal
+                    .error
+                    .unwrap_or(DictationError::TranscriptionFailed);
                 if err == DictationError::ApiFailed && !saw_connected && !retried_key_once {
                     retried_key_once = true;
                     let plat = NativePlatform::default();

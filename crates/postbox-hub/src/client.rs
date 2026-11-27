@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REST_TIMEOUT: Duration = Duration::from_secs(30);
+/// M5.5 RAM diet: keep at most two idle keep-alive sockets per host instead of reqwest's
+/// default of `usize::MAX`, so a long sync session cannot hold a pool of open TLS buffers.
+pub const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 2;
 /// 150s stall timeout for up-to-100 MiB Hub media downloads (`media_drain.zig:179-183`).
 pub const HUB_MEDIA_TIMEOUT: Duration = Duration::from_secs(150);
 pub const DEFAULT_MEDIA_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -49,11 +52,13 @@ impl HubClient {
             .user_agent(USER_AGENT)
             .redirect(Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
+            .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
             .timeout(REST_TIMEOUT);
         let mut sse_builder = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .redirect(Policy::none())
-            .connect_timeout(CONNECT_TIMEOUT);
+            .connect_timeout(CONNECT_TIMEOUT)
+            .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST);
 
         if !endpoint.secure {
             // Insecure loopback (127.0.0.1) bypasses system proxy (`winhttp.zig:343`).

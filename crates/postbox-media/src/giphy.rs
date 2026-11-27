@@ -1,3 +1,4 @@
+use crate::MAX_IDLE_CONNECTIONS_PER_HOST;
 use crate::MediaError;
 use futures_util::StreamExt;
 use postbox_core::ChatKey;
@@ -676,7 +677,8 @@ impl GiphyClient {
         let mut builder = reqwest::Client::builder()
             .user_agent("Postbox/1.0")
             .redirect(Policy::none())
-            .connect_timeout(Duration::from_secs(5));
+            .connect_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST);
         if loopback_port.is_some() {
             builder = builder.no_proxy();
         }

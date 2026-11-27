@@ -1,4 +1,4 @@
-use crate::{MAX_DECODE_PIXELS, MediaError, PREVIEW_MAX_H, PREVIEW_MAX_W};
+use crate::{MAX_DECODE_PIXELS, MAX_DECODE_WORKERS, MediaError, PREVIEW_MAX_H, PREVIEW_MAX_W};
 use image::codecs::gif::GifDecoder;
 use image::codecs::webp::WebPDecoder;
 use image::imageops::FilterType;
@@ -360,12 +360,13 @@ pub fn decode_preview_file(path: &Path) -> Result<DecodedImage, MediaError> {
     decode_image_bytes(&bytes, PREVIEW_MAX_W, PREVIEW_MAX_H, false)
 }
 
-/// Recommended off-UI-thread decode concurrency (`min(4, max(1, cpus/2))`).
+/// Off-UI-thread decode concurrency, hard-capped at `MAX_DECODE_WORKERS` (2) for the M5.5 RAM
+/// diet: fewer parallel BGRA buffers resident at once on Intel Arc shared memory.
 pub fn recommended_decode_workers() -> usize {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
-    (cpus / 2).clamp(1, 4)
+    (cpus / 2).clamp(1, MAX_DECODE_WORKERS)
 }
 
 /// Reads (capped at `MAX_IMAGE_FILE_BYTES`) and decodes an image file to BGRA8888 frames.
@@ -474,7 +475,7 @@ pub fn decode_workspace_icon_file(
     })
 }
 
-/// Bounded off-UI-thread decode pool (`min(4, max(1, cpus/2))` concurrent workers).
+/// Bounded off-UI-thread decode pool (`min(MAX_DECODE_WORKERS, max(1, cpus/2))` workers).
 #[derive(Clone)]
 pub struct DecodePool {
     semaphore: Arc<Semaphore>,
@@ -491,6 +492,11 @@ impl DecodePool {
         Self {
             semaphore: Arc::new(Semaphore::new(recommended_decode_workers())),
         }
+    }
+
+    /// Number of decode jobs this pool allows in flight at once (`<= MAX_DECODE_WORKERS`).
+    pub fn max_concurrency(&self) -> usize {
+        self.semaphore.available_permits()
     }
 
     pub async fn decode_file(
@@ -520,7 +526,7 @@ struct LruEntry<V> {
 
 /// Strict byte-budgeted LRU cache returning evicted `(K, V)` pairs so callers (e.g., GPUI
 /// `PostboxShell`) can deterministically call `cx.drop_image(evicted, Some(window))` and keep
-/// decoded RAM `<= 48 MB` and GPU VRAM `<= 64 MB`.
+/// decoded RAM `<= 48 MB` and GPU VRAM `<= 16 MB` (M5.5).
 pub struct BitmapLru<K, V> {
     budget_bytes: usize,
     total_bytes: usize,
@@ -545,6 +551,13 @@ where
 
     pub fn budget_bytes(&self) -> usize {
         self.budget_bytes
+    }
+
+    /// Live keys, least-recently-used first, for callers that purge by key prefix.
+    pub fn keys(&self) -> Vec<K> {
+        let mut keys: Vec<K> = self.entries.keys().cloned().collect();
+        keys.sort_unstable_by_key(|k| self.entries.get(k).map(|e| e.last_used).unwrap_or_default());
+        keys
     }
 
     pub fn total_bytes(&self) -> usize {
@@ -614,6 +627,30 @@ where
         let removed = self.entries.remove(key)?;
         self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
         Some(removed.value)
+    }
+
+    /// Removes every entry `predicate` accepts and returns the removed values.
+    pub fn remove_where<F>(&mut self, mut predicate: F) -> Vec<V>
+    where
+        F: FnMut(&K) -> bool,
+    {
+        let doomed: Vec<K> = self
+            .entries
+            .keys()
+            .filter(|k| predicate(*k))
+            .cloned()
+            .collect();
+        let mut removed = Vec::with_capacity(doomed.len());
+        for key in doomed {
+            if let Some(value) = self.remove(&key) {
+                removed.push(value);
+            }
+        }
+        if !removed.is_empty() {
+            let entries = &self.entries;
+            self.order.retain(|(k, _)| entries.contains_key(k));
+        }
+        removed
     }
 
     pub fn clear(&mut self) -> Vec<(K, V)> {
@@ -789,8 +826,8 @@ mod tests {
     #[test]
     fn real_size_638_image_lru_enforces_ram_and_vram_budgets_deterministically() {
         // Real-size 420x250 preview PNG decoded 638 times (~420 KiB BGRA each = ~268 MiB total
-        // if uncapped!). Both CPU bitmap LRU (24 MiB <= 48 MiB cap) and GPU VRAM LRU (64 MiB cap)
-        // MUST stay strictly within budget with deterministic FIFO/LRU eviction.
+        // if uncapped!). Both CPU bitmap LRU (12 MiB, under the 48 MiB cap) and GPU VRAM LRU
+        // (16 MiB M5.5 cap) MUST stay strictly within budget with deterministic eviction.
         let sample_png = make_png(840, 500, 64, 128, 192);
         let decoded = decode_image_bytes(&sample_png, PREVIEW_MAX_W, PREVIEW_MAX_H, false).unwrap();
         assert_eq!((decoded.width, decoded.height), (420, 250));
@@ -808,7 +845,7 @@ mod tests {
             ram_evicted += ev_r.len();
             assert!(
                 ram_lru.total_bytes() <= RAM_BITMAP_BUDGET_BYTES,
-                "RAM exceeded 24 MiB budget at image {idx}: {}",
+                "RAM exceeded 12 MiB budget at image {idx}: {}",
                 ram_lru.total_bytes()
             );
             assert!(ram_lru.total_bytes() <= MAX_RAM_BITMAP_CAP_BYTES);
@@ -817,18 +854,34 @@ mod tests {
             vram_evicted += ev_v.len();
             assert!(
                 vram_lru.total_bytes() <= VRAM_TEXTURE_BUDGET_BYTES,
-                "VRAM exceeded 64 MiB budget at image {idx}: {}",
+                "VRAM exceeded 16 MiB budget at image {idx}: {}",
                 vram_lru.total_bytes()
             );
         }
 
         // 638 * 420,000 B = 267,960,000 B -> deterministic eviction MUST have occurred.
-        assert!(ram_evicted > 550);
-        assert!(vram_evicted > 450);
+        assert!(ram_evicted > 580);
+        assert!(vram_evicted > 590);
         assert!(!ram_lru.contains(&0));
         assert!(ram_lru.contains(&637));
         assert!(!vram_lru.contains(&0));
         assert!(vram_lru.contains(&637));
+    }
+
+    #[test]
+    fn ram_diet_budgets_and_decode_concurrency_match_m5_5_targets() {
+        // 16 MiB VRAM / 12 MiB RAM bitmaps, both far inside the 48 MiB hard cap.
+        assert_eq!(VRAM_TEXTURE_BUDGET_BYTES, 16 * 1024 * 1024);
+        assert_eq!(RAM_BITMAP_BUDGET_BYTES, 12 * 1024 * 1024);
+        const { assert!(RAM_BITMAP_BUDGET_BYTES < MAX_RAM_BITMAP_CAP_BYTES) };
+        // Decode concurrency is hard-capped at 2 workers on every host.
+        assert_eq!(MAX_DECODE_WORKERS, 2);
+        assert!(recommended_decode_workers() <= MAX_DECODE_WORKERS);
+        assert_eq!(
+            DecodePool::new().max_concurrency(),
+            recommended_decode_workers()
+        );
+        assert!(DecodePool::new().max_concurrency() <= 2);
     }
 
     #[test]

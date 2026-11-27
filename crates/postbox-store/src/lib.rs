@@ -456,8 +456,10 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.pragma_update(None, "mmap_size", 67_108_864_i64)?;
-        conn.pragma_update(None, "cache_size", -16_000_i64)?;
+        // M5.5 RAM diet: no memory-mapped pages (the OS cannot reclaim them under pressure)
+        // and a 2 MiB page cache per connection instead of the previous 16 MiB.
+        conn.pragma_update(None, "mmap_size", 0_i64)?;
+        conn.pragma_update(None, "cache_size", -2_000_i64)?;
         conn.execute_batch(SCHEMA_SQL)?;
 
         // Forward-migration for existing M0 databases missing `staged_image_path` on `drafts`.
@@ -1456,6 +1458,17 @@ impl Store {
     pub fn evict_expired_media(&self, now_unix: i64) -> Result<Vec<String>, StoreError> {
         self.evict_expired_media_older_than(now_unix - MEDIA_TTL_SECS)
     }
+
+    /// Releases SQLite page cache and heap back to the OS (`PRAGMA shrink_memory`).
+    ///
+    /// M5.5 RAM diet: connections run with `mmap_size = 0` and a 2 MiB `cache_size`, and this
+    /// is called after bulk syncs and whenever the window goes idle or is minimized so the
+    /// process working set drops back to the idle budget instead of holding every page it
+    /// ever touched.
+    pub fn shrink_memory(&self) -> Result<(), StoreError> {
+        self.conn.execute_batch("PRAGMA shrink_memory;")?;
+        Ok(())
+    }
 }
 
 fn map_message_row(chat_key: &ChatKey, row: &Row<'_>) -> rusqlite::Result<Message> {
@@ -1507,19 +1520,99 @@ mod tests {
         }
     }
 
+    /// Unique scratch SQLite file for tests that must observe file-only pragmas (`mmap_size`
+    /// returns no row for `:memory:` databases). Removed on drop by the caller.
+    fn scratch_db_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "postbox-store-{tag}-{}-{nanos}.db",
+            std::process::id()
+        ))
+    }
+
     #[test]
-    fn cache_size_and_busy_timeout_pragmas_are_set() {
+    fn memory_diet_pragmas_and_shrink_memory_are_wired() {
         let store = Store::open_in_memory().unwrap();
         let cache_size: i64 = store
             .conn
             .pragma_query_value(None, "cache_size", |row| row.get(0))
             .unwrap();
-        assert_eq!(cache_size, -16_000);
+        assert_eq!(cache_size, -2_000);
         let busy_timeout: i64 = store
             .conn
             .pragma_query_value(None, "busy_timeout", |row| row.get(0))
             .unwrap();
         assert_eq!(busy_timeout, BUSY_TIMEOUT_MS as i64);
+
+        // `mmap_size` only reports a value for file-backed databases, so check it there.
+        let path = scratch_db_path("mmap");
+        let file_store = Store::open(&path).unwrap();
+        let mmap_size: i64 = file_store
+            .conn
+            .pragma_query_value(None, "mmap_size", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mmap_size, 0);
+        let file_cache_size: i64 = file_store
+            .conn
+            .pragma_query_value(None, "cache_size", |row| row.get(0))
+            .unwrap();
+        assert_eq!(file_cache_size, -2_000);
+        drop(file_store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn shrink_memory_releases_page_cache_and_keeps_connection_usable() {
+        let mut store = Store::open_in_memory().unwrap();
+        let chat = sample_chat(
+            Provider::Whatsapp,
+            "personal",
+            "1@s.whatsapp.net",
+            "Alice",
+            "2026-11-26T10:00:00Z",
+        );
+        store.upsert_chat(&chat, 100).unwrap();
+        // Touch enough pages that the page cache is non-trivially populated.
+        for i in 0..64 {
+            store
+                .upsert_message(&Message {
+                    chat: chat.key.clone(),
+                    msg_id: format!("m{i}"),
+                    sender_id: "u1".into(),
+                    sender_name: "Alice".into(),
+                    from_me: false,
+                    ts: format!("2026-11-26T10:00:{i:02}Z"),
+                    body: "x".repeat(512),
+                    reply_to_id: None,
+                    reply_broadcast: false,
+                    media_kind: None,
+                    mime_type: None,
+                    filename: None,
+                    file_size: None,
+                    reactions: vec![],
+                    read_status: ReadStatus::Sent,
+                    deleted: false,
+                })
+                .unwrap();
+        }
+
+        store.shrink_memory().unwrap();
+
+        // The connection must still answer queries and keep its diet pragmas after the shrink.
+        let loaded = store
+            .list_messages(&chat.key, 100, None)
+            .expect("queries still work after shrink_memory");
+        assert_eq!(loaded.len(), 64);
+        let cache_size: i64 = store
+            .conn
+            .pragma_query_value(None, "cache_size", |row| row.get(0))
+            .unwrap();
+        assert_eq!(cache_size, -2_000);
     }
 
     #[test]

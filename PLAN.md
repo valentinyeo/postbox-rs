@@ -25,7 +25,7 @@
 | **Cold start to painted inbox** | ~250–400 ms (JSON parse) | **`< 120 ms`** | SQLite WAL indexed top-50 query (`< 15 ms`), deferred hub sync after first GPU frame |
 | **Idle RAM (working set)** | ~40–60 MB | **`< 65 MB`** | Windowed SQLite queries, bounded message window, compact structs, no WebView/JS VM |
 | **Active RAM (real-size inbox)** | ~90–140 MB | **`< 110 MB`** | Virtualized chat & message lists, bounded image decode cache (`<= 48 MB` RAM) |
-| **GPU VRAM budget (Intel Arc)** | N/A (CPU BitBlt) | **`<= 64 MB`** | Explicit LRU eviction of decoded image/avatar/GIF GPU textures when off-screen |
+| **GPU VRAM budget (Intel Arc)** | N/A (CPU BitBlt) | **`<= 16 MB`** | Explicit LRU eviction of decoded image/avatar/GIF GPU textures when off-screen (64 MB in M3, tightened in M5.5) |
 | **Idle CPU & GPU utilization** | ~0–1% | **`0.0%` CPU / `0.0%` GPU** | Event-driven GPUI rendering (zero polling loops; GIF/dictation timers tick only while visible/active) |
 | **Keystroke-to-photon latency** | ~16–35 ms (CPU GDI+) | **`< 8 ms` (1 frame @ 120/144Hz)** | GPUI instanced DirectX quad/glyph batching on Intel Arc; zero blocking I/O on UI thread |
 | **Instant search (`/` or `Ctrl+K`)** | O(N) scan over loaded chats | **`< 2 ms`** | SQLite FTS5 prefix + trigram index over chats & messages + nucleo fuzzy ranking |
@@ -240,6 +240,14 @@ CREATE TABLE media_cache (
 - WASAPI microphone capture streaming PCM over WebSocket to Deepgram Nova-3 (`/v1/listen?model=nova-3&smart_format=true&...`) with Auto (EN/DE fail-closed), English, and German modes.
 - Anchored interim-span replacement inside the GPUI composer (text before/after cursor stays intact; CloseStream drains final once without duplication) + live waveform mic pill.
 - **Gate**: Loopback WebSocket dictation tests verify fragmented interims, replayed finals, cursor preservation, and all 3 language modes.
+
+### Milestone 5.5 — RAM Diet Pass (idle `~40-55 MB`, active `~65-85 MB`)
+- SQLite diet: `PRAGMA mmap_size = 0` (no unreclaimable mapped pages), `PRAGMA cache_size = -2000` (2 MiB per connection), and `PRAGMA shrink_memory` after bulk syncs and on every idle/minimize tick.
+- Media diet: GPU texture LRU cap `64 -> 16 MiB`, decoded bitmap budget `24 -> 12 MiB`, off-UI-thread decode concurrency hard-capped at 2 workers, and `pool_max_idle_per_host(2)` on every `reqwest` client.
+- Active-chat-only RAM: leaving a chat evicts its inline media and GIF frames, and a chat switch reloads only that chat's timeline from SQLite (no multi-chat message map).
+- Windows working-set trim (`SetProcessWorkingSetSizeEx`) plus `GetProcessMemoryInfo` telemetry (`working_set_kb`, `private_usage_kb`) on minimize/extended idle, wired into `TelemetryCounters`.
+- Emoji and Slack shortcode tables stay strictly lazy (built on first emoji use, never at startup) and borrow CLDR names that need no rewriting.
+- **Gate**: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, plus unit tests for every measured budget above.
 
 ### Milestone 6 — Hardware-Accelerated Video (Intel Arc DXVA / Media Foundation)
 - Windows Media Foundation `IMFSourceReader` + `IMFDXGIDeviceManager` hardware decode on Intel Arc for instant video thumbnail generation (cached to disk) and inline video playback (double-click to play, `F11` fullscreen, audio sync via WASAPI).

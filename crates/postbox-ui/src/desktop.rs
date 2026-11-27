@@ -33,7 +33,7 @@ use postbox_core::{FontScale, Provider, ThemeChoice};
 use postbox_keymap::{Action as PbAction, Keymap, f1_shortcut_groups};
 use postbox_media::paste::PasteStageResult;
 use postbox_media::unfurl::omit_unfurled_url_from_body;
-use postbox_platform::{ClipboardBackend, NativePlatform};
+use postbox_platform::{ClipboardBackend, MemoryPressure, NativePlatform};
 use std::borrow::Cow;
 use std::rc::Rc;
 use std::time::Instant;
@@ -394,6 +394,15 @@ pub struct PostboxShell {
     pub(crate) gif_tick: usize,
     pub(crate) gif_timer_task: Option<Task<()>>,
     pub(crate) dictation_timer_task: Option<Task<()>>,
+    /// M5.5 RAM diet: chat whose media is currently resident, so a chat switch can evict the
+    /// previous chat's inline images/GIF frames before decoding the next chat's.
+    pub(crate) resident_chat_id: Option<String>,
+    /// Working-set trim + `GetProcessMemoryInfo` telemetry source.
+    pub(crate) memory_platform: Option<std::sync::Arc<dyn MemoryPressure>>,
+    /// Number of idle/minimize trims performed (test observability).
+    pub(crate) memory_trim_count: u32,
+    /// Frames painted since launch, reported in `TelemetryCounters::frames_rendered`.
+    pub(crate) frames_rendered: u64,
     applying_dictation_sync: bool,
     pub(crate) reaction_retry_task: Option<Task<()>>,
     pub(crate) reaction_retry_deadline_ms: Option<u64>,
@@ -424,6 +433,16 @@ impl PostboxShell {
         }
         vm.initialize();
         Self::from_view_model_with_bridge(vm, ctx.sync_bridge, started_at, window, cx)
+            .with_memory_platform(ctx.memory_platform)
+    }
+
+    /// Installs the OS memory-pressure source (working-set trim + `GetProcessMemoryInfo`).
+    pub fn with_memory_platform(
+        mut self,
+        platform: Option<std::sync::Arc<dyn MemoryPressure>>,
+    ) -> Self {
+        self.memory_platform = platform;
+        self
     }
 
     pub fn from_view_model(
@@ -446,6 +465,8 @@ impl PostboxShell {
         let initial_scale = vm.font_scale();
         let initial_title = vm.window_title();
         let initial_timeline_len = vm.timeline_items().len();
+        let resident_chat_id = vm.selected_chat().map(|c| c.key.id.clone());
+        let memory_platform: Option<std::sync::Arc<dyn MemoryPressure>> = None;
         let sidebar_rows_cache = vm.sidebar_rows();
         let row_h = vm.row_geometry().height;
         let sidebar_item_sizes = Rc::new(vec![
@@ -609,6 +630,9 @@ impl PostboxShell {
             if !window.is_window_active() {
                 this.gif_timer_task = None;
                 this.dictation_timer_task = None;
+                // M5.5 RAM diet: losing focus counts as idle, so drop transient textures,
+                // release SQLite pages, and hand reclaimable pages back to Windows.
+                this.trim_memory_for_idle(window, cx);
                 if this.vm.on_window_blur() {
                     this.sync_sidebar_cache();
                 }
@@ -676,6 +700,10 @@ impl PostboxShell {
             gif_tick: 0,
             gif_timer_task: None,
             dictation_timer_task: None,
+            resident_chat_id,
+            memory_platform,
+            memory_trim_count: 0,
+            frames_rendered: 0,
             applying_dictation_sync: false,
             reaction_retry_task: None,
             reaction_retry_deadline_ms: None,
@@ -811,6 +839,58 @@ impl PostboxShell {
             FocusTarget::GiphyPicker => self
                 .giphy_search_input
                 .update(cx, |input, cx| input.focus(window, cx)),
+        }
+    }
+
+    /// M5.5 RAM diet: drops the previous chat's inline media and animated GIF textures when the
+    /// selected chat changes, so only the active chat's media stays resident.
+    pub(crate) fn evict_previous_chat_media(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let current = self.vm.selected_chat().map(|c| c.key.id.clone());
+        let previous = self.resident_chat_id.clone();
+        self.resident_chat_id = current.clone();
+        let Some(previous_id) = previous.filter(|prev| current.as_deref() != Some(prev.as_str()))
+        else {
+            return 0;
+        };
+        self.gpu_textures.evict_chat_media(&previous_id, window, cx)
+    }
+
+    /// M5.5 RAM diet idle/minimize trim: purges transient GPU textures, asks SQLite to release
+    /// its page cache, and asks Windows to move reclaimable pages out of the working set.
+    /// Returns the number of textures released.
+    pub fn trim_memory_for_idle(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        self.gif_timer_task = None;
+        self.memory_trim_count = self.memory_trim_count.saturating_add(1);
+        let dropped = self.gpu_textures.purge_transient_textures(window, cx);
+        let _ = self.vm.shrink_store_memory();
+        if let Some(platform) = &self.memory_platform {
+            let _ = platform.trim_process_working_set();
+        }
+        dropped
+    }
+
+    /// Working-set and private-commit telemetry, filled from `GetProcessMemoryInfo` on Windows.
+    pub fn process_memory_stats(&self) -> postbox_platform::ProcessMemoryStats {
+        self.memory_platform
+            .as_ref()
+            .and_then(|p| p.read_process_memory_stats().ok())
+            .unwrap_or_default()
+    }
+
+    /// `postboxctl status` telemetry: frames rendered, working set, private commit, GPU texture
+    /// bytes, and queued outbox rows for the active chat.
+    pub fn telemetry_counters(&self) -> postbox_core::control::TelemetryCounters {
+        let mem = self.process_memory_stats();
+        postbox_core::control::TelemetryCounters {
+            frames_rendered: self.frames_rendered,
+            working_set_kb: mem.working_set_kb(),
+            private_usage_kb: mem.private_usage_kb(),
+            gpu_texture_bytes: self.gpu_textures.total_vram_bytes() as u64,
+            pending_outbox: self.vm.outbox_for_chat().len() as u32,
         }
     }
 
@@ -2255,6 +2335,7 @@ impl Focusable for PostboxShell {
 
 impl Render for PostboxShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.frames_rendered = self.frames_rendered.saturating_add(1);
         let title = self.vm.window_title();
         if title != self.last_window_title {
             window.set_window_title(&title);
@@ -3050,6 +3131,7 @@ mod desktop_tests {
             giphy_key_available: true,
             deepgram_key_available: true,
             llm_format_key_available: false,
+            memory_platform: None,
         }
     }
 
@@ -3711,6 +3793,7 @@ mod desktop_tests {
             giphy_key_available: false,
             deepgram_key_available: false,
             llm_format_key_available: false,
+            memory_platform: None,
         };
         let (handle, shell) = open_shell_with_ctx(cx, ctx);
         cx.update_window(handle.into(), |_, window, cx| {
@@ -3826,6 +3909,7 @@ mod desktop_tests {
             giphy_key_available: false,
             deepgram_key_available: false,
             llm_format_key_available: false,
+            memory_platform: None,
         };
         let (handle, shell) = open_shell_with_ctx(cx, ctx);
         cx.update_window(handle.into(), |_, window, cx| {
@@ -5170,6 +5254,263 @@ mod desktop_tests {
                 .and_then(|item| item.text())
                 .unwrap_or_default();
             assert_eq!(clip, "Older raw note\r\n\r\nNewer raw note");
+        });
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // M5.5 RAM diet: active-chat-only timeline, chat-switch eviction, idle trim.
+    // -------------------------------------------------------------------------
+
+    /// Records every working-set trim and reports fixed memory counters.
+    #[derive(Default)]
+    struct TestMemoryPlatform {
+        trims: std::sync::atomic::AtomicUsize,
+        stats: postbox_platform::ProcessMemoryStats,
+    }
+
+    impl postbox_platform::MemoryPressure for TestMemoryPlatform {
+        fn trim_process_working_set(&self) -> Result<(), postbox_platform::PlatformError> {
+            self.trims
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn read_process_memory_stats(
+            &self,
+        ) -> Result<postbox_platform::ProcessMemoryStats, postbox_platform::PlatformError> {
+            Ok(self.stats)
+        }
+    }
+
+    #[gpui_kit::test]
+    fn idle_and_minimize_trim_purges_transient_textures_and_reports_memory_counters(
+        cx: &mut TestAppContext,
+    ) {
+        let mut launch_ctx = seeded_launch_ctx();
+        let platform = std::sync::Arc::new(TestMemoryPlatform {
+            trims: std::sync::atomic::AtomicUsize::new(0),
+            stats: postbox_platform::ProcessMemoryStats {
+                working_set_bytes: 61 * 1024 * 1024,
+                private_usage_bytes: 54 * 1024 * 1024,
+            },
+        });
+        launch_ctx.memory_platform = Some(platform.clone());
+        let (handle, shell) = open_shell_with_ctx(cx, launch_ctx);
+        let alice_key = ChatKey::new(Provider::Whatsapp, "main", "alice@s.whatsapp.net");
+
+        // Populate the texture LRU with two transient inline images so the idle trim has
+        // something to purge and we can count exactly what it released.
+        let data_dir = unique_desktop_test_dir("ram_diet_trim");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let png = postbox_media::paste::encode_png(16, 16, &vec![200u8; 16 * 16 * 4]).unwrap();
+        let inline_one = data_dir.join("inline_one.png");
+        let inline_two = data_dir.join("inline_two.png");
+        std::fs::write(&inline_one, &png).unwrap();
+        std::fs::write(&inline_two, &png).unwrap();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                for (msg_id, path, sha) in [
+                    ("img_m2", &inline_one, "ram-diet-inline-1"),
+                    ("img_m3", &inline_two, "ram-diet-inline-2"),
+                ] {
+                    this.vm.apply_sync_event(SyncEvent::MediaDownloaded {
+                        chat: alice_key.clone(),
+                        msg_id: msg_id.into(),
+                        path: path.clone(),
+                        mime_type: "image/png".into(),
+                        sha256: sha.into(),
+                    });
+                }
+                this.sync_after_vm_change(window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        // Feed the decoded textures straight into the LRU: this test is about the trim hook, and
+        // driving the real decode queue would make it depend on the off-thread scheduler.
+        let decoded = cx.update(|_| {
+            postbox_media::decode::decode_image_bytes(&png, 64, 64, false)
+                .expect("test PNG decodes")
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                for (msg_id, path) in [("img_m2", &inline_one), ("img_m3", &inline_two)] {
+                    let key = crate::desktop_m3::inline_media_tex_key(&alice_key.id, msg_id, path);
+                    assert!(
+                        this.gpu_textures
+                            .ensure_decoded_inserted(&key, &decoded, window, cx)
+                            .is_some()
+                    );
+                }
+            });
+        })
+        .unwrap();
+
+        let before = cx.update(|cx| shell.read(cx).gpu_textures.resident_count());
+        assert!(
+            before >= 2,
+            "expected resident inline textures, got {before}"
+        );
+
+        // The idle/minimize hook drops transient media, keeps small persistent icons, releases
+        // SQLite pages, and asks the OS to trim the working set.
+        let dropped = cx
+            .update_window(handle.into(), |_, window, cx| {
+                shell.update(cx, |this, cx| this.trim_memory_for_idle(window, cx))
+            })
+            .unwrap();
+        assert!(dropped >= 1, "the transient inline images must be purged");
+        assert_eq!(platform.trims.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        cx.update(|cx| {
+            let this = shell.read(cx);
+            assert_eq!(this.memory_trim_count, 1);
+            assert!(
+                this.gpu_textures
+                    .resident_keys()
+                    .iter()
+                    .all(|k| !k.starts_with(crate::desktop_m3::INLINE_MEDIA_KEY_PREFIX)),
+                "inline media must be purged on idle"
+            );
+            let counters = this.telemetry_counters();
+            assert_eq!(counters.working_set_kb, 61 * 1024);
+            assert_eq!(counters.private_usage_kb, 54 * 1024);
+            assert_eq!(counters.gpu_texture_bytes, this.gpu_vram_bytes() as u64);
+        });
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[gpui_kit::test]
+    fn switching_chats_evicts_previous_chat_media_and_keeps_only_active_timeline(
+        cx: &mut TestAppContext,
+    ) {
+        let data_dir = unique_desktop_test_dir("ram_diet_chat_switch");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut launch_ctx = seeded_launch_ctx();
+        launch_ctx.data_dir = data_dir.clone();
+
+        let alice_key = ChatKey::new(Provider::Whatsapp, "main", "alice@s.whatsapp.net");
+        let bob_key = ChatKey::new(Provider::Slack, "T1", "slack:T1:C-bob");
+        let png = postbox_media::paste::encode_png(20, 20, &vec![90u8; 20 * 20 * 4]).unwrap();
+        let alice_img = data_dir.join("alice.png");
+        let bob_img = data_dir.join("bob.png");
+        std::fs::write(&alice_img, &png).unwrap();
+        std::fs::write(&bob_img, &png).unwrap();
+
+        let mut media_seeds: Vec<(ChatKey, String, std::path::PathBuf)> = Vec::new();
+        for (chat, msg_id, path) in [
+            (&alice_key, "alice_img", &alice_img),
+            (&bob_key, "bob_img", &bob_img),
+        ] {
+            launch_ctx
+                .store
+                .upsert_message(&Message {
+                    chat: chat.clone(),
+                    msg_id: msg_id.into(),
+                    sender_id: "u1".into(),
+                    sender_name: "Peer".into(),
+                    from_me: false,
+                    ts: "2025-01-15T12:05:00Z".into(),
+                    body: String::new(),
+                    reply_to_id: None,
+                    reply_broadcast: false,
+                    media_kind: Some(postbox_core::MediaKind::Image),
+                    mime_type: Some("image/png".into()),
+                    filename: Some(format!("{msg_id}.png")),
+                    file_size: Some(1024),
+                    reactions: vec![],
+                    read_status: ReadStatus::Read,
+                    deleted: false,
+                })
+                .unwrap();
+            media_seeds.push((chat.clone(), msg_id.to_string(), path.clone()));
+        }
+
+        let (handle, shell) = open_shell_with_ctx(cx, launch_ctx);
+
+        // Load Alice (chat 0), decode her inline image.
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                for (chat, msg_id, path) in media_seeds.iter() {
+                    this.vm.apply_sync_event(SyncEvent::MediaDownloaded {
+                        chat: chat.clone(),
+                        msg_id: msg_id.clone(),
+                        path: path.clone(),
+                        mime_type: "image/png".into(),
+                        sha256: format!("sha-{msg_id}"),
+                    });
+                }
+                assert!(this.vm.select_chat_index(0));
+                this.vm.refresh_messages();
+                this.sync_after_vm_change(window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            shell.update(cx, |this, cx| this.refresh_visible_gpu_textures(window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        let alice_inline: Vec<String> = cx.update(|cx| {
+            shell
+                .read(cx)
+                .gpu_textures
+                .resident_keys()
+                .into_iter()
+                .filter(|k| k.starts_with(crate::desktop_m3::INLINE_MEDIA_KEY_PREFIX))
+                .collect()
+        });
+        assert!(
+            alice_inline.iter().any(|k| k.contains("alice_img")),
+            "Alice's inline image should be resident: {alice_inline:?}"
+        );
+
+        // Switch to Bob: Alice's media goes, Bob's timeline replaces hers in RAM.
+        let alice_msgs_before = cx.update(|cx| shell.read(cx).vm.messages().len());
+        let dropped = cx
+            .update_window(handle.into(), |_, window, cx| {
+                shell.update(cx, |this, cx| {
+                    assert!(this.vm.select_chat_index(1));
+                    this.vm.refresh_messages();
+                    let dropped = this.evict_previous_chat_media(window, cx);
+                    this.sync_after_vm_change(window, cx);
+                    dropped
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            dropped, 1,
+            "Alice's inline image must be evicted exactly once"
+        );
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            shell.update(cx, |this, cx| this.refresh_visible_gpu_textures(window, cx));
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let this = shell.read(cx);
+            let keys = this.gpu_textures.resident_keys();
+            assert!(
+                !keys.iter().any(|k| k.contains("alice_img")),
+                "Alice's media must be gone after switching to Bob: {keys:?}"
+            );
+            // Active-chat-only timeline: Bob's messages replaced Alice's, no accumulation.
+            assert!(alice_msgs_before >= 1);
+            let bob_msgs = this.vm.messages();
+            assert!(!bob_msgs.is_empty());
+            assert!(bob_msgs.iter().all(|m| m.chat == bob_key));
+            assert!(!bob_msgs.iter().any(|m| m.chat == alice_key));
+            assert_eq!(this.resident_chat_id.as_deref(), Some(bob_key.id.as_str()));
         });
 
         let _ = std::fs::remove_dir_all(&data_dir);

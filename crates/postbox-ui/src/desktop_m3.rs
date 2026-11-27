@@ -1,4 +1,4 @@
-//! GPUI rendering & Intel Arc `<= 64 MB` VRAM texture LRU for Milestone 3 features (#18–#26).
+//! GPUI rendering & Intel Arc `<= 16 MB` VRAM texture LRU for Milestone 3 features (#18–#26).
 
 use crate::desktop::PostboxShell;
 use crate::geometry::{TYPE_LABEL_PX, TYPE_TIME_PX};
@@ -28,21 +28,35 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Texture key prefixes. M5.5 purges by prefix on chat switch and on minimize/idle, so these
+/// must stay in sync with the `*_tex_key` builders below.
+pub(crate) const INLINE_MEDIA_KEY_PREFIX: &str = "inline:";
+pub(crate) const LIGHTBOX_KEY_PREFIX: &str = "lightbox:";
+pub(crate) const GIPHY_KEY_PREFIX: &str = "giphy:";
+pub(crate) const AVATAR_KEY_PREFIX: &str = "avatar:";
+pub(crate) const WORKSPACE_ICON_KEY_PREFIX: &str = "wsicon:";
+pub(crate) const SLACK_EMOJI_KEY_PREFIX: &str = "slackemoji:";
+pub(crate) const UNFURL_KEY_PREFIX: &str = "unfurl:";
+pub(crate) const STAGED_KEY_PREFIX: &str = "staged:";
+
 pub(crate) fn inline_media_tex_key(chat_id: &str, msg_id: &str, path: &Path) -> String {
-    format!("inline:{chat_id}:{msg_id}:{}", path.display())
+    format!(
+        "{INLINE_MEDIA_KEY_PREFIX}{chat_id}:{msg_id}:{}",
+        path.display()
+    )
 }
 
 pub(crate) fn lightbox_tex_key(msg_id: &str, path: &Path) -> String {
-    format!("lightbox:{msg_id}:{}", path.display())
+    format!("{LIGHTBOX_KEY_PREFIX}{msg_id}:{}", path.display())
 }
 
 pub(crate) fn giphy_tex_key(idx: usize, path: &Path) -> String {
-    format!("giphy:{idx}:{}", path.display())
+    format!("{GIPHY_KEY_PREFIX}{idx}:{}", path.display())
 }
 
 pub(crate) fn avatar_tex_key(chat: &ChatKey, path: &Path) -> String {
     format!(
-        "avatar:{:?}:{}:{}:{}",
+        "{AVATAR_KEY_PREFIX}{:?}:{}:{}:{}",
         chat.provider,
         chat.account,
         chat.id,
@@ -51,15 +65,33 @@ pub(crate) fn avatar_tex_key(chat: &ChatKey, path: &Path) -> String {
 }
 
 pub(crate) fn workspace_icon_tex_key(team: &str, path: &Path) -> String {
-    format!("wsicon:{team}:{}", path.display())
+    format!("{WORKSPACE_ICON_KEY_PREFIX}{team}:{}", path.display())
 }
 
 pub(crate) fn slack_emoji_tex_key(team: &str, name: &str, path: &Path) -> String {
-    format!("slackemoji:{team}:{name}:{}", path.display())
+    format!("{SLACK_EMOJI_KEY_PREFIX}{team}:{name}:{}", path.display())
 }
 
 pub(crate) fn unfurl_tex_key(provider: UnfurlProvider, id: &str, path: &Path) -> String {
-    format!("unfurl:{}:{id}:{}", provider.as_str(), path.display())
+    format!(
+        "{UNFURL_KEY_PREFIX}{}:{id}:{}",
+        provider.as_str(),
+        path.display()
+    )
+}
+
+/// Keys that survive an idle/minimize trim: small, reused across chats, and cheap to keep.
+pub(crate) fn is_persistent_texture_key(key: &str) -> bool {
+    key.starts_with(AVATAR_KEY_PREFIX)
+        || key.starts_with(WORKSPACE_ICON_KEY_PREFIX)
+        || key.starts_with(SLACK_EMOJI_KEY_PREFIX)
+        || key.starts_with(STAGED_KEY_PREFIX)
+}
+
+/// Keys whose lifetime is bound to one chat's timeline and must go when that chat is left.
+pub(crate) fn is_transient_chat_texture_key(key: &str, chat_id: &str) -> bool {
+    key.starts_with(&format!("{INLINE_MEDIA_KEY_PREFIX}{chat_id}:"))
+        || key.starts_with(UNFURL_KEY_PREFIX)
 }
 
 #[derive(Clone, Debug)]
@@ -118,7 +150,7 @@ impl GpuTextureEntry {
     }
 }
 
-/// Intel Arc GPU texture atlas LRU strictly capped at `VRAM_TEXTURE_BUDGET_BYTES` (64 MiB) with
+/// Intel Arc GPU texture atlas LRU strictly capped at `VRAM_TEXTURE_BUDGET_BYTES` (16 MiB, M5.5 RAM diet) with
 /// bounded off-UI-thread decode scheduling and deduplication.
 /// Drops every evicted `Arc<RenderImage>` via `cx.drop_image(frame, Some(window))`.
 pub(crate) struct GpuTextureLru {
@@ -146,6 +178,18 @@ impl Default for GpuTextureLru {
 impl GpuTextureLru {
     pub fn total_vram_bytes(&self) -> usize {
         self.lru.total_bytes()
+    }
+
+    /// Number of resident textures (test observability).
+    #[cfg(test)]
+    pub fn resident_count(&self) -> usize {
+        self.lru.len()
+    }
+
+    /// Resident texture keys, least-recently-used first (test observability).
+    #[cfg(test)]
+    pub fn resident_keys(&self) -> Vec<String> {
+        self.lru.keys()
     }
 
     pub fn peek(&self, key: &str) -> Option<&GpuTextureEntry> {
@@ -240,11 +284,70 @@ impl GpuTextureLru {
         self.pending_queue.clear();
         self.queued_or_in_flight.clear();
         self.failed_keys.clear();
+        self.in_flight = 0;
         for (_k, old_entry) in self.lru.clear() {
             for frame in old_entry.frames {
                 cx.drop_image(frame, Some(window));
             }
         }
+    }
+
+    /// Drops decoded images and animated GIF frames that belong to a chat the user just left,
+    /// keeping avatars, workspace icons, Slack custom emoji, and the newly selected chat.
+    /// Returns how many entries were released.
+    pub fn evict_chat_media(
+        &mut self,
+        previous_chat_id: &str,
+        window: &mut Window,
+        cx: &mut Context<PostboxShell>,
+    ) -> usize {
+        let doomed: Vec<String> = self
+            .lru
+            .keys()
+            .into_iter()
+            .filter(|key| {
+                !is_persistent_texture_key(key)
+                    && is_transient_chat_texture_key(key, previous_chat_id)
+            })
+            .collect();
+        // Queued decodes for the chat we just left must not resurrect its textures.
+        self.pending_queue
+            .retain(|job| !doomed.iter().any(|key| key == &job.key));
+        self.queued_or_in_flight
+            .retain(|key| !doomed.iter().any(|doomed_key| doomed_key == key));
+        let mut dropped = 0usize;
+        for entry in self
+            .lru
+            .remove_where(|key| doomed.iter().any(|doomed_key| doomed_key == key))
+        {
+            dropped += 1;
+            for frame in entry.frames {
+                cx.drop_image(frame, Some(window));
+            }
+        }
+        dropped
+    }
+
+    /// Purges every transient texture (inline media, animated GIF frames, lightbox, Giphy
+    /// previews, unfurl thumbnails) when the window is minimized or idle. Avatars, workspace
+    /// icons, and Slack custom emoji stay because they are small and reused across chats;
+    /// everything else is re-decoded on demand from the on-disk media cache.
+    pub fn purge_transient_textures(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<PostboxShell>,
+    ) -> usize {
+        self.pending_queue.clear();
+        self.queued_or_in_flight.clear();
+        self.in_flight = 0;
+        let mut dropped = 0usize;
+        for entry in self.lru.remove_where(|key| !is_persistent_texture_key(key)) {
+            dropped += 1;
+            for frame in entry.frames {
+                cx.drop_image(frame, Some(window));
+            }
+        }
+        dropped
     }
 }
 
@@ -375,12 +478,15 @@ impl PostboxShell {
 
     /// Schedules bounded off-UI-thread decodes for all visible textures (inline media, lightbox,
     /// Giphy tiles, sidebar avatars, view-rail Slack workspace icons, Slack custom emoji, and
-    /// unfurl thumbnails) into `GpuTextureLru` (`<= 64 MB` VRAM) and updates the GIF timer.
+    /// unfurl thumbnails) into `GpuTextureLru` (`<= 16 MB` VRAM) and updates the GIF timer.
     pub(crate) fn refresh_visible_gpu_textures(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 0. Only the active chat's media stays resident: drop the chat we just left first.
+        self.evict_previous_chat_media(window, cx);
+
         // 1. Inline message images/GIFs/stickers
         let msgs: Vec<(String, String, PathBuf)> = self
             .vm
@@ -428,7 +534,7 @@ impl PostboxShell {
             .iter()
             .filter_map(|item| {
                 let thumb = item.thumb.clone()?;
-                Some((format!("staged:{}", item.path.display()), thumb))
+                Some((format!("{STAGED_KEY_PREFIX}{}", item.path.display()), thumb))
             })
             .collect();
         for (key, thumb) in staged {
@@ -960,7 +1066,7 @@ impl PostboxShell {
             .py_1();
 
         for (idx, item) in items.iter().enumerate() {
-            let key = format!("staged:{}", item.path.display());
+            let key = format!("{STAGED_KEY_PREFIX}{}", item.path.display());
             let mut chip = div()
                 .id(SharedString::from(format!("staged-chip-{idx}")))
                 .test_support()
@@ -1461,5 +1567,72 @@ impl PostboxShell {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod ram_diet_tests {
+    use super::*;
+
+    #[test]
+    fn transient_and_persistent_texture_keys_partition_by_prefix() {
+        let chat = ChatKey::new(
+            postbox_core::Provider::Whatsapp,
+            "main",
+            "alice@s.whatsapp.net",
+        );
+        let p = Path::new("/tmp/media.png");
+
+        // Persistent: avatars, workspace icons, Slack custom emoji, staged thumbnails.
+        for key in [
+            avatar_tex_key(&chat, p),
+            workspace_icon_tex_key("T1", p),
+            slack_emoji_tex_key("T1", "shipit", p),
+            format!("{STAGED_KEY_PREFIX}{}", p.display()),
+        ] {
+            assert!(is_persistent_texture_key(&key), "{key} must survive a trim");
+            assert!(
+                !is_transient_chat_texture_key(&key, &chat.id),
+                "{key} must not be chat-evicted"
+            );
+        }
+
+        // Transient: inline media for the chat being left, and unfurl cards.
+        let inline = inline_media_tex_key(&chat.id, "msg1", p);
+        assert!(is_transient_chat_texture_key(&inline, &chat.id));
+        assert!(!is_persistent_texture_key(&inline));
+        let unfurl = unfurl_tex_key(UnfurlProvider::Page, "abc", p);
+        assert!(is_transient_chat_texture_key(&unfurl, &chat.id));
+
+        // Inline media of a different chat must not be evicted by this chat's switch.
+        assert!(!is_transient_chat_texture_key(&inline, "someone-else"));
+
+        // Lightbox and Giphy tiles are transient but not chat-scoped.
+        assert!(!is_persistent_texture_key(&lightbox_tex_key("msg1", p)));
+        assert!(!is_persistent_texture_key(&giphy_tex_key(3, p)));
+    }
+
+    #[test]
+    fn lru_remove_where_returns_only_matching_values_and_keeps_budget_honest() {
+        let mut lru: postbox_media::decode::BitmapLru<String, u32> =
+            postbox_media::decode::BitmapLru::new(1024);
+        lru.insert("keep-a".into(), 1, 100);
+        lru.insert("drop-1".into(), 2, 100);
+        lru.insert("keep-b".into(), 3, 100);
+        lru.insert("drop-2".into(), 4, 100);
+        assert_eq!(lru.total_bytes(), 400);
+
+        let mut removed = lru.remove_where(|k| k.starts_with("drop-"));
+        removed.sort_unstable();
+        assert_eq!(removed, vec![2, 4]);
+        assert_eq!(lru.total_bytes(), 200);
+        assert_eq!(lru.len(), 2);
+        assert!(lru.contains(&"keep-a".to_owned()));
+        assert!(lru.contains(&"keep-b".to_owned()));
+
+        // Removing what is not there is a no-op, and the LRU keeps evicting to budget after.
+        assert!(lru.remove_where(|k| k == "nope").is_empty());
+        lru.insert("big".into(), 5, 900);
+        assert!(lru.total_bytes() <= lru.budget_bytes());
     }
 }

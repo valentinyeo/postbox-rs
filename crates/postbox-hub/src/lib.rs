@@ -8,7 +8,7 @@ pub mod types;
 
 pub use client::{
     DEFAULT_MEDIA_POLL_INTERVAL, DEFAULT_MEDIA_POLL_MAX_WAIT, EventStream, HUB_MEDIA_TIMEOUT,
-    HubClient,
+    HubClient, MAX_IDLE_CONNECTIONS_PER_HOST,
 };
 pub use error::{
     HubError, SignalSendFailure, TelegramSendFailure, classify_signal_send_failure,

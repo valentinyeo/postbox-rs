@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
+use crate::MAX_IDLE_CONNECTIONS_PER_HOST;
+
 pub const FORMAT_CACHE_MAX_BYTES: usize = 64 * 1024;
 pub const FORMAT_CACHE_HEADER_V2: &str = "wazig-voice-format v2\n";
 pub const FORMAT_REQUEST_RING_CAP: usize = 512;
@@ -387,6 +389,7 @@ impl TranscriptFormatter {
         let client = Client::builder()
             .timeout(FORMAT_HTTP_TIMEOUT)
             .connect_timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
             .build()
             .unwrap_or_else(|_| Client::new());
         Self {

@@ -10,6 +10,10 @@ pub mod stretch;
 pub mod transcribe;
 pub mod voice_note;
 
+/// M5.5 RAM diet: at most two idle keep-alive sockets per host on every HTTP client, so a
+/// long-lived transcript formatter or Deepgram REST client cannot pool TLS buffers.
+pub const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 2;
+
 pub use dictation::{
     CLOSE_STREAM_DRAIN_TIMEOUT, DEFAULT_DEEPGRAM_WS_BASE_URL, DICTATION_CAPTURE_POLL_INTERVAL,
     DictationError, DictationMeter, LIVE_BYTES_PER_SECOND, LIVE_SAMPLE_RATE,

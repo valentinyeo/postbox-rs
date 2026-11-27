@@ -307,6 +307,9 @@ fn build_launch_context(
         giphy_key_available,
         deepgram_key_available,
         llm_format_key_available,
+        // M5.5 RAM diet: the same OS platform object owns working-set trim and
+        // `GetProcessMemoryInfo` telemetry for the shell's idle/minimize hook.
+        memory_platform: Some(Arc::new(NativePlatform::default())),
     }
 }
 

@@ -120,6 +120,10 @@ gpui_kit::actions!(
         SmartCopy,
         MoveViewUp,
         MoveViewDown,
+        ToggleVideoFullscreen,
+        CloseVideoPlayer,
+        ToggleVideoPlayPause,
+        ToggleVideoMute,
     ]
 );
 
@@ -204,6 +208,8 @@ fn gpui_action_for(action: PbAction) -> Option<Box<dyn GpuiAction>> {
         PbAction::SmartCopy => Some(Box::new(SmartCopy)),
         PbAction::MoveViewUp => Some(Box::new(MoveViewUp)),
         PbAction::MoveViewDown => Some(Box::new(MoveViewDown)),
+        PbAction::ToggleVideoFullscreen => Some(Box::new(ToggleVideoFullscreen)),
+        PbAction::CloseVideoPlayer => Some(Box::new(CloseVideoPlayer)),
         _ => None,
     }
 }
@@ -394,6 +400,13 @@ pub struct PostboxShell {
     pub(crate) gif_tick: usize,
     pub(crate) gif_timer_task: Option<Task<()>>,
     pub(crate) dictation_timer_task: Option<Task<()>>,
+    /// Milestone 6: `16 ms` presentation timer, armed only while a video is playing.
+    pub(crate) video_timer_task: Option<Task<()>>,
+    video_player_focus: FocusHandle,
+    pub(crate) video_backend: Option<std::sync::Arc<dyn postbox_platform::VideoBackend>>,
+    pub(crate) audio_backend: Option<std::sync::Arc<dyn postbox_platform::AudioBackend>>,
+    pub(crate) video_thumb_cache: Option<postbox_media::VideoThumbnailCache>,
+    pub(crate) video_runtime: Option<crate::desktop_m6::VideoRuntime>,
     /// M5.5 RAM diet: chat whose media is currently resident, so a chat switch can evict the
     /// previous chat's inline images/GIF frames before decoding the next chat's.
     pub(crate) resident_chat_id: Option<String>,
@@ -434,6 +447,21 @@ impl PostboxShell {
         vm.initialize();
         Self::from_view_model_with_bridge(vm, ctx.sync_bridge, started_at, window, cx)
             .with_memory_platform(ctx.memory_platform)
+            .with_video_support(ctx.video_backend, ctx.audio_backend, ctx.video_thumb_cache)
+    }
+
+    /// Installs the Milestone 6 video backend (Media Foundation + Intel Arc DXVA), the WASAPI
+    /// render backend that clocks playback, and the disk thumbnail cache.
+    pub fn with_video_support(
+        mut self,
+        video_backend: Option<std::sync::Arc<dyn postbox_platform::VideoBackend>>,
+        audio_backend: Option<std::sync::Arc<dyn postbox_platform::AudioBackend>>,
+        video_thumb_cache: Option<postbox_media::VideoThumbnailCache>,
+    ) -> Self {
+        self.video_backend = video_backend;
+        self.audio_backend = audio_backend;
+        self.video_thumb_cache = video_thumb_cache;
+        self
     }
 
     /// Installs the OS memory-pressure source (working-set trim + `GetProcessMemoryInfo`).
@@ -482,6 +510,7 @@ impl PostboxShell {
         let emoji_picker_focus = cx.focus_handle();
         let giphy_picker_focus = cx.focus_handle();
         let voice_record_focus = cx.focus_handle();
+        let video_player_focus = cx.focus_handle();
         sidebar_focus.focus(window, cx);
 
         let timeline_state = cx.new(|cx| MessageScrollerState::new(initial_timeline_len, cx));
@@ -630,6 +659,9 @@ impl PostboxShell {
             if !window.is_window_active() {
                 this.gif_timer_task = None;
                 this.dictation_timer_task = None;
+                // Milestone 6: minimize/occlude pauses video, stops the render stream and
+                // drops the presentation timer (0.0% idle CPU/GPU when nothing plays).
+                this.pause_video_when_occluded(cx);
                 // M5.5 RAM diet: losing focus counts as idle, so drop transient textures,
                 // release SQLite pages, and hand reclaimable pages back to Windows.
                 this.trim_memory_for_idle(window, cx);
@@ -700,6 +732,12 @@ impl PostboxShell {
             gif_tick: 0,
             gif_timer_task: None,
             dictation_timer_task: None,
+            video_timer_task: None,
+            video_player_focus,
+            video_backend: None,
+            audio_backend: None,
+            video_thumb_cache: None,
+            video_runtime: None,
             resident_chat_id,
             memory_platform,
             memory_trim_count: 0,
@@ -839,6 +877,7 @@ impl PostboxShell {
             FocusTarget::GiphyPicker => self
                 .giphy_search_input
                 .update(cx, |input, cx| input.focus(window, cx)),
+            FocusTarget::VideoPlayer => self.video_player_focus.focus(window, cx),
         }
     }
 
@@ -856,6 +895,10 @@ impl PostboxShell {
         else {
             return 0;
         };
+        // Milestone 6: leaving a chat stops the player and releases its frame + render stream.
+        let active_chat = self.vm.selected_chat().map(|c| c.key.clone());
+        self.vm.cleanup_video_player_for_chat(active_chat.as_ref());
+        self.release_video_runtime(window, cx);
         self.gpu_textures.evict_chat_media(&previous_id, window, cx)
     }
 
@@ -992,6 +1035,11 @@ impl PostboxShell {
         }
 
         self.refresh_visible_gpu_textures(window, cx);
+        // `Ctrl+K > Play video inline` queues an open request; answer it here.
+        if let Some(msg_id) = self.vm.take_pending_video_open() {
+            self.open_video_player_for(&msg_id, window, cx);
+        }
+        self.sync_video_player_timer(window, cx);
         self.sync_dictation_meter_timer(window, cx);
         self.sync_reaction_retry_timer(window, cx);
         self.sync_focus(window, cx);
@@ -1115,6 +1163,27 @@ impl PostboxShell {
         let key = event.keystroke.key.as_str();
         let mods = event.keystroke.modifiers;
         let now = self.now_ms();
+
+        // Milestone 6: while the inline player is open, `Space` plays/pauses and `M` mutes,
+        // mirroring every desktop video player. `F11`/`Esc` come from the keymap.
+        if self.vm.video_player_is_open()
+            && self.vm.focus() == FocusTarget::VideoPlayer
+            && !mods.control
+            && !mods.alt
+            && !mods.platform
+        {
+            match key {
+                "space" => {
+                    self.toggle_video_play_pause_ui(window, cx);
+                    return;
+                }
+                "m" if !mods.shift => {
+                    self.toggle_video_mute_ui(cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
 
         // Alt+G, Alt+G jump-to-latest chord
         if mods.alt
@@ -1571,7 +1640,11 @@ impl PostboxShell {
                         move |event: &MouseDownEvent, window, cx| {
                             if event.click_count == 2 {
                                 shell_dbl.update(cx, |this, cx| {
-                                    if this.vm.double_click_message_bubble(&msg_id_dbl) {
+                                    // Videos open the inline player; other bubbles keep the
+                                    // double-click thumbs-up reaction.
+                                    if this.vm.is_video_message_id(&msg_id_dbl) {
+                                        this.open_video_player_for(&msg_id_dbl, window, cx);
+                                    } else if this.vm.double_click_message_bubble(&msg_id_dbl) {
                                         this.sync_after_vm_change(window, cx);
                                     }
                                 });
@@ -2930,12 +3003,28 @@ impl Render for PostboxShell {
             .on_action(cx.listener(|this, _: &MoveViewDown, window, cx| {
                 this.dispatch_vm_action(PbAction::MoveViewDown, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleVideoFullscreen, _, cx| {
+                this.toggle_video_fullscreen_ui(cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseVideoPlayer, window, cx| {
+                this.handle_video_escape(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleVideoPlayPause, window, cx| {
+                this.toggle_video_play_pause_ui(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleVideoMute, _, cx| {
+                this.toggle_video_mute_ui(cx);
+            }))
             .child(self.render_view_rail(&p, cx))
             .child(sidebar_pane)
             .child(main_column);
 
         if let Some(thread_panel) = self.render_thread_panel(&p, cx) {
             root = root.child(thread_panel);
+        }
+
+        if let Some(player) = self.render_video_player_overlay(&p, &self.video_player_focus, cx) {
+            root = root.child(player);
         }
 
         if let Some(lightbox) = self.render_lightbox_overlay(&p, &self.lightbox_focus, cx) {
@@ -3132,6 +3221,9 @@ mod desktop_tests {
             deepgram_key_available: true,
             llm_format_key_available: false,
             memory_platform: None,
+            video_backend: None,
+            audio_backend: None,
+            video_thumb_cache: None,
         }
     }
 
@@ -3794,6 +3886,9 @@ mod desktop_tests {
             deepgram_key_available: false,
             llm_format_key_available: false,
             memory_platform: None,
+            video_backend: None,
+            audio_backend: None,
+            video_thumb_cache: None,
         };
         let (handle, shell) = open_shell_with_ctx(cx, ctx);
         cx.update_window(handle.into(), |_, window, cx| {
@@ -3910,6 +4005,9 @@ mod desktop_tests {
             deepgram_key_available: false,
             llm_format_key_available: false,
             memory_platform: None,
+            video_backend: None,
+            audio_backend: None,
+            video_thumb_cache: None,
         };
         let (handle, shell) = open_shell_with_ctx(cx, ctx);
         cx.update_window(handle.into(), |_, window, cx| {

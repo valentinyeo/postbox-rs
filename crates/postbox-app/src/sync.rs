@@ -32,9 +32,7 @@ use postbox_media::giphy::{
     GIPHY_DEFAULT_LIMIT, GIPHY_MSG_NEEDS_KEY, GiphyClient, giphy_error_message,
 };
 use postbox_media::unfurl::{ClassifiedUrl, UnfurlCard, UnfurlService};
-#[cfg(test)]
-use postbox_platform::NativePlatform;
-use postbox_platform::{AudioBackend, FormatProviderConfig};
+use postbox_platform::{AudioBackend, FormatProviderConfig, NativePlatform, VideoBackend};
 use postbox_store::{MediaCacheEntry, Store};
 use postbox_ui::{
     HubConnectionStatus, MediaDownloadTarget, SyncCommand, SyncEvent, SyncWorkerHandle,
@@ -58,6 +56,11 @@ impl StoreLocation {
             Self::SharedMemory(name) => Store::open_shared_memory(name),
         }
     }
+}
+
+/// Hub media cache root (video thumbnails live beside the downloaded videos).
+fn data_dir_hub_media(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("hub-media")
 }
 
 fn now_epoch_secs() -> i64 {
@@ -166,6 +169,9 @@ pub fn spawn_sync_engine(
                     format_provider,
                     audio_backend,
                 );
+                // Milestone 6: warm the video thumbnail cache off the UI thread as soon as a
+                // video finishes auto-downloading.
+                engine.store_loc = Some(store_loc);
                 engine.run().await;
             });
         })
@@ -230,6 +236,11 @@ struct SyncEngine {
     formatter: TranscriptFormatter,
     audio_worker: AudioWorkerHandle,
     dictation_controller: LiveDictationController,
+    /// Milestone 6: Media Foundation + Intel Arc DXVA thumbnail extraction for downloaded videos.
+    video_backend: Arc<dyn VideoBackend>,
+    video_thumb_cache: postbox_media::VideoThumbnailCache,
+    /// Store location, so the off-thread thumbnail job can open its own SQLite connection.
+    store_loc: Option<StoreLocation>,
 }
 
 impl Drop for SyncEngine {
@@ -277,6 +288,7 @@ impl SyncEngine {
         format_provider: Option<FormatProviderConfig>,
         audio_backend: Arc<dyn AudioBackend>,
     ) -> Self {
+        let data_dir_hint = data_dir.clone();
         let downloader = Arc::new(MediaDownloader::new(data_dir.join("hub-media")));
         let unfurl_service = UnfurlService::new(data_dir.join("link-previews"))
             .ok()
@@ -330,7 +342,33 @@ impl SyncEngine {
             formatter: TranscriptFormatter::new(),
             audio_worker,
             dictation_controller,
+            video_backend: Arc::new(NativePlatform::default()),
+            video_thumb_cache: postbox_media::VideoThumbnailCache::new(data_dir_hub_media(
+                &data_dir_hint,
+            )),
+            store_loc: None,
         }
+    }
+
+    /// Extracts and caches one video thumbnail after a download completed, on the blocking pool
+    /// so the sync loop never stalls and the UI thread never decodes a video.
+    fn schedule_video_thumbnail(&self, path: &std::path::Path, mime_type: &str, sha256: &str) {
+        if !postbox_media::is_video_mime(mime_type) || sha256.is_empty() {
+            return;
+        }
+        let Some(store_loc) = self.store_loc.clone() else {
+            return;
+        };
+        let backend = Arc::clone(&self.video_backend);
+        let cache = self.video_thumb_cache.clone();
+        let path = path.to_path_buf();
+        let sha = sha256.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let Ok(store) = store_loc.open() else {
+                return;
+            };
+            let _ = cache.ensure(&store, backend.as_ref(), &sha, &path);
+        });
     }
 
     fn now_media_ms(&self) -> u64 {
@@ -1237,6 +1275,8 @@ impl SyncEngine {
                         mime_type,
                         sha256,
                     }) => {
+                        // Milestone 6: cache the thumbnail now, keyed by the video's SHA-256.
+                        self.schedule_video_thumbnail(&path, &mime_type, &sha256);
                         self.drain_tracker.note_success(&key);
                         self.retry_targets.remove(&key);
                         self.emit(SyncEvent::MediaDownloaded {

@@ -9,9 +9,10 @@ mod sync;
 use audio_service::spawn_offline_audio_worker;
 use postbox_hub::Endpoint;
 use postbox_keymap::Keymap;
+use postbox_media::VideoThumbnailCache;
 use postbox_platform::{
     ApiKeyOutcome, AudioBackend, GiphyKeyOutcome, HubDiscoveryOutcome, NativePlatform, OsRegistry,
-    REG_DICTATION_LANGUAGE, discover_deepgram_api_key_from_system,
+    REG_DICTATION_LANGUAGE, VideoBackend, discover_deepgram_api_key_from_system,
     discover_format_provider_from_system, discover_giphy_api_key_from_system,
     discover_hub_credentials_from_system, load_microphone_choice,
 };
@@ -167,6 +168,10 @@ fn build_launch_context(
     }
 
     let audio_backend: Arc<dyn AudioBackend> = Arc::new(NativePlatform::default());
+    // Milestone 6: Windows Media Foundation + Intel Arc DXVA (mock on non-Windows tests). Media
+    // Foundation only starts on the first video request, so idle RAM is unchanged.
+    let video_backend: Arc<dyn VideoBackend> = Arc::new(NativePlatform::default());
+    let video_thumb_cache = VideoThumbnailCache::new(data_dir.join("hub-media"));
 
     let (hub_status, sync_bridge) = match discovery {
         HubDiscoveryOutcome::Configured(discovered) => {
@@ -310,6 +315,9 @@ fn build_launch_context(
         // M5.5 RAM diet: the same OS platform object owns working-set trim and
         // `GetProcessMemoryInfo` telemetry for the shell's idle/minimize hook.
         memory_platform: Some(Arc::new(NativePlatform::default())),
+        video_backend: Some(video_backend),
+        audio_backend: Some(Arc::new(NativePlatform::default())),
+        video_thumb_cache: Some(video_thumb_cache),
     }
 }
 

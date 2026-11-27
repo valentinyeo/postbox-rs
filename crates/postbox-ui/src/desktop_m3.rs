@@ -38,6 +38,8 @@ pub(crate) const WORKSPACE_ICON_KEY_PREFIX: &str = "wsicon:";
 pub(crate) const SLACK_EMOJI_KEY_PREFIX: &str = "slackemoji:";
 pub(crate) const UNFURL_KEY_PREFIX: &str = "unfurl:";
 pub(crate) const STAGED_KEY_PREFIX: &str = "staged:";
+pub(crate) const VIDEO_THUMB_KEY_PREFIX: &str = "videothumb:";
+pub(crate) const VIDEO_PLAYER_KEY_PREFIX: &str = "videoplayer:";
 
 pub(crate) fn inline_media_tex_key(chat_id: &str, msg_id: &str, path: &Path) -> String {
     format!(
@@ -91,6 +93,8 @@ pub(crate) fn is_persistent_texture_key(key: &str) -> bool {
 /// Keys whose lifetime is bound to one chat's timeline and must go when that chat is left.
 pub(crate) fn is_transient_chat_texture_key(key: &str, chat_id: &str) -> bool {
     key.starts_with(&format!("{INLINE_MEDIA_KEY_PREFIX}{chat_id}:"))
+        || key.starts_with(&format!("{VIDEO_THUMB_KEY_PREFIX}{chat_id}:"))
+        || key.starts_with(VIDEO_PLAYER_KEY_PREFIX)
         || key.starts_with(UNFURL_KEY_PREFIX)
 }
 
@@ -278,6 +282,25 @@ impl GpuTextureLru {
             }
         }
         Some(entry)
+    }
+
+    /// Drops one texture by key (the video player keeps exactly one frame resident).
+    pub fn remove_key(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<PostboxShell>,
+    ) -> bool {
+        self.pending_queue.retain(|job| job.key != key);
+        self.queued_or_in_flight.remove(key);
+        let mut dropped = false;
+        for entry in self.lru.remove_where(|k| k == key) {
+            dropped = true;
+            for frame in entry.frames {
+                cx.drop_image(frame, Some(window));
+            }
+        }
+        dropped
     }
 
     pub fn clear_all(&mut self, window: &mut Window, cx: &mut Context<PostboxShell>) {
@@ -486,6 +509,9 @@ impl PostboxShell {
     ) {
         // 0. Only the active chat's media stays resident: drop the chat we just left first.
         self.evict_previous_chat_media(window, cx);
+        // 0b. Milestone 6: cached video thumbnails join the same bounded decode queue.
+        self.queue_video_thumb_textures();
+        self.pump_video_thumbnails(window, cx);
 
         // 1. Inline message images/GIFs/stickers
         let msgs: Vec<(String, String, PathBuf)> = self
@@ -757,6 +783,12 @@ impl PostboxShell {
         let kind = msg.media_kind?;
         if kind.is_voice_or_audio() {
             return Some(self.render_voice_note_pill(msg, p, ix, id_prefix, shell));
+        }
+        // Milestone 6: videos render their cached thumbnail + play badge + duration chip.
+        if self.vm.is_video_message_id(&msg.msg_id)
+            && let Some(el) = self.render_video_bubble(msg, p, ix, id_prefix, shell)
+        {
+            return Some(el);
         }
         let label = self.vm.attachment_display_label(msg);
         let msg_id = msg.msg_id.clone();

@@ -1,4 +1,5 @@
 use postbox_core::{ChatKey, Provider, Reaction};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -25,7 +26,9 @@ pub struct EmojiEntry {
     pub name: &'static str,
     pub aliases: &'static str,
     pub subgroup: &'static str,
-    pub normalized_code: String,
+    /// Shortcode form of `name`. Borrowed from the embedded data for the common case where
+    /// no byte needs rewriting, so building the catalog allocates nothing per entry.
+    pub normalized_code: Cow<'static, str>,
 }
 
 #[derive(Debug)]
@@ -38,8 +41,16 @@ pub struct EmojiCatalog {
 static CATALOG: OnceLock<EmojiCatalog> = OnceLock::new();
 
 impl EmojiCatalog {
+    /// Builds the catalog on first use only. Nothing in startup, the first render, or the
+    /// message-list path touches this table unless the user actually opens the emoji picker,
+    /// types a `:shortcode`, reacts to a message, or loads saved recents.
     pub fn global() -> &'static Self {
         CATALOG.get_or_init(Self::build)
+    }
+
+    /// True once something has asked for the catalog (test/telemetry only).
+    pub fn is_loaded() -> bool {
+        CATALOG.get().is_some()
     }
 
     fn build() -> Self {
@@ -53,7 +64,7 @@ impl EmojiCatalog {
                 continue;
             };
             let idx = entries.len();
-            let normalized_code = normalize_shortcode(name);
+            let normalized_code = normalize_shortcode_cow(name);
             by_emoji.insert(emoji, idx);
             entries.push(EmojiEntry {
                 index: idx,
@@ -316,6 +327,23 @@ fn word_match(text: &str, query_lower: &str) -> u8 {
 
 /// Exact port of `shortcodes.normalize` (`shortcodes.zig:59-72`).
 pub fn normalize_shortcode(cldr_name: &str) -> String {
+    normalize_shortcode_cow_str(cldr_name).into_owned()
+}
+
+/// `normalize_shortcode` without allocating when the CLDR name needs no rewriting.
+pub fn normalize_shortcode_cow(cldr_name: &'static str) -> Cow<'static, str> {
+    normalize_shortcode_cow_str(cldr_name)
+}
+
+fn normalize_shortcode_cow_str(cldr_name: &str) -> Cow<'_, str> {
+    // Fast path: already lowercase ASCII with no space or hyphen, so the mapping is identity.
+    let needs_rewrite = cldr_name.len() > SHORTCODE_MAX_NAME
+        || cldr_name
+            .bytes()
+            .any(|b| !matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'+'));
+    if !needs_rewrite {
+        return Cow::Borrowed(cldr_name);
+    }
     let mut out = String::with_capacity(cldr_name.len().min(SHORTCODE_MAX_NAME));
     for b in cldr_name.bytes() {
         if out.len() >= SHORTCODE_MAX_NAME {
@@ -329,7 +357,7 @@ pub fn normalize_shortcode(cldr_name: &str) -> String {
             out.push(mapped as char);
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -780,6 +808,50 @@ impl PendingReactionQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emoji_catalog_builds_once_and_borrows_cldr_names_that_need_no_rewrite() {
+        // M5.5 RAM diet: the catalog lives behind a `OnceLock` with no static initializer, so
+        // nothing builds it at startup; `global()` is the only entry point and it builds once.
+        let first = EmojiCatalog::global();
+        let second = EmojiCatalog::global();
+        assert!(std::ptr::eq(first, second));
+        assert!(EmojiCatalog::is_loaded());
+        assert_eq!(first.len(), 1923);
+
+        // Normalization borrows when no byte needs rewriting and allocates only when it does.
+        assert!(matches!(
+            normalize_shortcode_cow("grinning_face"),
+            Cow::Borrowed("grinning_face")
+        ));
+        assert!(matches!(
+            normalize_shortcode_cow("Grinning Face"),
+            Cow::Owned(_)
+        ));
+        assert_eq!(normalize_shortcode("Face-Smiling"), "face_smiling");
+        assert_eq!(normalize_shortcode("+1"), "+1");
+
+        // Roughly a quarter of CLDR names are already a valid shortcode, so building the catalog
+        // skips those allocations entirely.
+        let borrowed = first
+            .entries
+            .iter()
+            .filter(|e| matches!(e.normalized_code, Cow::Borrowed(_)))
+            .count();
+        assert!(
+            borrowed > 400,
+            "expected many CLDR names to borrow, got {borrowed} of {}",
+            first.len()
+        );
+    }
+
+    #[test]
+    fn slack_standard_emoji_table_is_lazy_until_first_lookup() {
+        // The `slack_emoji.tsv` table (4,205 rows) exists only to resolve a `:code:` token, so
+        // it must not be materialized on startup for a session that never renders Slack emoji.
+        assert_eq!(crate::avatar::lookup_standard_slack_emoji("+1"), Some("👍"));
+        assert_eq!(crate::avatar::standard_slack_emoji_count(), 4205);
+    }
 
     #[test]
     fn emoji_catalog_has_1923_entries_zero_skin_tones_and_638_gemoji_aliases() {

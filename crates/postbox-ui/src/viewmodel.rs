@@ -28,7 +28,6 @@ use postbox_keymap::{
     ctrl_a_selects_chats,
 };
 use postbox_media::drain::MediaItemStatus;
-use postbox_media::emoji::EmojiCatalog;
 use postbox_store::{MessageCursor, Store, StoreError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -54,6 +53,9 @@ pub struct PostboxLaunchContext {
     pub giphy_key_available: bool,
     pub deepgram_key_available: bool,
     pub llm_format_key_available: bool,
+    /// M5.5 RAM diet: working-set trim + `GetProcessMemoryInfo` telemetry. `None` in tests that
+    /// do not exercise the OS hook; the shell falls back to a no-op trim.
+    pub memory_platform: Option<std::sync::Arc<dyn postbox_platform::MemoryPressure>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,8 +246,10 @@ impl PostboxViewModel {
         }
         let mut m3 = M3State::default();
         if let Ok(saved_recents) = store.load_emoji_recents() {
-            let joined = saved_recents.join(",");
-            m3.emoji_recents = EmojiCatalog::global().parse_recents(&joined);
+            // M5.5 RAM diet: keep the saved emoji strings and only resolve them to catalog
+            // indices the first time the user reacts or opens the picker. Startup never builds
+            // the 1,923-entry emoji table for a session that never uses emoji.
+            m3.pending_emoji_recents = saved_recents;
         }
         let saved_speed = store
             .load_playback_speed()
@@ -751,6 +755,11 @@ impl PostboxViewModel {
 
     pub fn store_mut(&mut self) -> &mut Store {
         &mut self.store
+    }
+
+    /// M5.5 RAM diet: releases the SQLite page cache after bulk syncs and on idle/minimize.
+    pub fn shrink_store_memory(&self) -> Result<(), postbox_store::StoreError> {
+        self.store.shrink_memory()
     }
 
     pub fn keymap(&self) -> &Keymap {
@@ -1295,6 +1304,10 @@ impl PostboxViewModel {
         };
 
         let prev_msg_id = self.selected_message().map(|m| m.msg_id.clone());
+        // M5.5 RAM diet: only the active chat's timeline lives in RAM. Clear the previous
+        // chat's vec before loading, so a chat switch never holds two message lists at once.
+        self.messages.clear();
+        self.messages.shrink_to_fit();
         self.messages = self
             .store
             .list_messages(&chat.key, self.loaded_message_limit, None)
@@ -3655,5 +3668,104 @@ mod tests {
         assert_eq!(vm.handle_alt_g(2000, false), LatestChordOutcome::ArmedHint);
         vm.reset_latest_chord();
         assert_eq!(vm.handle_alt_g(2200, false), LatestChordOutcome::ArmedHint);
+    }
+}
+
+#[cfg(test)]
+mod ram_diet_tests {
+    use super::*;
+    use postbox_core::{Account, Chat, Message, Provider};
+
+    fn seed(store: &mut Store) {
+        store
+            .upsert_account(&Account {
+                provider: Provider::Whatsapp,
+                account_id: "main".into(),
+                label: "WhatsApp".into(),
+                state: "connected".into(),
+                sort_order: 1,
+                last_event_at: None,
+            })
+            .unwrap();
+        for (id, title, ts) in [
+            ("a@s.whatsapp.net", "Alice", "2025-01-15T12:00:00Z"),
+            ("b@s.whatsapp.net", "Bob", "2025-01-15T11:00:00Z"),
+        ] {
+            let key = ChatKey::new(Provider::Whatsapp, "main", id);
+            store
+                .upsert_chat(
+                    &Chat {
+                        key: key.clone(),
+                        title: title.into(),
+                        is_group: false,
+                        archived_local: false,
+                        archived_remote: false,
+                        pinned: false,
+                        unread_count: 0,
+                        last_msg_ts: ts.into(),
+                        last_msg_preview: "hi".into(),
+                        avatar_hash: None,
+                    },
+                    100,
+                )
+                .unwrap();
+            for n in 0..50 {
+                store
+                    .upsert_message(&Message {
+                        chat: key.clone(),
+                        msg_id: format!("{id}-{n}"),
+                        sender_id: "u1".into(),
+                        sender_name: title.into(),
+                        from_me: false,
+                        ts: format!("2025-01-15T12:{n:02}:00Z"),
+                        body: format!("{title} message {n}"),
+                        reply_to_id: None,
+                        reply_broadcast: false,
+                        media_kind: None,
+                        mime_type: None,
+                        filename: None,
+                        file_size: None,
+                        reactions: vec![],
+                        read_status: postbox_core::ReadStatus::Read,
+                        deleted: false,
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn chat_switch_reloads_only_the_active_timeline_from_sqlite_within_5ms() {
+        let mut store = Store::open_in_memory().unwrap();
+        seed(&mut store);
+        let mut vm =
+            PostboxViewModel::new(store, postbox_keymap::Keymap::postbox_defaults(), "0.1.0");
+        vm.initialize();
+
+        assert!(vm.select_chat_index(0));
+        let first_chat = vm.selected_chat().unwrap().key.clone();
+        let first_msgs = vm.messages().len();
+        assert_eq!(first_msgs, 50);
+        assert!(vm.messages().iter().all(|m| m.chat == first_chat));
+
+        // Switching chat replaces the vec: no multi-chat message map, no accumulation.
+        let started = std::time::Instant::now();
+        assert!(vm.select_chat_index(1));
+        let switch_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let second_chat = vm.selected_chat().unwrap().key.clone();
+        assert_ne!(second_chat, first_chat);
+        assert_eq!(vm.messages().len(), 50);
+        assert!(
+            vm.messages().iter().all(|m| m.chat == second_chat),
+            "only the active chat's messages may stay in RAM"
+        );
+        assert!(
+            switch_ms < 5.0,
+            "chat switch + SQLite reload took {switch_ms:.3} ms, budget is 5 ms"
+        );
+
+        // Standing memory diet: the same `shrink_memory` the idle hook calls must work here too.
+        assert!(vm.shrink_store_memory().is_ok());
     }
 }

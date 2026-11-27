@@ -1321,6 +1321,7 @@ impl SyncEngine {
                             .map(|m| m.to_core_message(&chat, is_group))
                             .collect();
                         let _ = self.store.upsert_messages_batch(&core_msgs);
+                        let _ = self.store.shrink_memory();
                         if core_msgs.is_empty() {
                             self.background_swept_chats.insert(chat, last_msg_ts);
                         } else {
@@ -1680,6 +1681,8 @@ impl SyncEngine {
 
         self.last_sync_mono = Instant::now();
         self.last_sync_wall = now_epoch_secs();
+        // M5.5 RAM diet: bulk chat sync touched thousands of pages; hand them back.
+        let _ = self.store.shrink_memory();
         self.emit(SyncEvent::ChatsUpdated { reset });
         Ok(())
     }
@@ -1704,6 +1707,8 @@ impl SyncEngine {
             .collect();
         let added = core_msgs.len();
         let _ = self.store.upsert_messages_batch(&core_msgs);
+        // M5.5 RAM diet: release the page cache after every message batch ingest.
+        let _ = self.store.shrink_memory();
         let prepended = if before.is_some() { added } else { 0 };
         let exhausted = before.is_some() && added == 0;
         self.emit(SyncEvent::MessagesUpdated {

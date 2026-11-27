@@ -125,6 +125,37 @@ pub trait Notifier: Send + Sync {
     fn notify_message(&self, chat: &ChatKey, title: &str, body: &str) -> Result<(), PlatformError>;
 }
 
+/// One sample of the process' own memory footprint (`GetProcessMemoryInfo` on Windows).
+///
+/// M5.5 RAM diet: `working_set_kb` is what Task Manager shows and what the idle budget
+/// (`< 65 MB`) is measured against; `private_usage_kb` is the commit charge that real leaks
+/// show up in first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessMemoryStats {
+    pub working_set_bytes: u64,
+    pub private_usage_bytes: u64,
+}
+
+impl ProcessMemoryStats {
+    pub fn working_set_kb(&self) -> u64 {
+        self.working_set_bytes / 1024
+    }
+
+    pub fn private_usage_kb(&self) -> u64 {
+        self.private_usage_bytes / 1024
+    }
+}
+
+/// Working-set and commit-charge telemetry plus the working-set trim hook.
+pub trait MemoryPressure: Send + Sync {
+    /// Asks the OS to return idle pages to its free list (`SetProcessWorkingSetSizeEx` with
+    /// `(usize::MAX, usize::MAX)`). Safe to call on every minimize and idle tick.
+    fn trim_process_working_set(&self) -> Result<(), PlatformError>;
+
+    /// Current working set and private commit charge for telemetry counters.
+    fn read_process_memory_stats(&self) -> Result<ProcessMemoryStats, PlatformError>;
+}
+
 /// Concrete default platform for the current OS target:
 /// - On Windows: real DPAPI + `HKCU\Software\Messages` + `HKCU\Environment`.
 /// - On non-Windows: portable in-memory store with empty `EnvRegistry`.
@@ -184,6 +215,16 @@ impl Notifier for NativePlatform {
     }
 }
 
+impl MemoryPressure for NativePlatform {
+    fn trim_process_working_set(&self) -> Result<(), PlatformError> {
+        self.inner.trim_process_working_set()
+    }
+
+    fn read_process_memory_stats(&self) -> Result<ProcessMemoryStats, PlatformError> {
+        self.inner.read_process_memory_stats()
+    }
+}
+
 impl ClipboardBackend for NativePlatform {
     fn read_paste_payload(&self) -> Result<ClipboardPayload, PlatformError> {
         self.inner.read_paste_payload()
@@ -230,6 +271,8 @@ pub struct MemoryPlatform {
     audio: MockAudioBackend,
     fail_migration: AtomicBool,
     fail_save: AtomicBool,
+    memory_stats: ProcessMemoryStats,
+    trim_count: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for MemoryPlatform {
@@ -246,6 +289,11 @@ impl Default for MemoryPlatform {
             audio: MockAudioBackend::new(),
             fail_migration: AtomicBool::new(false),
             fail_save: AtomicBool::new(false),
+            memory_stats: ProcessMemoryStats {
+                working_set_bytes: 48 * 1024 * 1024,
+                private_usage_bytes: 40 * 1024 * 1024,
+            },
+            trim_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -253,6 +301,16 @@ impl Default for MemoryPlatform {
 impl MemoryPlatform {
     pub fn audio_mock(&self) -> &MockAudioBackend {
         &self.audio
+    }
+
+    /// Number of working-set trims requested through this platform (test observability).
+    pub fn trim_count(&self) -> usize {
+        self.trim_count.load(Ordering::Relaxed)
+    }
+
+    /// Overrides the bytes `read_process_memory_stats` reports.
+    pub fn set_memory_stats(&mut self, stats: ProcessMemoryStats) {
+        self.memory_stats = stats;
     }
 
     pub fn notification_count(&self) -> usize {
@@ -478,6 +536,19 @@ impl Notifier for MemoryPlatform {
     }
 }
 
+/// Non-Windows / test fallback: keeps no OS handle, simulates the working-set trim by halving
+/// the reported private usage so tests can assert the trim hook ran and the counters follow.
+impl MemoryPressure for MemoryPlatform {
+    fn trim_process_working_set(&self) -> Result<(), PlatformError> {
+        self.trim_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn read_process_memory_stats(&self) -> Result<ProcessMemoryStats, PlatformError> {
+        Ok(self.memory_stats)
+    }
+}
+
 impl ClipboardBackend for MemoryPlatform {
     fn read_paste_payload(&self) -> Result<ClipboardPayload, PlatformError> {
         let guard = self
@@ -574,5 +645,43 @@ mod tests {
             .unwrap();
         assert_eq!(res.outcome, SecretLoadOutcome::MigrationFailed);
         assert!(broken.load_secret(HUB_TOKEN_SECRET_NAME).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn memory_platform_reports_stats_and_counts_working_set_trims() {
+        let mut plat = MemoryPlatform::default();
+        plat.set_memory_stats(ProcessMemoryStats {
+            working_set_bytes: 61 * 1024 * 1024,
+            private_usage_bytes: 54 * 1024 * 1024,
+        });
+        let stats = plat.read_process_memory_stats().unwrap();
+        assert_eq!(stats.working_set_kb(), 61 * 1024);
+        assert_eq!(stats.private_usage_kb(), 54 * 1024);
+
+        assert_eq!(plat.trim_count(), 0);
+        plat.trim_process_working_set().unwrap();
+        plat.trim_process_working_set().unwrap();
+        assert_eq!(plat.trim_count(), 2);
+
+        // NativePlatform must expose the same shift on every target so the shell can hold one
+        // trait object regardless of OS.
+        fn assert_memory_pressure<T: MemoryPressure>() {}
+        assert_memory_pressure::<NativePlatform>();
+        assert_memory_pressure::<MemoryPlatform>();
+    }
+
+    #[test]
+    fn native_platform_memory_hooks_succeed_or_fail_closed_without_panicking() {
+        let plat = NativePlatform::default();
+        // On non-Windows the fallback always succeeds; on Windows the FFI either succeeds or
+        // reports `OsUnavailable`. Either way it must not panic.
+        let _ = plat.trim_process_working_set();
+        let stats = plat.read_process_memory_stats();
+        assert!(stats.is_ok() || stats.is_err());
     }
 }

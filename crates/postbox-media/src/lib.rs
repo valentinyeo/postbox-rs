@@ -25,14 +25,19 @@ pub const PREVIEW_MAX_W: u32 = 420;
 pub const PREVIEW_MAX_H: u32 = 250;
 /// Maximum pixel count allowed before image allocation (`24 MiB / 4 = 6_291_456`).
 pub const MAX_DECODE_PIXELS: u64 = 6_291_456;
-/// Decoded CPU bitmap LRU budget (24 MiB default, strictly <= 48 MiB RAM cap).
-pub const RAM_BITMAP_BUDGET_BYTES: usize = 24 * 1024 * 1024;
+/// Decoded CPU bitmap LRU budget (12 MiB, well under the 48 MiB hard RAM cap).
+pub const RAM_BITMAP_BUDGET_BYTES: usize = 12 * 1024 * 1024;
 /// Maximum RAM cap for decoded bitmaps across large image workloads.
 pub const MAX_RAM_BITMAP_CAP_BYTES: usize = 48 * 1024 * 1024;
-/// Intel Arc GPU texture atlas LRU cap (64 MiB VRAM).
-pub const VRAM_TEXTURE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+/// Intel Arc GPU texture atlas LRU cap (16 MiB VRAM, was 64 MiB before the M5.5 RAM diet).
+pub const VRAM_TEXTURE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum off-UI-thread decode jobs in flight at once (M5.5 concurrency cap).
+pub const MAX_DECODE_WORKERS: usize = 2;
 /// Fixed animated GIF tick interval (`main.zig:20377`).
 pub const GIF_FRAME_INTERVAL_MS: u64 = 120;
+/// M5.5 RAM diet: at most two idle keep-alive sockets per host on every HTTP client, so long
+/// sync sessions cannot hold a pool of pooled TLS buffers.
+pub const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 2;
 
 #[derive(Debug, Error)]
 pub enum MediaError {

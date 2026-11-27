@@ -2,6 +2,7 @@
 //! single `audio/ogg` `NoSpeech` `language=multi` fallback, single `401`/`403` key-refresh retry,
 //! immutable dual `.txt` / atomic `.raw.txt` sidecars, and raw marked transcript export.
 
+use crate::MAX_IDLE_CONNECTIONS_PER_HOST;
 use crate::format::looks_formatted;
 use postbox_core::dictation::DictationLanguage;
 use postbox_core::voice::TranscriptError;
@@ -51,6 +52,7 @@ impl DeepgramRestClient {
         let client = Client::builder()
             .timeout(DEEPGRAM_HTTP_TIMEOUT)
             .connect_timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
             .build()
             .unwrap_or_else(|_| Client::new());
         Self {

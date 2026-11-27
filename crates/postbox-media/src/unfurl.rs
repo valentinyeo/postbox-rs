@@ -1,3 +1,4 @@
+use crate::MAX_IDLE_CONNECTIONS_PER_HOST;
 use crate::MediaError;
 use crate::drain::{atomic_write_file, hex_encode};
 use futures_util::StreamExt;
@@ -1003,6 +1004,7 @@ impl UnfurlService {
             .user_agent(UNFURL_USER_AGENT)
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(15))
+            .pool_max_idle_per_host(MAX_IDLE_CONNECTIONS_PER_HOST)
             .timeout(Duration::from_secs(60))
             .dns_resolver(Arc::new(PublicOnlyDnsResolver {
                 allow_loopback_for_test,
@@ -1322,7 +1324,8 @@ mod tests {
             "http://0x7f000001/",
             "http://0x7f.0.0.1/",
             "http://0177.0.0.1/",
-            "https://user:pass@youtube.com/watch?v=dQw4w9WgXcQ",
+            // Rejected because of the inline credential, not a real secret: test fixture.
+            "https://user:pass@youtube.com/watch?v=dQw4w9WgXcQ", // trufflehog:ignore
             "javascript:alert(1)",
             "file:///etc/passwd",
             "https://example.com/a b",

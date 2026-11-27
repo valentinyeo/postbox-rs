@@ -77,6 +77,8 @@ pub struct M3State {
     pub staged_attachments: StagedAttachments,
     pub lightbox: Option<LightboxState>,
     pub emoji_recents: Vec<usize>,
+    /// Saved emoji strings from SQLite, untranslated until the emoji catalog is first needed.
+    pub pending_emoji_recents: Vec<String>,
     pub emoji_picker: Option<EmojiPickerState>,
     pub pending_reactions: PendingReactionQueue,
     pub mention_popup: Option<MentionPopupState>,
@@ -106,6 +108,7 @@ impl Default for M3State {
             staged_attachments: StagedAttachments::new(),
             lightbox: None,
             emoji_recents: Vec::new(),
+            pending_emoji_recents: Vec::new(),
             emoji_picker: None,
             pending_reactions: PendingReactionQueue::new(),
             mention_popup: None,
@@ -736,6 +739,20 @@ impl PostboxViewModel {
         &self.m3.emoji_recents
     }
 
+    /// Resolves the saved emoji strings to catalog indices. This is the only place the emoji
+    /// catalog is built for recents, and it runs on first emoji use, never at startup
+    /// (M5.5 RAM diet).
+    fn resolve_emoji_recents_if_needed(&mut self) {
+        if self.m3.pending_emoji_recents.is_empty() && !self.m3.emoji_recents.is_empty() {
+            return;
+        }
+        if self.m3.pending_emoji_recents.is_empty() {
+            return;
+        }
+        let joined = std::mem::take(&mut self.m3.pending_emoji_recents).join(",");
+        self.m3.emoji_recents = EmojiCatalog::global().parse_recents(&joined);
+    }
+
     pub fn is_reaction_pending(&self, chat: &ChatKey, msg_id: &str) -> bool {
         self.m3.pending_reactions.is_pending(chat, msg_id)
     }
@@ -747,6 +764,7 @@ impl PostboxViewModel {
         if self.messages.is_empty() {
             return false;
         }
+        self.resolve_emoji_recents_if_needed();
         let target_msg_id = if let Some(msg) = self.selected_message() {
             msg.msg_id.clone()
         } else if let Some(incoming) = self.messages.iter().rev().find(|m| !m.from_me) {
@@ -769,6 +787,7 @@ impl PostboxViewModel {
 
     pub fn open_insert_emoji_picker(&mut self) -> bool {
         self.dismiss_all_modals();
+        self.resolve_emoji_recents_if_needed();
         let origin_chat = self.selected_chat().map(|c| c.key.clone());
         self.m3.emoji_picker = Some(EmojiPickerState::open(
             EmojiPickerMode::InsertIntoComposer { origin_chat },
@@ -840,6 +859,7 @@ impl PostboxViewModel {
     }
 
     fn record_emoji_recent(&mut self, catalog_index: usize) {
+        self.resolve_emoji_recents_if_needed();
         push_recent(&mut self.m3.emoji_recents, catalog_index);
         let formatted = EmojiCatalog::global().format_recents(&self.m3.emoji_recents);
         let _ = self.store.save_emoji_recents(&formatted);

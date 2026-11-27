@@ -2,6 +2,7 @@
 
 pub mod clipboard;
 pub mod dpapi;
+pub mod memory;
 pub mod registry;
 pub mod shell;
 pub mod wasapi;
@@ -9,7 +10,8 @@ pub mod wasapi;
 use crate::audio::{AudioBackend, AudioCaptureStream, AudioRenderStream};
 use crate::clipboard::{ClipboardBackend, ClipboardPayload, ZoneMarker, mark_downloaded_file_zone};
 use crate::{
-    EnvRegistry, Notifier, OsRegistry, PlatformError, SecretLoad, SecretLoadOutcome, SecretStore,
+    EnvRegistry, MemoryPressure, Notifier, OsRegistry, PlatformError, ProcessMemoryStats,
+    SecretLoad, SecretLoadOutcome, SecretStore,
 };
 use postbox_core::ChatKey;
 use postbox_core::voice::AudioDeviceInfo;
@@ -81,6 +83,16 @@ impl Notifier for WindowsPlatform {
     ) -> Result<(), PlatformError> {
         // WinRT Toast XML implementation lands in Milestone 7.
         Ok(())
+    }
+}
+
+impl MemoryPressure for WindowsPlatform {
+    fn trim_process_working_set(&self) -> Result<(), PlatformError> {
+        memory::trim_working_set()
+    }
+
+    fn read_process_memory_stats(&self) -> Result<ProcessMemoryStats, PlatformError> {
+        memory::process_memory_info()
     }
 }
 

@@ -569,7 +569,7 @@ impl PostboxViewModel {
     // -------------------------------------------------------------------------
 
     pub fn toggle_voice_recording(&mut self, window_active: bool) -> bool {
-        if !window_active || self.focus == FocusTarget::ThreadComposer {
+        if !window_active {
             return false;
         }
         if self.m4.recording.is_retained() {
@@ -577,6 +577,9 @@ impl PostboxViewModel {
         }
         if self.m4.recording.is_recording() {
             return self.finish_voice_recording();
+        }
+        if self.focus == FocusTarget::ThreadComposer {
+            return false;
         }
         let Some(chat) = self.selected_chat().cloned() else {
             self.status_notice = Some("Select a chat first".to_owned());

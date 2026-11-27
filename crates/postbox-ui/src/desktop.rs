@@ -543,7 +543,9 @@ impl PostboxShell {
                         cx.notify();
                     }
                     InputEvent::Blur => {
-                        this.vm.set_composer_focused(false);
+                        if !this.vm.voice_record_state().is_active() {
+                            this.vm.set_composer_focused(false);
+                        }
                         cx.notify();
                     }
                     _ => {}
@@ -749,6 +751,9 @@ impl PostboxShell {
         if self.vm.voice_record_state().is_active()
             && !self.vm.palette_open()
             && !self.vm.shortcuts_open()
+            && self.vm.lightbox().is_none()
+            && self.vm.emoji_picker().is_none()
+            && !self.vm.giphy_picker().is_open()
         {
             self.voice_record_focus.focus(window, cx);
             return;
@@ -4358,7 +4363,7 @@ mod desktop_tests {
 
         let mut ctx = seeded_launch_ctx();
         ctx.data_dir = data_dir.clone();
-        let alice_key = ChatKey::new(Provider::Whatsapp, "personal", "alice@s.whatsapp.net");
+        let alice_key = ChatKey::new(Provider::Whatsapp, "main", "alice@s.whatsapp.net");
         ctx.store
             .upsert_message(&Message {
                 chat: alice_key.clone(),
@@ -4468,26 +4473,17 @@ mod desktop_tests {
     fn m4_recording_strip_repeat_guard_enter_esc_and_thread_composer_block(
         cx: &mut TestAppContext,
     ) {
-        let (handle, shell) = open_shell(cx);
+        let data_dir = unique_desktop_test_dir("m4_rec");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut ctx = seeded_launch_ctx();
+        ctx.data_dir = data_dir.clone();
+        let alice_key = ChatKey::new(Provider::Whatsapp, "main", "alice@s.whatsapp.net");
+        let (handle, shell) = open_shell_with_ctx(cx, ctx);
 
-        // 1. Blocked when ThreadComposer is focused.
+        // 0. Blocked while window is inactive (`TestWindow::is_active` starts false).
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            shell.update(cx, |this, cx| {
-                this.vm.set_focus(FocusTarget::ThreadComposer);
-                this.sync_after_vm_change(window, cx);
-            });
-            window.press("ctrl-shift-m", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            assert!(!shell.read(cx).vm.is_voice_recording());
-            assert!(window.try_find("voice-recording-strip").is_none());
-
-            // 2. Focus Composer and press Ctrl+Shift+M -> starts recording strip.
+            assert!(!window.is_window_active());
             shell.update(cx, |this, cx| {
                 this.vm.set_focus(FocusTarget::Composer);
                 this.sync_after_vm_change(window, cx);
@@ -4499,10 +4495,166 @@ mod desktop_tests {
 
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
+            assert!(
+                !shell.read(cx).vm.is_voice_recording(),
+                "Ctrl+Shift+M must not start recording while window is inactive"
+            );
+            assert!(window.try_find("voice-recording-strip").is_none());
+            // Bring headless test window to foreground so active-window recording paths run.
+            window.activate_window();
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        // 1. Blocked when ThreadComposer is focused inside an active window.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.is_window_active());
+            shell.update(cx, |this, cx| {
+                assert!(this.vm.select_chat_index(1));
+                assert!(this.vm.open_thread("1700.1"));
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(shell.read(cx).vm.focus(), FocusTarget::ThreadComposer);
+            assert!(window.try_find("thread-panel").is_some());
+            window.press("ctrl-shift-m", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!shell.read(cx).vm.is_voice_recording());
+            assert!(window.try_find("voice-recording-strip").is_none());
+
+            // 2. Close thread panel, focus main Composer, and press Ctrl+Shift+M -> starts recording strip.
+            shell.update(cx, |this, cx| {
+                this.vm.close_thread_panel();
+                assert!(this.vm.select_chat_index(0));
+                this.vm.set_focus(FocusTarget::Composer);
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            assert!(
+                shell
+                    .read(cx)
+                    .composer
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window),
+                "Composer must have GPUI focus before Ctrl+Shift+M"
+            );
+            window.press("ctrl-shift-m", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
             assert!(shell.read(cx).vm.is_voice_recording());
+            assert_eq!(
+                shell.read(cx).vm.focus(),
+                FocusTarget::Composer,
+                "starting voice recording from Composer must not clobber vm.focus on composer blur"
+            );
+            assert!(
+                shell.read(cx).voice_record_focus.is_focused(window),
+                "voice_record_focus must hold GPUI focus while recording"
+            );
             assert!(
                 window.try_find("voice-recording-strip").is_some(),
                 "voice-recording-strip must render while recording"
+            );
+
+            // 2b. Opening an M3 modal (EmojiPicker) while recording must NOT lose focus on 100ms VoiceRecordTick.
+            let generation = shell.read(cx).vm.active_record_generation();
+            shell.update(cx, |this, cx| {
+                assert!(this.vm.open_insert_emoji_picker());
+                this.sync_after_vm_change(window, cx);
+                this.apply_sync_events(
+                    vec![SyncEvent::VoiceRecordTick {
+                        generation,
+                        elapsed_ms: 400,
+                        bars: vec![40, 80],
+                    }],
+                    window,
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            assert!(
+                shell
+                    .read(cx)
+                    .emoji_search_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window),
+                "VoiceRecordTick must not steal GPUI focus from open EmojiPicker modal"
+            );
+            assert!(!shell.read(cx).voice_record_focus.is_focused(window));
+
+            // Closing EmojiPicker via real Esc must close ONLY the picker and return GPUI focus to voice_record_focus.
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                shell.read(cx).vm.emoji_picker().is_none(),
+                "Esc must close EmojiPicker overlay"
+            );
+            assert!(
+                shell.read(cx).vm.is_voice_recording(),
+                "Esc closing EmojiPicker must NOT cancel active voice recording"
+            );
+            assert!(shell.read(cx).voice_record_focus.is_focused(window));
+            assert_eq!(shell.read(cx).vm.focus(), FocusTarget::Composer);
+
+            // 2c. Opening F1 ShortcutsOverlay while recording and pressing real Esc must close ONLY the modal.
+            window.press("f1", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                shell.read(cx).vm.shortcuts_open(),
+                "F1 must open ShortcutsOverlay while recording"
+            );
+            assert!(window.try_find("f1-shortcuts-modal").is_some());
+            assert!(shell.read(cx).vm.is_voice_recording());
+            assert!(
+                !shell.read(cx).voice_record_focus.is_focused(window),
+                "ShortcutsOverlay must hold focus instead of voice_record_focus while open"
+            );
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                !shell.read(cx).vm.shortcuts_open(),
+                "Esc must close F1 ShortcutsOverlay"
+            );
+            assert!(window.try_find("f1-shortcuts-modal").is_none());
+            assert!(
+                shell.read(cx).vm.is_voice_recording(),
+                "Esc closing F1 ShortcutsOverlay must NOT cancel active voice recording"
+            );
+            assert!(
+                shell.read(cx).voice_record_focus.is_focused(window),
+                "voice_record_focus must regain GPUI focus after closing F1 ShortcutsOverlay"
+            );
+            assert_eq!(
+                shell.read(cx).vm.focus(),
+                FocusTarget::Composer,
+                "closing F1 ShortcutsOverlay must preserve Composer focus target"
             );
 
             // 3. Held key-repeat of Ctrl+Shift+M MUST be consumed without finishing!
@@ -4534,29 +4686,90 @@ mod desktop_tests {
             window.render_frame(cx);
             assert!(!shell.read(cx).vm.is_voice_recording());
             assert!(window.try_find("voice-recording-strip").is_none());
+            assert_eq!(
+                shell.read(cx).vm.focus(),
+                FocusTarget::Composer,
+                "Esc cancelling recording must preserve FocusTarget::Composer"
+            );
+            assert!(
+                shell
+                    .read(cx)
+                    .composer
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window),
+                "Composer must regain GPUI focus after Esc cancels recording"
+            );
+            assert!(
+                !shell.read(cx).sidebar_focus.is_focused(window),
+                "sidebar_focus must NOT gain focus after Esc cancels recording"
+            );
 
-            // 5. Start again and press Enter -> triggers VoiceRecordFinish!
+            // 5. Start again from Composer and press Enter -> routes via voice_record_focus to VoiceRecordFinish!
             window.press("ctrl-shift-m", cx);
         })
         .unwrap();
         cx.run_until_parked();
 
+        let mut finish_generation = 0u64;
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
+            assert!(shell.read(cx).vm.is_voice_recording());
+            assert_eq!(shell.read(cx).vm.focus(), FocusTarget::Composer);
+            assert!(shell.read(cx).voice_record_focus.is_focused(window));
+            finish_generation = shell.read(cx).vm.active_record_generation();
             let _ = shell.update(cx, |this, _| this.vm.take_emitted_sync_commands());
             window.press("enter", cx);
         })
         .unwrap();
         cx.run_until_parked();
 
-        cx.update(|cx| {
+        cx.update_window(handle.into(), |_, window, cx| {
             let cmds = shell.update(cx, |this, _| this.vm.take_emitted_sync_commands());
             assert!(
                 cmds.iter()
                     .any(|c| matches!(c, SyncCommand::VoiceRecordFinish)),
-                "Enter while recording must emit VoiceRecordFinish"
+                "Enter while recording must emit VoiceRecordFinish via voice_record_focus"
             );
-        });
+            // 6. Completing VoiceRecordFinished returns recording to Idle and restores Composer focus!
+            shell.update(cx, |this, cx| {
+                this.apply_sync_events(
+                    vec![SyncEvent::VoiceRecordFinished {
+                        generation: finish_generation,
+                        origin_chat: alice_key.clone(),
+                        ogg_bytes: vec![b'O', b'g', b'g', b'S'],
+                        duration_secs: 2,
+                        waveform: vec![50; 32],
+                    }],
+                    window,
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            assert!(!shell.read(cx).vm.voice_record_state().is_active());
+            assert!(window.try_find("voice-recording-strip").is_none());
+            assert_eq!(
+                shell.read(cx).vm.focus(),
+                FocusTarget::Composer,
+                "VoiceRecordFinished returning to Idle must keep FocusTarget::Composer"
+            );
+            assert!(
+                shell
+                    .read(cx)
+                    .composer
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window),
+                "Composer must regain GPUI focus after VoiceRecordFinished"
+            );
+            assert!(
+                !shell.read(cx).sidebar_focus.is_focused(window),
+                "sidebar_focus must NOT gain focus after VoiceRecordFinished"
+            );
+        })
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[gpui_kit::test]
@@ -4565,7 +4778,7 @@ mod desktop_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let mut ctx = seeded_launch_ctx();
         ctx.data_dir = data_dir.clone();
-        let alice_key = ChatKey::new(Provider::Whatsapp, "personal", "alice@s.whatsapp.net");
+        let alice_key = ChatKey::new(Provider::Whatsapp, "main", "alice@s.whatsapp.net");
         for (id, ts) in [
             ("vc_1", "2026-11-27T11:01:00Z"),
             ("vc_2", "2026-11-27T11:02:00Z"),
@@ -4612,7 +4825,32 @@ mod desktop_tests {
                     formatted_text: None,
                     language: "en".into(),
                 });
-                // Mark in reverse order to verify oldest-first `\r\n\r\n` raw clipboard export!
+                // 1. Single Copy transcript writes display text (formatted when available).
+                let vc1_idx = this
+                    .vm
+                    .messages
+                    .iter()
+                    .position(|m| m.msg_id == "vc_1")
+                    .unwrap();
+                this.vm.select_message_index(vc1_idx);
+                assert!(this.vm.copy_selected_transcript());
+                this.sync_after_vm_change(window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let clip = cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default();
+            assert_eq!(clip, "1. Formatted older");
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                // 2. Mark in reverse order to verify oldest-first `\r\n\r\n` raw clipboard export!
                 this.vm.toggle_mark_message("vc_2");
                 this.vm.toggle_mark_message("vc_1");
                 assert!(this.vm.copy_all_marked_transcripts());

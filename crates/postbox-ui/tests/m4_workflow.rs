@@ -800,3 +800,101 @@ fn pending_auto_advance_cancelled_by_manual_stop_chat_switch_download_failure_an
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn escape_closes_overlay_modals_before_cancelling_recording_and_thread_composer_toggle_finishes_active_recording()
+ {
+    let dir = std::env::temp_dir().join(format!("postbox_m4_modal_esc_{}", std::process::id()));
+    let (mut vm, chat1, _) = seeded_voice_vm(&dir);
+    vm = vm.with_giphy_key_available(true);
+
+    // Seed an image message in chat1 so Lightbox can be opened over an active recording.
+    vm.store_mut()
+        .upsert_message(&Message {
+            chat: chat1.clone(),
+            msg_id: "img1".into(),
+            sender_id: "alice".into(),
+            sender_name: "Alice".into(),
+            from_me: false,
+            ts: "2026-11-27T10:04:00Z".into(),
+            body: String::new(),
+            reply_to_id: None,
+            reply_broadcast: false,
+            media_kind: Some(MediaKind::Image),
+            mime_type: Some("image/png".into()),
+            filename: Some("photo.png".into()),
+            file_size: Some(128),
+            reactions: vec![],
+            read_status: ReadStatus::None,
+            deleted: false,
+        })
+        .unwrap();
+    vm.refresh_messages();
+
+    // Start recording from Composer.
+    vm.set_focus(FocusTarget::Composer);
+    assert!(vm.toggle_voice_recording(true));
+    assert!(vm.is_voice_recording());
+
+    // 1. F1 ShortcutsOverlay -> first Esc closes ONLY shortcuts (restoring Composer) and preserves recording.
+    vm.toggle_shortcuts();
+    assert!(vm.shortcuts_open());
+    vm.handle_escape();
+    assert!(!vm.shortcuts_open());
+    assert!(vm.is_voice_recording());
+    assert_eq!(vm.focus(), FocusTarget::Composer);
+
+    // 2. Command Palette -> first Esc closes ONLY palette and preserves recording.
+    vm.open_palette();
+    assert!(vm.palette_open());
+    vm.handle_escape();
+    assert!(!vm.palette_open());
+    assert!(vm.is_voice_recording());
+
+    // 3. EmojiPicker -> first Esc closes ONLY emoji picker and preserves recording.
+    assert!(vm.open_insert_emoji_picker());
+    assert!(vm.emoji_picker().is_some());
+    vm.handle_escape();
+    assert!(vm.emoji_picker().is_none());
+    assert!(vm.is_voice_recording());
+
+    // 4. Lightbox -> first Esc closes ONLY lightbox and preserves recording.
+    assert!(vm.open_lightbox_for_message("img1", 1000));
+    assert!(vm.lightbox().is_some());
+    vm.handle_escape();
+    assert!(vm.lightbox().is_none());
+    assert!(vm.is_voice_recording());
+
+    // 5. GiphyPicker -> first Esc closes ONLY giphy picker and preserves recording.
+    assert!(vm.open_giphy_picker());
+    assert!(vm.giphy_picker().is_open());
+    vm.handle_escape();
+    assert!(!vm.giphy_picker().is_open());
+    assert!(vm.is_voice_recording());
+
+    // Once all modals are closed, next Esc cancels the active voice recording cleanly.
+    vm.handle_escape();
+    assert_eq!(*vm.voice_record_state(), VoiceRecordState::Idle);
+    assert_eq!(vm.status_notice(), Some("Voice note cancelled"));
+
+    // ThreadComposer still blocks starting a NEW recording...
+    vm.set_focus(FocusTarget::ThreadComposer);
+    assert!(!vm.toggle_voice_recording(true));
+    assert_eq!(*vm.voice_record_state(), VoiceRecordState::Idle);
+
+    // ...but if focus moves to ThreadComposer mid-recording, Ctrl+Shift+M still finishes the active recording!
+    vm.set_focus(FocusTarget::Composer);
+    assert!(vm.toggle_voice_recording(true));
+    assert!(vm.is_voice_recording());
+    let _ = vm.take_emitted_sync_commands();
+    vm.set_focus(FocusTarget::ThreadComposer);
+    assert!(vm.toggle_voice_recording(true));
+    assert!(
+        vm.take_emitted_sync_commands()
+            .iter()
+            .any(|c| matches!(c, SyncCommand::VoiceRecordFinish)),
+        "Ctrl+Shift+M must still finish an already-active recording even if ThreadComposer is focused"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

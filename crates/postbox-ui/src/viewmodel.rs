@@ -205,6 +205,7 @@ pub struct PostboxViewModel {
     pub(crate) focus: FocusTarget,
     pub(crate) palette: PaletteState,
     shortcuts_open: bool,
+    shortcuts_return_focus: FocusTarget,
     ctrl_badges: CtrlBadgeState,
     inbox_chord: InboxChord,
     latest_chord: LatestChord,
@@ -297,6 +298,7 @@ impl PostboxViewModel {
             focus: FocusTarget::ChatList,
             palette: PaletteState::default(),
             shortcuts_open: false,
+            shortcuts_return_focus: FocusTarget::ChatList,
             ctrl_badges: CtrlBadgeState::default(),
             inbox_chord: InboxChord::default(),
             latest_chord: LatestChord::default(),
@@ -2365,6 +2367,7 @@ impl PostboxViewModel {
             }
         }
         self.shortcuts_open = false;
+        self.shortcuts_return_focus = FocusTarget::ChatList;
         self.m3.lightbox = None;
         self.m3.emoji_picker = None;
         if self.m3.giphy_picker.is_open() {
@@ -2375,11 +2378,25 @@ impl PostboxViewModel {
         }
     }
 
+    fn non_modal_focus_or_chat_list(&self) -> FocusTarget {
+        match self.focus {
+            FocusTarget::ChatList | FocusTarget::MessageList | FocusTarget::Composer => self.focus,
+            FocusTarget::ThreadComposer | FocusTarget::ThreadBroadcast
+                if self.thread_panel.is_some() =>
+            {
+                self.focus
+            }
+            _ => FocusTarget::ChatList,
+        }
+    }
+
     pub fn toggle_shortcuts(&mut self) {
         if self.shortcuts_open {
             self.close_shortcuts();
         } else {
+            let return_focus = self.non_modal_focus_or_chat_list();
             self.dismiss_all_modals();
+            self.shortcuts_return_focus = return_focus;
             self.shortcuts_open = true;
             self.focus = FocusTarget::ShortcutsOverlay;
         }
@@ -2388,7 +2405,16 @@ impl PostboxViewModel {
     pub fn close_shortcuts(&mut self) {
         if self.shortcuts_open {
             self.shortcuts_open = false;
-            self.focus = FocusTarget::ChatList;
+            let target = match self.shortcuts_return_focus {
+                FocusTarget::ThreadComposer | FocusTarget::ThreadBroadcast
+                    if self.thread_panel.is_none() =>
+                {
+                    FocusTarget::ChatList
+                }
+                other => other,
+            };
+            self.shortcuts_return_focus = FocusTarget::ChatList;
+            self.focus = target;
         }
     }
 
@@ -2705,7 +2731,9 @@ impl PostboxViewModel {
                 return true;
             }
             PaletteCommand::ShowShortcuts => {
+                let return_focus = self.non_modal_focus_or_chat_list();
                 self.dismiss_all_modals();
+                self.shortcuts_return_focus = return_focus;
                 self.shortcuts_open = true;
                 self.focus = FocusTarget::ShortcutsOverlay;
                 return true;
@@ -2968,12 +2996,8 @@ impl PostboxViewModel {
         self.latest_chord.reset();
     }
 
-    /// Exact Postbox `Esc` cascade (`main.zig:21364-21513`).
+    /// Exact Postbox `Esc` cascade (`main.zig:21127-21132`, `main.zig:21364-21513`).
     pub fn handle_escape(&mut self) {
-        if self.m4.recording.is_active() {
-            self.cancel_voice_recording("Voice note cancelled");
-            return;
-        }
         if self.m3.lightbox.is_some() {
             self.close_lightbox();
             return;
@@ -2995,6 +3019,10 @@ impl PostboxViewModel {
         }
         if self.palette.open {
             self.close_palette();
+            return;
+        }
+        if self.m4.recording.is_active() {
+            self.cancel_voice_recording("Voice note cancelled");
             return;
         }
         if self.thread_panel.is_some() {

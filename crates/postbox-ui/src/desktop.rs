@@ -6123,7 +6123,7 @@ mod desktop_tests {
             "the staged build is installed in one atomic replace"
         );
         assert!(
-            install_dir.join("postbox.exe.backup.exe").exists(),
+            install_dir.join("postbox.exe.old").exists(),
             "the previous build is kept for a rollback"
         );
         assert!(

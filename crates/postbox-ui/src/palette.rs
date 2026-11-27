@@ -1140,6 +1140,7 @@ mod tests {
             bulk_selected_count: 0,
             marked_messages_count: 0,
             update_label: "Check for updates now",
+            update_hint: "v0.1.42",
             restart_label: None,
         };
         for label in [

@@ -133,6 +133,24 @@ impl M7State {
         Self::default()
     }
 
+    pub fn version_label(&self, version: &str) -> String {
+        match self.update_phase {
+            UpdatePhase::Idle => format!("Postbox v{version}"),
+            UpdatePhase::Checking => format!("Postbox v{version} (checking for updates...)"),
+            UpdatePhase::Downloading => format!("Postbox v{version} (downloading update...)"),
+            UpdatePhase::Ready => {
+                if let Some(prompt) = &self.update_prompt {
+                    format!("Postbox v{version} ({} ready to install)", prompt.tag)
+                } else {
+                    format!("Postbox v{version} (update ready)")
+                }
+            }
+            UpdatePhase::Installing => format!("Postbox v{version} (installing update...)"),
+            UpdatePhase::UpToDate => format!("Postbox v{version} (up to date)"),
+            UpdatePhase::Failed => format!("Postbox v{version} (update check failed)"),
+        }
+    }
+
     /// Parses a `postbox://` URL or a bare `focus` signal from the link pipe or the command
     /// line, and reports what the shell must do.
     pub fn accept_link(
@@ -388,6 +406,47 @@ mod tests {
             digest_hex(b"payload")
         );
         UpdateManifest::parse(&body).unwrap()
+    }
+
+    #[test]
+    fn version_label_reports_the_current_version_and_update_phase() {
+        for (phase, expected) in [
+            (UpdatePhase::Idle, "Postbox v0.1.42"),
+            (
+                UpdatePhase::Checking,
+                "Postbox v0.1.42 (checking for updates...)",
+            ),
+            (
+                UpdatePhase::Downloading,
+                "Postbox v0.1.42 (downloading update...)",
+            ),
+            (UpdatePhase::Ready, "Postbox v0.1.42 (update ready)"),
+            (
+                UpdatePhase::Installing,
+                "Postbox v0.1.42 (installing update...)",
+            ),
+            (UpdatePhase::UpToDate, "Postbox v0.1.42 (up to date)"),
+            (UpdatePhase::Failed, "Postbox v0.1.42 (update check failed)"),
+        ] {
+            let state = M7State {
+                update_phase: phase,
+                ..M7State::new()
+            };
+            assert_eq!(state.version_label("0.1.42"), expected, "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn version_label_includes_the_staged_release_tag_when_ready() {
+        let state = M7State {
+            update_phase: UpdatePhase::Ready,
+            update_prompt: Some(UpdatePrompt::new("v0.1.43", "", 0)),
+            ..M7State::new()
+        };
+        assert_eq!(
+            state.version_label("0.1.42"),
+            "Postbox v0.1.42 (v0.1.43 ready to install)"
+        );
     }
 
     #[test]

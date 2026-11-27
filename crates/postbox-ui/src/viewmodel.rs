@@ -2690,8 +2690,10 @@ impl PostboxViewModel {
             .map(|c| self.effective_replies_fold(c))
             .unwrap_or(false);
 
+        let version_label = self.m7.version_label(&self.version);
         let catalog_ctx = PaletteCatalogContext {
             version: &self.version,
+            version_label: &version_label,
             hub_status: &self.hub_status,
             theme: self.theme,
             font_scale: self.font_scale,
@@ -2890,7 +2892,7 @@ impl PostboxViewModel {
                 }
             }
             PaletteCommand::VersionInfo => {
-                self.status_notice = Some(format!("Postbox v{}", self.version));
+                self.status_notice = Some(self.m7.version_label(&self.version));
             }
             PaletteCommand::HubStatusInfo => match &self.hub_status {
                 HubConnectionStatus::Connected { .. } => {

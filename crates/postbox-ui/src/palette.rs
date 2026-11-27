@@ -326,6 +326,7 @@ pub fn chat_name_quality(label: &str, query: &str) -> i32 {
 
 pub struct PaletteCatalogContext<'a> {
     pub version: &'a str,
+    pub version_label: &'a str,
     pub hub_status: &'a HubConnectionStatus,
     pub theme: ThemeChoice,
     pub font_scale: FontScale,
@@ -402,7 +403,7 @@ pub fn build_palette_items(ctx: &PaletteCatalogContext<'_>) -> Vec<PaletteEntry>
         PaletteCommand::ShowShortcuts,
     ));
     items.push(cmd_entry(
-        format!("You are on v{} - this is the newest version", ctx.version),
+        ctx.version_label,
         None,
         PaletteCommand::VersionInfo,
     ));
@@ -1057,6 +1058,7 @@ mod tests {
         };
         let mut ctx = PaletteCatalogContext {
             version: "0.1.0",
+            version_label: "Postbox v0.1.0",
             hub_status: &hub_status,
             theme: ThemeChoice::ZincDark,
             font_scale: FontScale::default(),
@@ -1100,6 +1102,59 @@ mod tests {
     }
 
     #[test]
+    fn version_entry_uses_the_live_version_label() {
+        let hub_status = HubConnectionStatus::Connected {
+            url: "https://hub.example".into(),
+            last_event_id: Some(1),
+        };
+        let mut ctx = PaletteCatalogContext {
+            version: "0.1.42",
+            version_label: "Postbox v0.1.42",
+            hub_status: &hub_status,
+            theme: ThemeChoice::ZincDark,
+            font_scale: FontScale::default(),
+            dictation_language: DictationLanguage::Automatic,
+            playback_speed_pct: 100,
+            show_archived_inline: false,
+            show_archived_only: false,
+            slack_threads_enabled: false,
+            slack_reply_style: false,
+            accounts: &[],
+            microphones: &[],
+            selected_microphone: None,
+            selected_chat: None,
+            selected_message: None,
+            bulk_selected_count: 0,
+            marked_messages_count: 0,
+            update_label: "Check for updates now",
+            restart_label: None,
+        };
+        for label in [
+            "Postbox v0.1.42",
+            "Postbox v0.1.42 (checking for updates...)",
+            "Postbox v0.1.42 (downloading update...)",
+            "Postbox v0.1.42 (v0.1.43 ready to install)",
+            "Postbox v0.1.42 (update ready)",
+            "Postbox v0.1.42 (installing update...)",
+            "Postbox v0.1.42 (up to date)",
+            "Postbox v0.1.42 (update check failed)",
+        ] {
+            ctx.version_label = label;
+            let items = build_palette_items(&ctx);
+            let version_entry = items
+                .iter()
+                .find(|entry| {
+                    matches!(
+                        entry.kind,
+                        PaletteEntryKind::Command(PaletteCommand::VersionInfo)
+                    )
+                })
+                .expect("the version entry is listed");
+            assert_eq!(version_entry.label, label);
+        }
+    }
+
+    #[test]
     fn non_empty_query_ranks_chats_above_messages_above_commands() {
         let hub_status = HubConnectionStatus::Connected {
             url: "https://hub.example".into(),
@@ -1107,6 +1162,7 @@ mod tests {
         };
         let ctx = PaletteCatalogContext {
             version: "0.1.0",
+            version_label: "Postbox v0.1.0",
             hub_status: &hub_status,
             theme: ThemeChoice::ZincDark,
             font_scale: FontScale::default(),

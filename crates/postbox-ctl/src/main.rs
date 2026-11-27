@@ -505,13 +505,25 @@ mod tests {
         assert_eq!(decoded.status.unwrap().working_set_kb, 66_560);
     }
 
-    #[cfg(unix)]
+    /// The endpoint the round-trip test binds: a named pipe on Windows, a socket elsewhere.
+    fn test_transport(dir: &std::path::Path) -> Transport {
+        #[cfg(windows)]
+        {
+            let _ = dir;
+            Transport::pipe(&format!("postboxctl-test-{}", std::process::id()))
+        }
+        #[cfg(not(windows))]
+        {
+            Transport::socket(dir.join("control.sock"))
+        }
+    }
+
     #[test]
     fn a_round_trip_against_a_live_server_returns_a_decoded_response() {
         let dir = std::env::temp_dir().join(format!("postboxctl-rt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let transport = Transport::socket(dir.join("control.sock"));
+        let transport = test_transport(&dir);
 
         let server = postbox_platform::control_pipe::serve(&transport, |line| {
             let request = postbox_core::control::decode_request(line).unwrap();
@@ -537,7 +549,23 @@ mod tests {
         })
         .expect("server starts");
 
-        let response = send(&transport, &ControlRequest::Status, 2_000).expect("round trip works");
+        // The Windows acceptor creates its first pipe instance on a thread, so a send that
+        // arrives before then is retried rather than failing the test.
+        let mut last = String::new();
+        let mut response = None;
+        for _ in 0..100 {
+            match send(&transport, &ControlRequest::Status, 2_000) {
+                Ok(reply) => {
+                    response = Some(reply);
+                    break;
+                }
+                Err(err) => {
+                    last = err;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        let response = response.unwrap_or_else(|| panic!("round trip works: {last}"));
         let status = response.status.expect("status payload");
         assert_eq!(status.version, "0.1.0");
         assert_eq!(status.working_set_kb, 40 * 1024);

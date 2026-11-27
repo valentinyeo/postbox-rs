@@ -259,10 +259,10 @@ impl PostboxShell {
         os: OsRuntime,
         notifier: Option<Arc<dyn postbox_platform::Notifier>>,
     ) -> Self {
-        if let Some(records) = &os.exit_records {
-            if let Ok(last) = records.last() {
-                self.vm.set_last_exit_record(last);
-            }
+        if let Some(records) = &os.exit_records
+            && let Ok(last) = records.last()
+        {
+            self.vm.set_last_exit_record(last);
         }
         self.os_runtime = Some(os);
         self.notifier = notifier;
@@ -428,7 +428,7 @@ impl PostboxShell {
             && let Some(records) = &os.exit_records
         {
             let uptime_ms = self.started_at.elapsed().as_millis() as u64;
-            let _ = records.record_clean(&self.vm.version().to_owned(), uptime_ms);
+            let _ = records.record_clean(self.vm.version(), uptime_ms);
         }
     }
 

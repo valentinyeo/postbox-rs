@@ -49,6 +49,52 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// The control endpoint a test server binds: a named pipe on Windows, a socket elsewhere.
+///
+/// Windows has no Unix-domain sockets, so `Transport::socket` can only ever fail there. The
+/// pipe name carries the process id and a per-call sequence number so two tests in the same
+/// binary never race for one endpoint.
+fn test_control_transport(dir: &Path, label: &str) -> Transport {
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let _ = dir;
+        Transport::pipe(&format!(
+            "postbox-test-{label}-{}-{seq}",
+            std::process::id()
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        Transport::socket(dir.join(format!("control-{label}.sock")))
+    }
+}
+
+/// One request line, answered after the server is actually listening.
+///
+/// `serve` binds synchronously on Unix but hands the Windows pipe to an acceptor thread, so a
+/// request sent immediately after `serve` can arrive before the first pipe instance exists.
+fn round_trip_when_ready(transport: &Transport, request_line: &str, label: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match round_trip(transport, request_line, Duration::from_secs(2)) {
+            Ok(Some(reply)) => return reply,
+            Ok(None) => {}
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    panic!("{label}: no answer at {}: {err}", transport.display());
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("{label}: no answer at {}", transport.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn wa_chat() -> ChatKey {
     ChatKey::new(Provider::Whatsapp, "biz", "491234@s.whatsapp.net")
 }
@@ -363,16 +409,14 @@ mod control_round_trip {
     #[test]
     fn status_carries_live_ram_fps_and_the_active_view_over_a_real_pipe() {
         let dir = temp_dir("ctl-status");
-        let transport = Transport::socket(dir.join("control.sock"));
+        let transport = test_control_transport(&dir, "status");
         let server = serve(&transport, handle).expect("server starts");
 
-        let reply = round_trip(
+        let reply = round_trip_when_ready(
             &transport,
             &encode_request(&ControlRequest::Status),
-            Duration::from_secs(2),
-        )
-        .expect("no transport error")
-        .expect("server answered");
+            "status",
+        );
         let response = decode_response(&reply).expect("valid JSON line");
         let status = response.status.expect("status payload");
 
@@ -393,7 +437,7 @@ mod control_round_trip {
     #[test]
     fn every_control_subcommand_round_trips_on_one_line() {
         let dir = temp_dir("ctl-all");
-        let transport = Transport::socket(dir.join("control.sock"));
+        let transport = test_control_transport(&dir, "all");
         let server = serve(&transport, handle).expect("server starts");
 
         let requests = vec![
@@ -433,9 +477,7 @@ mod control_round_trip {
 
         for request in requests {
             let line = encode_request(&request);
-            let reply = round_trip(&transport, &line, Duration::from_secs(2))
-                .unwrap_or_else(|err| panic!("{}: {err}", request.command_name()))
-                .unwrap_or_else(|| panic!("{}: no answer", request.command_name()));
+            let reply = round_trip_when_ready(&transport, &line, request.command_name());
             let response = decode_response(&reply)
                 .unwrap_or_else(|err| panic!("{}: {err}", request.command_name()));
             assert!(response.ok, "{}: {response:?}", request.command_name());
@@ -453,11 +495,9 @@ mod control_round_trip {
     #[test]
     fn an_unknown_chat_is_an_error_payload_not_a_broken_pipe() {
         let dir = temp_dir("ctl-error");
-        let transport = Transport::socket(dir.join("control.sock"));
+        let transport = test_control_transport(&dir, "error");
         let server = serve(&transport, handle).expect("server starts");
-        let reply = round_trip(&transport, "not json", Duration::from_secs(2))
-            .expect("transport ok")
-            .expect("server answered");
+        let reply = round_trip_when_ready(&transport, "not json", "error");
         let response = decode_response(&reply).unwrap();
         assert!(!response.ok);
         assert!(response.error.unwrap().contains("invalid request"));

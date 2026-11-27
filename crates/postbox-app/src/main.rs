@@ -431,7 +431,6 @@ fn main() {
             // Another Postbox already owns the single-instance lock and has the URL.
             StartupRole::Forwarded { .. } => {
                 println!("Postbox is already running; handed the request over.");
-                return;
             }
             StartupRole::Primary { link } => {
                 let mut launch_ctx = build_launch_context(&cfg, started_at, true);

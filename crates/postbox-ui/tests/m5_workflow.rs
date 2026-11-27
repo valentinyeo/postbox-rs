@@ -140,7 +140,8 @@ async fn websocket_fragments_replace_cursor_span_and_close_stream_commits_once_i
                 rx.changed().await.unwrap();
             }
             assert_eq!(vm.composer_text(), "links Grüße rechts");
-            assert_eq!(vm.composer_selection(), 13..13);
+            let interim_caret = "links Grüße ".len();
+            assert_eq!(vm.composer_selection(), interim_caret..interim_caret);
             assert!(vm.stop_dictation());
             session.request_stop();
             let final_snapshot = session.wait_for_terminal().await;
@@ -152,7 +153,8 @@ async fn websocket_fragments_replace_cursor_span_and_close_stream_commits_once_i
                 });
             }
             assert_eq!(vm.composer_text(), "links Grüße! rechts");
-            assert_eq!(vm.composer_selection(), 14..14);
+            let final_caret = "links Grüße! ".len();
+            assert_eq!(vm.composer_selection(), final_caret..final_caret);
             assert_eq!(
                 vm.store().load_draft(&first).unwrap().unwrap().text_body,
                 "links Grüße! rechts"

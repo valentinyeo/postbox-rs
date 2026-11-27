@@ -129,6 +129,13 @@ impl PostboxViewModel {
     pub fn set_composer_selection(&mut self, range: Range<usize>) {
         self.m5.composer_selection = clamp_selection_utf8(&self.composer_text, range);
         self.m5.composer_selection_set = true;
+        if let Some(state) = self.m5.active.as_mut()
+            && !state.in_thread
+            && state.auto_send_armed
+            && state.armed_selection.as_ref() != Some(&self.m5.composer_selection)
+        {
+            state.auto_send_armed = false;
+        }
     }
 
     pub fn set_thread_selection(&mut self, range: Range<usize>) {
@@ -139,6 +146,13 @@ impl PostboxViewModel {
             .unwrap_or(0..0);
         self.m5.thread_selection = clamped;
         self.m5.thread_selection_set = true;
+        if let Some(state) = self.m5.active.as_mut()
+            && state.in_thread
+            && state.auto_send_armed
+            && state.armed_selection.as_ref() != Some(&self.m5.thread_selection)
+        {
+            state.auto_send_armed = false;
+        }
     }
 
     pub fn composer_selection(&self) -> Range<usize> {
@@ -503,6 +517,11 @@ impl PostboxViewModel {
     /// Called whenever the user edits composer or thread composer text; compares against
     /// `live_snapshot` (or `pre_text`) and detaches cleanly without clobbering user text.
     pub(crate) fn on_composer_user_edit(&mut self, in_thread: bool, new_text: &str) {
+        if !self.m5.active.as_ref().is_some_and(|state| {
+            self.selected_chat().is_some_and(|chat| chat.key == state.origin_chat)
+        }) {
+            return;
+        }
         let mut emit_stop_gen = None;
         if let Some(state) = self.m5.active.as_mut()
             && state.in_thread == in_thread

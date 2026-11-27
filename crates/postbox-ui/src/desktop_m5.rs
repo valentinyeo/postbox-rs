@@ -6,6 +6,7 @@
 use crate::desktop::PostboxShell;
 use crate::m5::{DICTATION_METER_TICK_MS, DictationPhase};
 use crate::theme::ShadcnPalette;
+use crate::{FONT_MONO, scaled_px};
 use gpui_kit::{
     AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
     StatefulInteractiveElement, Styled, TestSupportExt, Window, div, px, rgb,
@@ -67,6 +68,7 @@ impl PostboxShell {
             return None;
         }
 
+        let scale = self.vm.font_scale().percent();
         let elapsed_label = match d.phase {
             DictationPhase::Draining => {
                 format!("{} · Transcribing...", format_voice_clock(d.elapsed_ms))
@@ -143,7 +145,8 @@ impl PostboxShell {
                         div()
                             .id("dictation-elapsed")
                             .test_support()
-                            .text_size(px(12.0))
+                            .font_family(FONT_MONO)
+                            .text_size(px(scaled_px(12.0, scale)))
                             .text_color(rgb(p.foreground))
                             .child(elapsed_label),
                     )
@@ -157,7 +160,7 @@ impl PostboxShell {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(scaled_px(11.0, scale)))
                             .text_color(rgb(p.muted_foreground))
                             .child("Ctrl+Enter sends · Esc cancels"),
                     )
@@ -169,7 +172,7 @@ impl PostboxShell {
                             .py_0p5()
                             .rounded_sm()
                             .bg(rgb(p.muted))
-                            .text_size(px(11.0))
+                            .text_size(px(scaled_px(11.0, scale)))
                             .text_color(rgb(p.foreground))
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, window, cx| {

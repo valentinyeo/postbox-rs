@@ -649,6 +649,9 @@ impl PostboxShell {
         shell: &Entity<Self>,
     ) -> Option<AnyElement> {
         let kind = msg.media_kind?;
+        if kind.is_voice_or_audio() {
+            return Some(self.render_voice_note_pill(msg, p, ix, id_prefix, shell));
+        }
         let label = self.vm.attachment_display_label(msg);
         let msg_id = msg.msg_id.clone();
 

@@ -17,6 +17,7 @@ desktop = ["postbox-ui/desktop"]
 
 [dependencies]
 async-channel.workspace = true
+postbox-audio.workspace = true
 postbox-core.workspace = true
 postbox-hub.workspace = true
 postbox-keymap.workspace = true

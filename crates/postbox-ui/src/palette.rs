@@ -1,5 +1,6 @@
 use crate::sync_bridge::HubConnectionStatus;
 use postbox_core::dictation::DictationLanguage;
+use postbox_core::voice::AudioDeviceInfo;
 use postbox_core::{Account, Chat, ChatKey, FontScale, Message, Provider, ThemeChoice};
 use postbox_store::SearchHit;
 use std::collections::BTreeSet;
@@ -24,6 +25,7 @@ pub enum PaletteCommand {
     RecordVoiceNote,
     SetDictationLanguage(DictationLanguage),
     SelectMicrophoneDefault,
+    SelectMicrophone(String),
     SetPlaybackSpeed(u16), // 100 = 1x, 150 = 1.5x, 200 = 2x
     FontSmaller,
     FontLarger,
@@ -332,6 +334,8 @@ pub struct PaletteCatalogContext<'a> {
     pub slack_threads_enabled: bool,
     pub slack_reply_style: bool,
     pub accounts: &'a [Account],
+    pub microphones: &'a [AudioDeviceInfo],
+    pub selected_microphone: Option<&'a str>,
     pub selected_chat: Option<&'a Chat>,
     pub selected_message: Option<&'a Message>,
     pub bulk_selected_count: usize,
@@ -427,11 +431,25 @@ pub fn build_palette_items(ctx: &PaletteCatalogContext<'_>) -> Vec<PaletteEntry>
         ));
     }
 
+    let default_mic_marker = if ctx.selected_microphone.is_none() {
+        " (in use)"
+    } else {
+        ""
+    };
     items.push(cmd_entry(
-        "Microphone: System default",
+        format!("Microphone: System default{default_mic_marker}"),
         None,
         PaletteCommand::SelectMicrophoneDefault,
     ));
+    for mic in ctx.microphones.iter().take(16) {
+        let active = ctx.selected_microphone == Some(mic.friendly_name.as_str());
+        let marker = if active { " (in use)" } else { "" };
+        items.push(cmd_entry(
+            format!("Microphone: {}{marker}", mic.friendly_name),
+            None,
+            PaletteCommand::SelectMicrophone(mic.friendly_name.clone()),
+        ));
+    }
 
     for (speed, label) in [(100u16, "1x"), (150, "1.5x"), (200, "2x")] {
         let marker = if ctx.playback_speed_pct == speed {
@@ -1031,6 +1049,8 @@ mod tests {
             slack_threads_enabled: false,
             slack_reply_style: false,
             accounts: &[],
+            microphones: &[],
+            selected_microphone: None,
             selected_chat: None,
             selected_message: None,
             bulk_selected_count: 0,

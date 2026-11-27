@@ -1285,10 +1285,65 @@ pub fn f1_shortcut_groups() -> &'static [ShortcutGroup] {
     F1_SHORTCUT_GROUPS
 }
 
+/// Outcome of evaluating a key-down event against the `Ctrl+Shift+M` voice recording shortcut
+/// (matching Zig `shortcuts.zig:116-121`, ignoring held key repeats).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceKeyOutcome {
+    Ignore,
+    StartOrFinish,
+    ConsumeRepeat,
+}
+
+pub fn voice_key(
+    key: &str,
+    control: bool,
+    shift: bool,
+    alt: bool,
+    repeated: bool,
+) -> VoiceKeyOutcome {
+    if key.eq_ignore_ascii_case("m") && control && shift && !alt {
+        if repeated {
+            VoiceKeyOutcome::ConsumeRepeat
+        } else {
+            VoiceKeyOutcome::StartOrFinish
+        }
+    } else {
+        VoiceKeyOutcome::Ignore
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn voice_key_guards_held_repeats_and_requires_exact_modifiers() {
+        assert_eq!(
+            voice_key("m", true, true, false, false),
+            VoiceKeyOutcome::StartOrFinish
+        );
+        assert_eq!(
+            voice_key("M", true, true, false, false),
+            VoiceKeyOutcome::StartOrFinish
+        );
+        assert_eq!(
+            voice_key("m", true, true, false, true),
+            VoiceKeyOutcome::ConsumeRepeat
+        );
+        assert_eq!(
+            voice_key("m", true, true, true, false),
+            VoiceKeyOutcome::Ignore
+        );
+        assert_eq!(
+            voice_key("m", true, false, false, false),
+            VoiceKeyOutcome::Ignore
+        );
+        assert_eq!(
+            voice_key("n", true, true, false, false),
+            VoiceKeyOutcome::Ignore
+        );
+    }
 
     #[test]
     fn default_keymap_resolves_postbox_core_shortcuts() {

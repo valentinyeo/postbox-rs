@@ -109,6 +109,12 @@ gpui_kit::actions!(
         FontSmaller,
         FontLarger,
         FontReset,
+        PlayPauseVoice,
+        ToggleTranscript,
+        FinishVoiceRecord,
+        CancelVoiceRecord,
+        CopyMessageText,
+        SmartCopy,
         MoveViewUp,
         MoveViewDown,
     ]
@@ -184,6 +190,12 @@ fn gpui_action_for(action: PbAction) -> Option<Box<dyn GpuiAction>> {
         PbAction::FontSmaller => Some(Box::new(FontSmaller)),
         PbAction::FontLarger => Some(Box::new(FontLarger)),
         PbAction::FontReset => Some(Box::new(FontReset)),
+        PbAction::PlayPauseVoice => Some(Box::new(PlayPauseVoice)),
+        PbAction::ToggleTranscript => Some(Box::new(ToggleTranscript)),
+        PbAction::FinishVoiceRecord => Some(Box::new(FinishVoiceRecord)),
+        PbAction::CancelVoiceRecord => Some(Box::new(CancelVoiceRecord)),
+        PbAction::CopyMessageText => Some(Box::new(CopyMessageText)),
+        PbAction::SmartCopy => Some(Box::new(SmartCopy)),
         PbAction::MoveViewUp => Some(Box::new(MoveViewUp)),
         PbAction::MoveViewDown => Some(Box::new(MoveViewDown)),
         _ => None,
@@ -238,6 +250,7 @@ pub fn bind_postbox_keys(cx: &mut App, keymap: &Keymap) {
             postbox_keymap::KeyContext::ShortcodePopup => Some("PostboxShortcodePopup > Input"),
             postbox_keymap::KeyContext::EmojiPicker => Some("PostboxEmojiPicker > Input"),
             postbox_keymap::KeyContext::GiphyPicker => Some("PostboxGiphyPicker > Input"),
+            postbox_keymap::KeyContext::VoiceRecording => Some("PostboxVoiceRecording > Input"),
             postbox_keymap::KeyContext::ThreadPanel
                 if matches!(entry.stroke.as_str(), "escape" | "tab") =>
             {
@@ -356,6 +369,7 @@ pub struct PostboxShell {
     lightbox_focus: FocusHandle,
     emoji_picker_focus: FocusHandle,
     giphy_picker_focus: FocusHandle,
+    pub(crate) voice_record_focus: FocusHandle,
     sidebar_scroll: VirtualListScrollHandle,
     sidebar_item_sizes: Rc<Vec<Size<Pixels>>>,
     pub(crate) sidebar_rows_cache: Vec<SidebarChatRow>,
@@ -393,7 +407,9 @@ impl PostboxShell {
         let mut vm = PostboxViewModel::new_uninitialized(ctx.store, ctx.keymap, ctx.version)
             .with_hub_status(ctx.hub_status)
             .with_data_dir(ctx.data_dir)
-            .with_giphy_key_available(ctx.giphy_key_available);
+            .with_giphy_key_available(ctx.giphy_key_available)
+            .with_deepgram_key_available(ctx.deepgram_key_available)
+            .with_llm_format_key_available(ctx.llm_format_key_available);
         if let Some(bridge) = &ctx.sync_bridge {
             vm.attach_sync_sender(bridge.cmd_tx.clone());
         }
@@ -435,6 +451,7 @@ impl PostboxShell {
         let lightbox_focus = cx.focus_handle();
         let emoji_picker_focus = cx.focus_handle();
         let giphy_picker_focus = cx.focus_handle();
+        let voice_record_focus = cx.focus_handle();
         sidebar_focus.focus(window, cx);
 
         let timeline_state = cx.new(|cx| MessageScrollerState::new(initial_timeline_len, cx));
@@ -526,7 +543,9 @@ impl PostboxShell {
                         cx.notify();
                     }
                     InputEvent::Blur => {
-                        this.vm.set_composer_focused(false);
+                        if !this.vm.voice_record_state().is_active() {
+                            this.vm.set_composer_focused(false);
+                        }
                         cx.notify();
                     }
                     _ => {}
@@ -610,6 +629,7 @@ impl PostboxShell {
             lightbox_focus,
             emoji_picker_focus,
             giphy_picker_focus,
+            voice_record_focus,
             sidebar_scroll: VirtualListScrollHandle::new(),
             sidebar_item_sizes,
             sidebar_rows_cache,
@@ -728,6 +748,16 @@ impl PostboxShell {
     }
 
     fn sync_focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vm.voice_record_state().is_active()
+            && !self.vm.palette_open()
+            && !self.vm.shortcuts_open()
+            && self.vm.lightbox().is_none()
+            && self.vm.emoji_picker().is_none()
+            && !self.vm.giphy_picker().is_open()
+        {
+            self.voice_record_focus.focus(window, cx);
+            return;
+        }
         match self.vm.focus() {
             FocusTarget::ChatList => self.sidebar_focus.focus(window, cx),
             FocusTarget::MessageList => self.message_list_focus.focus(window, cx),
@@ -846,6 +876,10 @@ impl PostboxShell {
         if title != self.last_window_title {
             window.set_window_title(&title);
             self.last_window_title = title;
+        }
+
+        if let Some(text) = self.vm.take_pending_clipboard_text() {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
         }
 
         if self.vm.quit_requested() {
@@ -1406,6 +1440,31 @@ impl PostboxShell {
                             if event.click_count == 2 {
                                 shell_dbl.update(cx, |this, cx| {
                                     if this.vm.double_click_message_bubble(&msg_id_dbl) {
+                                        this.sync_after_vm_change(window, cx);
+                                    }
+                                });
+                            } else if event.click_count == 1 {
+                                shell_dbl.update(cx, |this, cx| {
+                                    if event.modifiers.shift {
+                                        if let Some(idx) = this
+                                            .vm
+                                            .messages
+                                            .iter()
+                                            .position(|m| m.msg_id == msg_id_dbl)
+                                        {
+                                            this.vm.range_mark_messages_to(
+                                                idx,
+                                                event.modifiers.control,
+                                            );
+                                            this.sync_after_vm_change(window, cx);
+                                        }
+                                    } else if event.modifiers.control {
+                                        this.vm.toggle_mark_message(&msg_id_dbl);
+                                        this.sync_after_vm_change(window, cx);
+                                    } else if let Some(idx) =
+                                        this.vm.messages.iter().position(|m| m.msg_id == msg_id_dbl)
+                                    {
+                                        this.vm.select_message_index(idx);
                                         this.sync_after_vm_change(window, cx);
                                     }
                                 });
@@ -2328,6 +2387,10 @@ impl Render for PostboxShell {
             composer_section = composer_section.child(strip);
         }
 
+        if let Some(rec_strip) = self.render_voice_recording_strip(&p, cx) {
+            composer_section = composer_section.child(rec_strip);
+        }
+
         composer_section = composer_section
             .on_action(cx.listener(|this, _: &PasteImage, window, cx| {
                 let plat = NativePlatform::default();
@@ -2350,7 +2413,7 @@ impl Render for PostboxShell {
                     .bordered(true),
             );
 
-        let main_column = div()
+        let mut main_column = div()
             .id("chat-main-column")
             .test_support()
             .track_focus(&self.message_list_focus)
@@ -2359,16 +2422,18 @@ impl Render for PostboxShell {
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgb(p.background))
-            .child(timeline_pane)
-            .child(
-                div()
-                    .w_full()
-                    .border_t_1()
-                    .border_color(rgb(p.border))
-                    .bg(rgb(p.card))
-                    .child(composer_section),
-            );
+            .bg(rgb(p.background));
+        if let Some(voice_bar) = self.render_voice_playback_bar(&p, cx) {
+            main_column = main_column.child(voice_bar);
+        }
+        let main_column = main_column.child(timeline_pane).child(
+            div()
+                .w_full()
+                .border_t_1()
+                .border_color(rgb(p.border))
+                .bg(rgb(p.card))
+                .child(composer_section),
+        );
 
         // ZERO TOOLBAR: Root container holds only View Rail + Virtualized Sidebar + Timeline/Composer + Optional Thread Panel + Overlays.
         let mut root = div()
@@ -2404,6 +2469,26 @@ impl Render for PostboxShell {
                     }
                 },
             ))
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                match postbox_keymap::voice_key(
+                    &event.keystroke.key,
+                    event.keystroke.modifiers.control,
+                    event.keystroke.modifiers.shift,
+                    event.keystroke.modifiers.alt,
+                    event.is_held,
+                ) {
+                    postbox_keymap::VoiceKeyOutcome::Ignore => {}
+                    postbox_keymap::VoiceKeyOutcome::ConsumeRepeat => {
+                        cx.stop_propagation();
+                    }
+                    postbox_keymap::VoiceKeyOutcome::StartOrFinish => {
+                        cx.stop_propagation();
+                        if this.vm.toggle_voice_recording(window.is_window_active()) {
+                            this.sync_after_vm_change(window, cx);
+                        }
+                    }
+                }
+            }))
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_action(cx.listener(|this, _: &OpenPalette, window, cx| {
                 this.dispatch_vm_action(PbAction::OpenPalette, window, cx);
@@ -2605,6 +2690,24 @@ impl Render for PostboxShell {
             }))
             .on_action(cx.listener(|this, _: &CloseShortcodePopup, window, cx| {
                 this.dispatch_vm_action(PbAction::CloseShortcodePopup, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PlayPauseVoice, window, cx| {
+                this.dispatch_vm_action(PbAction::PlayPauseVoice, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTranscript, window, cx| {
+                this.dispatch_vm_action(PbAction::ToggleTranscript, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FinishVoiceRecord, window, cx| {
+                this.dispatch_vm_action(PbAction::FinishVoiceRecord, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CancelVoiceRecord, window, cx| {
+                this.dispatch_vm_action(PbAction::CancelVoiceRecord, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CopyMessageText, window, cx| {
+                this.dispatch_vm_action(PbAction::CopyMessageText, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SmartCopy, window, cx| {
+                this.dispatch_vm_action(PbAction::SmartCopy, window, cx);
             }))
             .on_action(cx.listener(|this, _: &MoveViewUp, window, cx| {
                 this.dispatch_vm_action(PbAction::MoveViewUp, window, cx);
@@ -2811,6 +2914,8 @@ mod desktop_tests {
             sync_bridge: None,
             data_dir: std::env::temp_dir().join("postbox_desktop_test"),
             giphy_key_available: true,
+            deepgram_key_available: true,
+            llm_format_key_available: false,
         }
     }
 
@@ -3300,6 +3405,8 @@ mod desktop_tests {
             sync_bridge: None,
             data_dir: std::env::temp_dir().join("postbox_desktop_test"),
             giphy_key_available: false,
+            deepgram_key_available: false,
+            llm_format_key_available: false,
         };
         let (handle, shell) = open_shell_with_ctx(cx, ctx);
         cx.update_window(handle.into(), |_, window, cx| {
@@ -3413,6 +3520,8 @@ mod desktop_tests {
             sync_bridge: Some(bridge),
             data_dir: std::env::temp_dir().join("postbox_desktop_test"),
             giphy_key_available: false,
+            deepgram_key_available: false,
+            llm_format_key_available: false,
         };
         let (handle, shell) = open_shell_with_ctx(cx, ctx);
         cx.update_window(handle.into(), |_, window, cx| {
@@ -3728,6 +3837,7 @@ mod desktop_tests {
                     msg_id: "img_m2".into(),
                     path: inline_path.clone(),
                     mime_type: "image/png".into(),
+                    sha256: "test-sha-img-m2".into(),
                 });
                 this.vm.apply_sync_event(SyncEvent::AvatarReady {
                     chat: alice_key.clone(),
@@ -4233,6 +4343,530 @@ mod desktop_tests {
             );
         })
         .unwrap();
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[gpui_kit::test]
+    fn m4_voice_pill_top_bar_ctrl_p_and_ctrl_t_toggle(cx: &mut TestAppContext) {
+        let data_dir = unique_desktop_test_dir("m4_voice_pill");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let pcm: Vec<i16> = (0..24_000)
+            .map(|i| {
+                ((2.0 * std::f32::consts::PI * 440.0 * (i as f32) / 48_000.0).sin() * 12_000.0)
+                    as i16
+            })
+            .collect();
+        let ogg_bytes = postbox_audio::encode_voice_note(&pcm).unwrap().ogg_bytes;
+        let voice_path = data_dir.join("note1.ogg");
+        std::fs::write(&voice_path, &ogg_bytes).unwrap();
+
+        let mut ctx = seeded_launch_ctx();
+        ctx.data_dir = data_dir.clone();
+        let alice_key = ChatKey::new(Provider::Whatsapp, "main", "alice@s.whatsapp.net");
+        ctx.store
+            .upsert_message(&Message {
+                chat: alice_key.clone(),
+                msg_id: "voice_m1".into(),
+                sender_id: "alice".into(),
+                sender_name: "Alice".into(),
+                from_me: false,
+                ts: "2026-11-27T11:00:00Z".into(),
+                body: String::new(),
+                reply_to_id: None,
+                reply_broadcast: false,
+                media_kind: Some(postbox_core::MediaKind::Voice),
+                mime_type: Some("audio/ogg".into()),
+                filename: Some("note1.ogg".into()),
+                file_size: Some(ogg_bytes.len() as u64),
+                reactions: vec![],
+                read_status: ReadStatus::None,
+                deleted: false,
+            })
+            .unwrap();
+
+        let (handle, shell) = open_shell_with_ctx(cx, ctx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            // 0% idle: top playback bar is NOT rendered before playback starts.
+            assert!(window.try_find("voice-playback-bar").is_none());
+            assert!(window.try_find("voice-recording-strip").is_none());
+
+            shell.update(cx, |this, cx| {
+                this.vm.apply_sync_event(SyncEvent::MediaDownloaded {
+                    chat: alice_key.clone(),
+                    msg_id: "voice_m1".into(),
+                    path: voice_path.clone(),
+                    mime_type: "audio/ogg".into(),
+                    sha256: "sha-voice-m1".into(),
+                });
+                this.vm.apply_sync_event(SyncEvent::TranscriptReady {
+                    chat: alice_key.clone(),
+                    msg_id: "voice_m1".into(),
+                    sha256: "sha-voice-m1".into(),
+                    raw_text: "Hello from Alice voice note.".into(),
+                    formatted_text: None,
+                    language: "en".into(),
+                });
+                let idx = this
+                    .vm
+                    .messages
+                    .iter()
+                    .position(|m| m.msg_id == "voice_m1")
+                    .unwrap();
+                this.vm.select_message_index(idx);
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("voice-playback-bar").is_none());
+
+            // Ctrl+P starts voice playback -> persistent top bar appears!
+            window.press("ctrl-p", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("voice-playback-bar").is_some(),
+                "voice-playback-bar must render while active"
+            );
+            assert!(shell.read(cx).vm.is_voice_playing());
+            assert!(shell.read(cx).vm.is_voice_played(&alice_key, "voice_m1"));
+
+            // Ctrl+T toggles transcript expansion on selected voice message.
+            assert!(
+                !shell
+                    .read(cx)
+                    .vm
+                    .is_transcript_expanded(&alice_key, "voice_m1")
+            );
+            window.press("ctrl-t", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                shell
+                    .read(cx)
+                    .vm
+                    .is_transcript_expanded(&alice_key, "voice_m1")
+            );
+
+            // Stop playback -> persistent top bar disappears cleanly (0% idle).
+            shell.update(cx, |this, cx| {
+                this.vm.stop_voice_playback();
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("voice-playback-bar").is_none());
+        })
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[gpui_kit::test]
+    fn m4_recording_strip_repeat_guard_enter_esc_and_thread_composer_block(
+        cx: &mut TestAppContext,
+    ) {
+        let data_dir = unique_desktop_test_dir("m4_rec");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut ctx = seeded_launch_ctx();
+        ctx.data_dir = data_dir.clone();
+        let alice_key = ChatKey::new(Provider::Whatsapp, "main", "alice@s.whatsapp.net");
+        let (handle, shell) = open_shell_with_ctx(cx, ctx);
+
+        // 0. Blocked while window is inactive (`TestWindow::is_active` starts false).
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!window.is_window_active());
+            shell.update(cx, |this, cx| {
+                this.vm.set_focus(FocusTarget::Composer);
+                this.sync_after_vm_change(window, cx);
+            });
+            window.press("ctrl-shift-m", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                !shell.read(cx).vm.is_voice_recording(),
+                "Ctrl+Shift+M must not start recording while window is inactive"
+            );
+            assert!(window.try_find("voice-recording-strip").is_none());
+            // Bring headless test window to foreground so active-window recording paths run.
+            window.activate_window();
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        // 1. Blocked when ThreadComposer is focused inside an active window.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.is_window_active());
+            shell.update(cx, |this, cx| {
+                assert!(this.vm.select_chat_index(1));
+                assert!(this.vm.open_thread("1700.1"));
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(shell.read(cx).vm.focus(), FocusTarget::ThreadComposer);
+            assert!(window.try_find("thread-panel").is_some());
+            window.press("ctrl-shift-m", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!shell.read(cx).vm.is_voice_recording());
+            assert!(window.try_find("voice-recording-strip").is_none());
+
+            // 2. Close thread panel, focus main Composer, and press Ctrl+Shift+M -> starts recording strip.
+            shell.update(cx, |this, cx| {
+                this.vm.close_thread_panel();
+                assert!(this.vm.select_chat_index(0));
+                this.vm.set_focus(FocusTarget::Composer);
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            assert!(
+                shell
+                    .read(cx)
+                    .composer
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window),
+                "Composer must have GPUI focus before Ctrl+Shift+M"
+            );
+            window.press("ctrl-shift-m", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(shell.read(cx).vm.is_voice_recording());
+            assert_eq!(
+                shell.read(cx).vm.focus(),
+                FocusTarget::Composer,
+                "starting voice recording from Composer must not clobber vm.focus on composer blur"
+            );
+            assert!(
+                shell.read(cx).voice_record_focus.is_focused(window),
+                "voice_record_focus must hold GPUI focus while recording"
+            );
+            assert!(
+                window.try_find("voice-recording-strip").is_some(),
+                "voice-recording-strip must render while recording"
+            );
+
+            // 2b. Opening an M3 modal (EmojiPicker) while recording must NOT lose focus on 100ms VoiceRecordTick.
+            let generation = shell.read(cx).vm.active_record_generation();
+            shell.update(cx, |this, cx| {
+                assert!(this.vm.open_insert_emoji_picker());
+                this.sync_after_vm_change(window, cx);
+                this.apply_sync_events(
+                    vec![SyncEvent::VoiceRecordTick {
+                        generation,
+                        elapsed_ms: 400,
+                        bars: vec![40, 80],
+                    }],
+                    window,
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            assert!(
+                shell
+                    .read(cx)
+                    .emoji_search_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window),
+                "VoiceRecordTick must not steal GPUI focus from open EmojiPicker modal"
+            );
+            assert!(!shell.read(cx).voice_record_focus.is_focused(window));
+
+            // Closing EmojiPicker via real Esc must close ONLY the picker and return GPUI focus to voice_record_focus.
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                shell.read(cx).vm.emoji_picker().is_none(),
+                "Esc must close EmojiPicker overlay"
+            );
+            assert!(
+                shell.read(cx).vm.is_voice_recording(),
+                "Esc closing EmojiPicker must NOT cancel active voice recording"
+            );
+            assert!(shell.read(cx).voice_record_focus.is_focused(window));
+            assert_eq!(shell.read(cx).vm.focus(), FocusTarget::Composer);
+
+            // 2c. Opening F1 ShortcutsOverlay while recording and pressing real Esc must close ONLY the modal.
+            window.press("f1", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                shell.read(cx).vm.shortcuts_open(),
+                "F1 must open ShortcutsOverlay while recording"
+            );
+            assert!(window.try_find("f1-shortcuts-modal").is_some());
+            assert!(shell.read(cx).vm.is_voice_recording());
+            assert!(
+                !shell.read(cx).voice_record_focus.is_focused(window),
+                "ShortcutsOverlay must hold focus instead of voice_record_focus while open"
+            );
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                !shell.read(cx).vm.shortcuts_open(),
+                "Esc must close F1 ShortcutsOverlay"
+            );
+            assert!(window.try_find("f1-shortcuts-modal").is_none());
+            assert!(
+                shell.read(cx).vm.is_voice_recording(),
+                "Esc closing F1 ShortcutsOverlay must NOT cancel active voice recording"
+            );
+            assert!(
+                shell.read(cx).voice_record_focus.is_focused(window),
+                "voice_record_focus must regain GPUI focus after closing F1 ShortcutsOverlay"
+            );
+            assert_eq!(
+                shell.read(cx).vm.focus(),
+                FocusTarget::Composer,
+                "closing F1 ShortcutsOverlay must preserve Composer focus target"
+            );
+
+            // 3. Held key-repeat of Ctrl+Shift+M MUST be consumed without finishing!
+            let _ = window.dispatch_event(
+                gpui_kit::PlatformInput::KeyDown(gpui_kit::KeyDownEvent {
+                    keystroke: gpui_kit::Keystroke::parse("ctrl-shift-m").unwrap(),
+                    is_held: true,
+                    prefer_character_input: false,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                shell.read(cx).vm.is_voice_recording(),
+                "held repeat of Ctrl+Shift+M must NOT finish recording"
+            );
+            // 4. Esc cancels recording and removes recording strip.
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!shell.read(cx).vm.is_voice_recording());
+            assert!(window.try_find("voice-recording-strip").is_none());
+            assert_eq!(
+                shell.read(cx).vm.focus(),
+                FocusTarget::Composer,
+                "Esc cancelling recording must preserve FocusTarget::Composer"
+            );
+            assert!(
+                shell
+                    .read(cx)
+                    .composer
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window),
+                "Composer must regain GPUI focus after Esc cancels recording"
+            );
+            assert!(
+                !shell.read(cx).sidebar_focus.is_focused(window),
+                "sidebar_focus must NOT gain focus after Esc cancels recording"
+            );
+
+            // 5. Start again from Composer and press Enter -> routes via voice_record_focus to VoiceRecordFinish!
+            window.press("ctrl-shift-m", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        let mut finish_generation = 0u64;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(shell.read(cx).vm.is_voice_recording());
+            assert_eq!(shell.read(cx).vm.focus(), FocusTarget::Composer);
+            assert!(shell.read(cx).voice_record_focus.is_focused(window));
+            finish_generation = shell.read(cx).vm.active_record_generation();
+            let _ = shell.update(cx, |this, _| this.vm.take_emitted_sync_commands());
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let cmds = shell.update(cx, |this, _| this.vm.take_emitted_sync_commands());
+            assert!(
+                cmds.iter()
+                    .any(|c| matches!(c, SyncCommand::VoiceRecordFinish)),
+                "Enter while recording must emit VoiceRecordFinish via voice_record_focus"
+            );
+            // 6. Completing VoiceRecordFinished returns recording to Idle and restores Composer focus!
+            shell.update(cx, |this, cx| {
+                this.apply_sync_events(
+                    vec![SyncEvent::VoiceRecordFinished {
+                        generation: finish_generation,
+                        origin_chat: alice_key.clone(),
+                        ogg_bytes: vec![b'O', b'g', b'g', b'S'],
+                        duration_secs: 2,
+                        waveform: vec![50; 32],
+                    }],
+                    window,
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            assert!(!shell.read(cx).vm.voice_record_state().is_active());
+            assert!(window.try_find("voice-recording-strip").is_none());
+            assert_eq!(
+                shell.read(cx).vm.focus(),
+                FocusTarget::Composer,
+                "VoiceRecordFinished returning to Idle must keep FocusTarget::Composer"
+            );
+            assert!(
+                shell
+                    .read(cx)
+                    .composer
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window),
+                "Composer must regain GPUI focus after VoiceRecordFinished"
+            );
+            assert!(
+                !shell.read(cx).sidebar_focus.is_focused(window),
+                "sidebar_focus must NOT gain focus after VoiceRecordFinished"
+            );
+        })
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[gpui_kit::test]
+    fn m4_copy_transcript_and_copy_all_marked_writes_clipboard(cx: &mut TestAppContext) {
+        let data_dir = unique_desktop_test_dir("m4_clip");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut ctx = seeded_launch_ctx();
+        ctx.data_dir = data_dir.clone();
+        let alice_key = ChatKey::new(Provider::Whatsapp, "main", "alice@s.whatsapp.net");
+        for (id, ts) in [
+            ("vc_1", "2026-11-27T11:01:00Z"),
+            ("vc_2", "2026-11-27T11:02:00Z"),
+        ] {
+            ctx.store
+                .upsert_message(&Message {
+                    chat: alice_key.clone(),
+                    msg_id: id.into(),
+                    sender_id: "alice".into(),
+                    sender_name: "Alice".into(),
+                    from_me: false,
+                    ts: ts.into(),
+                    body: String::new(),
+                    reply_to_id: None,
+                    reply_broadcast: false,
+                    media_kind: Some(postbox_core::MediaKind::Voice),
+                    mime_type: Some("audio/ogg".into()),
+                    filename: Some(format!("{id}.ogg")),
+                    file_size: Some(1024),
+                    reactions: vec![],
+                    read_status: ReadStatus::None,
+                    deleted: false,
+                })
+                .unwrap();
+        }
+
+        let (handle, shell) = open_shell_with_ctx(cx, ctx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            shell.update(cx, |this, cx| {
+                this.vm.apply_sync_event(SyncEvent::TranscriptReady {
+                    chat: alice_key.clone(),
+                    msg_id: "vc_1".into(),
+                    sha256: "sha-vc1".into(),
+                    raw_text: "Older raw note".into(),
+                    formatted_text: Some("1. Formatted older".into()),
+                    language: "en".into(),
+                });
+                this.vm.apply_sync_event(SyncEvent::TranscriptReady {
+                    chat: alice_key.clone(),
+                    msg_id: "vc_2".into(),
+                    sha256: "sha-vc2".into(),
+                    raw_text: "Newer raw note".into(),
+                    formatted_text: None,
+                    language: "en".into(),
+                });
+                // 1. Single Copy transcript writes display text (formatted when available).
+                let vc1_idx = this
+                    .vm
+                    .messages
+                    .iter()
+                    .position(|m| m.msg_id == "vc_1")
+                    .unwrap();
+                this.vm.select_message_index(vc1_idx);
+                assert!(this.vm.copy_selected_transcript());
+                this.sync_after_vm_change(window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let clip = cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default();
+            assert_eq!(clip, "1. Formatted older");
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                // 2. Mark in reverse order to verify oldest-first `\r\n\r\n` raw clipboard export!
+                this.vm.toggle_mark_message("vc_2");
+                this.vm.toggle_mark_message("vc_1");
+                assert!(this.vm.copy_all_marked_transcripts());
+                this.sync_after_vm_change(window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let clip = cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default();
+            assert_eq!(clip, "Older raw note\r\n\r\nNewer raw note");
+        });
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

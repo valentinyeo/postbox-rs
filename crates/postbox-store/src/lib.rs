@@ -1,6 +1,7 @@
 pub mod media;
 pub mod outbox;
 pub mod state;
+pub mod voice;
 
 use postbox_core::archive::unix_seconds;
 use postbox_core::drafts::{MAX_DRAFTS, validate_draft_key, validate_draft_text};
@@ -20,6 +21,7 @@ use thiserror::Error;
 pub use media::{FetchMarker, MediaCacheEntry, SETTING_EMOJI_RECENTS, gone_media_pair_key};
 pub use postbox_core::outbox::{OutboxKind, OutboxPhase, OutboxRecord};
 pub use state::{MAX_PINS, PendingArchiveRow};
+pub use voice::{SETTING_MICROPHONE, SETTING_PLAYBACK_SPEED};
 
 pub const MEDIA_TTL_SECS: i64 = 14 * 24 * 60 * 60;
 pub const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -246,7 +248,9 @@ CREATE TABLE IF NOT EXISTS transcripts (
     media_sha256 TEXT PRIMARY KEY,
     language TEXT NOT NULL,
     text TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    formatted_text TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS drafts (
@@ -372,6 +376,26 @@ CREATE TABLE IF NOT EXISTS media_fetch_markers (
     checked_at INTEGER NOT NULL,
     rel_path TEXT
 );
+
+CREATE TABLE IF NOT EXISTS played_voice (
+    pair_key TEXT PRIMARY KEY,
+    played_at INTEGER NOT NULL,
+    seq INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_played_voice_seq
+    ON played_voice (seq ASC);
+
+CREATE TABLE IF NOT EXISTS voice_positions (
+    pair_key TEXT PRIMARY KEY,
+    pos_ms INTEGER NOT NULL,
+    dur_ms INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    seq INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_voice_positions_seq
+    ON voice_positions (seq ASC);
 "#;
 
 const SETTING_THEME: &str = "ui.theme";
@@ -474,6 +498,16 @@ impl Store {
         // Forward-migration for existing M0/M1/M2 databases missing `file_size` on `messages`.
         if !table_has_column(&conn, "messages", "file_size")? {
             conn.execute("ALTER TABLE messages ADD COLUMN file_size INTEGER", [])?;
+        }
+        // Forward-migration for existing M0-M3 databases missing `formatted_text`/`updated_at` on `transcripts`.
+        if !table_has_column(&conn, "transcripts", "formatted_text")? {
+            conn.execute("ALTER TABLE transcripts ADD COLUMN formatted_text TEXT", [])?;
+        }
+        if !table_has_column(&conn, "transcripts", "updated_at")? {
+            conn.execute(
+                "ALTER TABLE transcripts ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         {
             let mut stmt =

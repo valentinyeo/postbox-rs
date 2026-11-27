@@ -7,6 +7,7 @@ pub mod outbox;
 pub mod read;
 pub mod threads;
 pub mod views;
+pub mod voice;
 
 use serde::{Deserialize, Serialize};
 
@@ -183,6 +184,10 @@ impl MediaKind {
                 | Self::Voice
                 | Self::Document
         )
+    }
+
+    pub const fn is_voice_or_audio(self) -> bool {
+        matches!(self, Self::Voice | Self::Audio)
     }
 }
 

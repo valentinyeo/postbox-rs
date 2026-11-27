@@ -5,6 +5,7 @@ pub mod dpapi;
 pub mod memory;
 pub mod registry;
 pub mod shell;
+pub mod video;
 pub mod wasapi;
 
 use crate::audio::{AudioBackend, AudioCaptureStream, AudioRenderStream};

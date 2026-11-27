@@ -69,6 +69,7 @@ pub enum PaletteCommand {
     RestartLiveSync,
     ManageAccounts,
     OpenVideoExternal,
+    PlayVideoInline,
     OpenImageExternal,
     AttachFile,
     CheckForUpdates,
@@ -751,6 +752,11 @@ pub fn build_palette_items(ctx: &PaletteCatalogContext<'_>) -> Vec<PaletteEntry>
         "Manage accounts",
         None,
         PaletteCommand::ManageAccounts,
+    ));
+    items.push(cmd_entry(
+        "Play video inline",
+        None,
+        PaletteCommand::PlayVideoInline,
     ));
     items.push(cmd_entry(
         "Open video in external player",

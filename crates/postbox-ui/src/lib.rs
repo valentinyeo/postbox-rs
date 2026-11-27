@@ -2,6 +2,7 @@ pub mod geometry;
 pub mod m3;
 pub mod m4;
 pub mod m5;
+pub mod m6;
 pub mod palette;
 pub mod sync_bridge;
 pub mod theme;
@@ -16,6 +17,8 @@ mod desktop_m3;
 mod desktop_m4;
 #[cfg(feature = "desktop")]
 mod desktop_m5;
+#[cfg(feature = "desktop")]
+mod desktop_m6;
 
 pub use geometry::RowGeometry;
 pub use m3::{M3State, MentionPopupState, ShortcodePopupState};
@@ -23,6 +26,10 @@ pub use m4::M4State;
 pub use m5::{
     DICTATION_METER_BARS, DICTATION_METER_TICK_MS, DictationContextSnapshot, DictationPhase,
     LiveDictationUiState, M5State, compute_dictation_padding,
+};
+pub use m6::{
+    M6State, MAX_VIDEO_FRAME_BYTES, VIDEO_PLAYER_TICK_MS, VideoEscapeOutcome, VideoPlayRequest,
+    VideoPlayerUiState, VideoThumbReady, VideoThumbState, av_sync_position_ms,
 };
 pub use palette::{
     PaletteCommand, PaletteEntry, PaletteEntryKind, PaletteGroupKind, PaletteMode, PaletteSection,

@@ -7,3 +7,4 @@
 .env.*
 keymap.local.json
 .agents/
+brief.txt

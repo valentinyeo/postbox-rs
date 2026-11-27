@@ -2,6 +2,7 @@ use crate::geometry::RowGeometry;
 use crate::m3::M3State;
 use crate::m4::M4State;
 use crate::m5::M5State;
+use crate::m6::M6State;
 use crate::palette::{
     PaletteCatalogContext, PaletteCommand, PaletteEntry, PaletteEntryKind, PaletteFilterInput,
     PaletteMode, PaletteSection, PaletteState, build_palette_items, filter_palette,
@@ -56,6 +57,12 @@ pub struct PostboxLaunchContext {
     /// M5.5 RAM diet: working-set trim + `GetProcessMemoryInfo` telemetry. `None` in tests that
     /// do not exercise the OS hook; the shell falls back to a no-op trim.
     pub memory_platform: Option<std::sync::Arc<dyn postbox_platform::MemoryPressure>>,
+    /// Milestone 6: Windows Media Foundation + Intel Arc DXVA (mock on Linux/tests).
+    pub video_backend: Option<std::sync::Arc<dyn postbox_platform::VideoBackend>>,
+    /// Milestone 6: WASAPI render stream that clocks inline video playback.
+    pub audio_backend: Option<std::sync::Arc<dyn postbox_platform::AudioBackend>>,
+    /// Milestone 6: disk cache for video thumbnails (keyed by video content SHA-256).
+    pub video_thumb_cache: Option<postbox_media::VideoThumbnailCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +77,7 @@ pub enum FocusTarget {
     EmojiPicker,
     Lightbox,
     GiphyPicker,
+    VideoPlayer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +231,7 @@ pub struct PostboxViewModel {
     pub(crate) m3: M3State,
     pub(crate) m4: M4State,
     pub(crate) m5: M5State,
+    pub(crate) m6: M6State,
 }
 
 impl PostboxViewModel {
@@ -321,6 +330,7 @@ impl PostboxViewModel {
             m3,
             m4,
             m5: M5State::default(),
+            m6: M6State::default(),
         }
     }
 
@@ -3001,6 +3011,9 @@ impl PostboxViewModel {
             }
             PaletteCommand::ToggleTranscript => {
                 self.toggle_selected_transcript();
+            }
+            PaletteCommand::PlayVideoInline => {
+                self.request_video_player_open_selected();
             }
             PaletteCommand::CopyMessageLink
             | PaletteCommand::OpenVideoExternal

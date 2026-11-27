@@ -2,6 +2,7 @@ pub mod audio;
 pub mod clipboard;
 pub mod giphy_auth;
 pub mod hub_auth;
+pub mod video;
 pub mod voice_auth;
 
 #[cfg(windows)]
@@ -34,6 +35,11 @@ pub use hub_auth::{
     ENV_WAZIG_HUB_TOKEN, ENV_WAZIG_HUB_URL, HUB_TOKEN_SECRET_NAME, HubDiscoveryOutcome,
     discover_hub_credentials, discover_hub_credentials_from_system, valid_hub_token,
 };
+pub use video::{
+    MockVideoBackend, MockVideoConfig, MockVideoSession, THUMBNAIL_SEEK_MS, VideoAudioChunk,
+    VideoBackend, VideoFrame, VideoMetadata, VideoPlaybackSession, downscale_rgba,
+    fit_thumbnail_box, rgba_to_bgra_in_place, synthetic_rgba_frame,
+};
 pub use voice_auth::{
     ANTHROPIC_API_KEY_SECRET_NAME, ANTHROPIC_WORKSPACE_ID_SECRET_NAME, ApiKeyOutcome,
     DEEPGRAM_API_KEY_SECRET_NAME, DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENROUTER_MODEL,
@@ -64,6 +70,8 @@ pub enum PlatformError {
     RegistryError(String),
     #[error("audio_error: {0}")]
     AudioError(String),
+    #[error("video_error: {0}")]
+    VideoError(String),
     #[error("io_error")]
     Io(#[from] std::io::Error),
 }
@@ -258,6 +266,25 @@ impl AudioBackend for NativePlatform {
     }
 }
 
+impl VideoBackend for NativePlatform {
+    fn extract_thumbnail(
+        &self,
+        path: &Path,
+        max_w: u32,
+        max_h: u32,
+    ) -> Result<Option<VideoFrame>, PlatformError> {
+        self.inner.extract_thumbnail(path, max_w, max_h)
+    }
+
+    fn open_session(&self, path: &Path) -> Result<Box<dyn VideoPlaybackSession>, PlatformError> {
+        self.inner.open_session(path)
+    }
+
+    fn hardware_acceleration_available(&self) -> bool {
+        self.inner.hardware_acceleration_available()
+    }
+}
+
 /// Portable in-memory mock platform used for fast Linux & headless unit tests.
 pub struct MemoryPlatform {
     secrets: Mutex<HashMap<String, String>>,
@@ -269,6 +296,7 @@ pub struct MemoryPlatform {
     clipboard_payload: Mutex<ClipboardPayload>,
     zone_marked_paths: Mutex<Vec<PathBuf>>,
     audio: MockAudioBackend,
+    video: MockVideoBackend,
     fail_migration: AtomicBool,
     fail_save: AtomicBool,
     memory_stats: ProcessMemoryStats,
@@ -287,6 +315,7 @@ impl Default for MemoryPlatform {
             clipboard_payload: Mutex::new(ClipboardPayload::Empty),
             zone_marked_paths: Mutex::new(Vec::new()),
             audio: MockAudioBackend::new(),
+            video: MockVideoBackend::new(),
             fail_migration: AtomicBool::new(false),
             fail_save: AtomicBool::new(false),
             memory_stats: ProcessMemoryStats {
@@ -301,6 +330,16 @@ impl Default for MemoryPlatform {
 impl MemoryPlatform {
     pub fn audio_mock(&self) -> &MockAudioBackend {
         &self.audio
+    }
+
+    /// Deterministic video backend used by `VideoBackend` on non-Windows targets.
+    pub fn video_mock(&self) -> &MockVideoBackend {
+        &self.video
+    }
+
+    /// Swaps in configured mock video behaviour (silent clips, failing decodes, ...).
+    pub fn set_video_mock(&mut self, mock: MockVideoBackend) {
+        self.video = mock;
     }
 
     /// Number of working-set trims requested through this platform (test observability).
@@ -567,6 +606,25 @@ impl ZoneMarker for MemoryPlatform {
             .map_err(|_| PlatformError::OsUnavailable)?;
         guard.push(path.to_path_buf());
         Ok(true)
+    }
+}
+
+impl VideoBackend for MemoryPlatform {
+    fn extract_thumbnail(
+        &self,
+        path: &Path,
+        max_w: u32,
+        max_h: u32,
+    ) -> Result<Option<VideoFrame>, PlatformError> {
+        self.video.extract_thumbnail(path, max_w, max_h)
+    }
+
+    fn open_session(&self, path: &Path) -> Result<Box<dyn VideoPlaybackSession>, PlatformError> {
+        self.video.open_session(path)
+    }
+
+    fn hardware_acceleration_available(&self) -> bool {
+        self.video.hardware_acceleration_available()
     }
 }
 

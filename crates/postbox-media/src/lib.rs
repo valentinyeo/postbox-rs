@@ -8,8 +8,16 @@ pub mod lightbox;
 pub mod mention;
 pub mod paste;
 pub mod unfurl;
+pub mod video;
 
 use thiserror::Error;
+
+pub use video::{
+    CachedVideoThumbnail, PreparedVideoThumb, VIDEO_THUMB_CACHE_PREFIX, VIDEO_THUMB_DIR,
+    VIDEO_THUMB_MIME, VideoThumbMeta, VideoThumbnailCache, encode_png, format_duration_chip,
+    is_video_mime, mp4_alias_path, needs_mp4_alias, prepare_video_thumbnail,
+    video_thumbnail_cache_key, video_thumbnail_meta_rel_path, video_thumbnail_rel_path,
+};
 
 /// Maximum automatic media download size (100 MiB, `media_drain.zig:7`).
 /// Files `<= 104_857_600` auto-download on chat open; `>= 104_857_601` require manual click.

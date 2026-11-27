@@ -251,7 +251,8 @@ CREATE TABLE media_cache (
 
 ### Milestone 6 — Hardware-Accelerated Video (Intel Arc DXVA / Media Foundation)
 - Windows Media Foundation `IMFSourceReader` + `IMFDXGIDeviceManager` hardware decode on Intel Arc for instant video thumbnail generation (cached to disk) and inline video playback (double-click to play, `F11` fullscreen, audio sync via WASAPI).
-- **Gate**: Hardware decode verification on Intel Arc confirms `< 5%` CPU during 1080p inline playback.
+- **Shipped**: `VideoBackend` / `VideoPlaybackSession` traits with a deterministic `MockVideoBackend`; Media Foundation + DXVA backend in `postbox-platform/src/win/video.rs` (lazy `MFStartup` and DLL loading, D3D11 `VIDEO_SUPPORT` + `BGRA_SUPPORT` device manager, software fallback, `.f4v`/`.f4p` `.mp4` alias); PNG video thumbnails cached beside the content-addressed media cache, keyed by video SHA-256 and evicted by the same 14-day LRU; video bubbles with play badge, duration chip and fallback card; inline player with `F11` fullscreen, `Esc` (exits fullscreen first), `Space` play/pause, scrubber, mute, `elapsed / total` clock, hardware badge; audio via `AudioBackend::open_render` with the render clock driving presentation (wall clock when silent/muted); pause-when-occluded and release on close/chat-switch.
+- **Gate**: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo test -p postbox-ui --features desktop-test`, plus `cargo clippy -p postbox-platform --target x86_64-pc-windows-msvc --all-targets -- -D warnings`. The `< 5%` CPU measurement still needs a physical Intel Arc machine; the decoder falls back to software when DXVA is unavailable.
 
 ### Milestone 7 — Windows OS Integration, `postboxctl` & Atomic Self-Updater
 - Windows Toast XML notifications with click-to-focus chat routing.

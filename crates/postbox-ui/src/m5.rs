@@ -518,7 +518,8 @@ impl PostboxViewModel {
     /// `live_snapshot` (or `pre_text`) and detaches cleanly without clobbering user text.
     pub(crate) fn on_composer_user_edit(&mut self, in_thread: bool, new_text: &str) {
         if !self.m5.active.as_ref().is_some_and(|state| {
-            self.selected_chat().is_some_and(|chat| chat.key == state.origin_chat)
+            self.selected_chat()
+                .is_some_and(|chat| chat.key == state.origin_chat)
         }) {
             return;
         }

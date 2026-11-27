@@ -23,6 +23,17 @@ Minimal, GPU-accelerated Rust messaging client for the Postbox / Triage Hub (`/v
 
 See [PLAN.md](PLAN.md) for the complete architecture, performance budgets, SQLite schema, and 8-milestone implementation roadmap.
 
+## Live Dictation (Windows)
+
+Set `DEEPGRAM_API_KEY` in your Windows user environment (`HKCU\Environment`), then restart Postbox. The app trims the key and saves it with Windows DPAPI encryption; you can then remove the environment variable. A changed seed replaces the saved key. Failed legacy plaintext migration disables dictation rather than using the unencrypted key.
+
+- `Ctrl+D` starts dictation at the composer selection. Press it again to stop and receive the final text.
+- `Esc` cancels and restores the original draft, unless you have edited it yourself.
+- `Ctrl+Enter` stops dictation and sends after the final text arrives, provided the draft, cursor, and chat context have not changed.
+- Choose **Automatic**, **English**, **German**, or a microphone in `Ctrl+K`. Automatic accepts only English and German and rejects results without language information.
+
+Audio streams to Deepgram Nova-3 over an encrypted WebSocket. The eight-bar microphone meter updates every 120 ms only while dictation and the window are active.
+
 ## Quick Commands
 
 ```bash

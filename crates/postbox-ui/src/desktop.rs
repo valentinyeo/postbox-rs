@@ -3090,8 +3090,10 @@ mod desktop_tests {
     #[gpui_kit::test]
     fn m5_real_composer_cursor_interims_final_and_meter_lifecycle(cx: &mut TestAppContext) {
         let (handle, shell) = open_shell(cx);
+        cx.update_window(handle.into(), |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
-            window.activate_window();
             shell.update(cx, |this, cx| {
                 this.vm.set_composer_text("links rechts");
                 this.vm.set_focus(FocusTarget::Composer);
@@ -3130,7 +3132,10 @@ mod desktop_tests {
                 "links Grüße rechts"
             );
             let caret = "links Grüße ".len();
-            assert_eq!(shell.read(cx).composer.read(cx).selected_range(), caret..caret);
+            assert_eq!(
+                shell.read(cx).composer.read(cx).selected_range(),
+                caret..caret
+            );
             assert!(!shell.read(cx).vm.live_dictation().unwrap().live_detached);
             assert!(shell.read(cx).dictation_timer_task.is_some());
             assert!(window.try_find("dictation-mic-pill").is_some());
@@ -3144,28 +3149,35 @@ mod desktop_tests {
         })
         .unwrap();
         cx.run_until_parked();
-        cx.background_executor.advance_clock(std::time::Duration::from_millis(120));
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(120));
         cx.run_until_parked();
         cx.update(|cx| {
-            assert_eq!(shell.read(cx).vm.live_dictation().unwrap().meter_bars[7], 200);
+            assert_eq!(
+                shell.read(cx).vm.live_dictation().unwrap().meter_bars[7],
+                200
+            );
         });
         let mut visual = gpui_kit::VisualTestContext::from_window(handle.into(), cx);
         visual.deactivate_window();
         cx.run_until_parked();
         cx.update(|cx| assert!(shell.read(cx).dictation_timer_task.is_none()));
-        cx.background_executor.advance_clock(std::time::Duration::from_millis(240));
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(240));
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             assert!(!window.is_window_active());
             assert_eq!(shell.read(cx).vm.live_dictation().unwrap().meter_bars[6], 0);
             window.activate_window();
-        }).unwrap();
+        })
+        .unwrap();
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             assert!(shell.read(cx).dictation_timer_task.is_some());
             window.render_frame(cx);
             window.press("ctrl-d", cx);
-        }).unwrap();
+        })
+        .unwrap();
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             let generation = shell.read(cx).vm.live_dictation().unwrap().generation;
@@ -3185,7 +3197,10 @@ mod desktop_tests {
                 "links Grüße! rechts"
             );
             let caret = "links Grüße! ".len();
-            assert_eq!(shell.read(cx).composer.read(cx).selected_range(), caret..caret);
+            assert_eq!(
+                shell.read(cx).composer.read(cx).selected_range(),
+                caret..caret
+            );
             assert!(shell.read(cx).dictation_timer_task.is_none());
             assert!(window.try_find("dictation-mic-pill").is_none());
         })
@@ -3195,37 +3210,55 @@ mod desktop_tests {
     #[gpui_kit::test]
     fn m5_cursor_move_during_close_stream_disarms_auto_send(cx: &mut TestAppContext) {
         let (handle, shell) = open_shell(cx);
+        cx.update_window(handle.into(), |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
-            window.activate_window();
             shell.update(cx, |this, cx| {
                 this.vm.set_composer_text("draft");
                 this.vm.set_focus(FocusTarget::Composer);
                 this.sync_after_vm_change(window, cx);
-                this.composer.update(cx, |input, cx| input.set_selected_range(5..5, cx));
+                this.composer
+                    .update(cx, |input, cx| input.set_selected_range(5..5, cx));
             });
             window.render_frame(cx);
             window.press("ctrl-d", cx);
-        }).unwrap();
+        })
+        .unwrap();
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             let generation = shell.read(cx).vm.live_dictation().unwrap().generation;
             shell.update(cx, |this, cx| {
-                this.apply_sync_events(vec![SyncEvent::DictationConnected { generation }], window, cx);
+                this.apply_sync_events(
+                    vec![SyncEvent::DictationConnected { generation }],
+                    window,
+                    cx,
+                );
             });
             window.render_frame(cx);
             window.press("ctrl-enter", cx);
-        }).unwrap();
+        })
+        .unwrap();
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             assert!(shell.read(cx).vm.live_dictation().unwrap().auto_send_armed);
             shell.update(cx, |this, cx| {
-                this.composer.update(cx, |input, cx| input.set_selected_range(0..0, cx));
+                this.composer
+                    .update(cx, |input, cx| input.set_selected_range(0..0, cx));
                 let generation = this.vm.live_dictation().unwrap().generation;
-                this.apply_sync_events(vec![SyncEvent::DictationFinal { generation, text: "dictated".into() }], window, cx);
+                this.apply_sync_events(
+                    vec![SyncEvent::DictationFinal {
+                        generation,
+                        text: "dictated".into(),
+                    }],
+                    window,
+                    cx,
+                );
                 assert_eq!(this.vm.composer_text(), "draft dictated");
                 assert!(this.vm.store().list_outbox().unwrap().is_empty());
             });
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

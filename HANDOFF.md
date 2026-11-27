@@ -12,16 +12,17 @@
 - **`e2e/suite` (`a74c84a`) — Complete & verified**:
   - 185-test opaque-box 4-tier E2E suite (`crates/postbox-e2e`) with loopback mock Hub, mock Deepgram, and mock external servers. Ready to rebase/merge onto `main` in Milestone 8.
 
-- **`m5/deepgram-live-dictation` (this branch — WIP)**:
-  - Mid-implementation of **Milestone 5** (Deepgram Nova-3 live streaming WebSocket dictation `Ctrl+D`, DPAPI `HKCU\Environment\DEEPGRAM_API_KEY` seeding, EN/DE fail-closed Auto, anchored interim span replacement, `CloseStream` drain, 8-bar `micPill`).
-  - Needs compilation/test verification, loopback WebSocket tests, clippy/fmt check, and PR #5 to `main`.
+- **`m5/deepgram-live-dictation` (Milestone 5, PR #5)**:
+  - Implements Deepgram Nova-3 live WebSocket dictation (`Ctrl+D`), DPAPI `HKCU\Environment\DEEPGRAM_API_KEY` seeding, EN/DE fail-closed Automatic mode, anchored composer replacement, `CloseStream` final drain, and an eight-bar microphone meter.
+  - Loopback tests cover fragmented Unicode interims, replayed finals, cursor preservation, and all three language modes. GPUI tests cover real composer selection, cursor-safe auto-send, and the 120 ms meter timer's active-window lifecycle.
+  - Dictation results stay with the origin chat even when another draft is edited. Cursor or context changes disarm `Ctrl+Enter` auto-send.
+  - Verification runs on GitHub-hosted Linux and Windows runners. See PR #5 for the final run and test counts; no Rust toolchain is installed on this host.
 
 ## Remaining Work (Priority Order)
 
-1. **Finish Milestone 5 (`m5/deepgram-live-dictation` -> PR #5)**:
-   - Run `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
-   - Finish/verify Deepgram Nova-3 WebSocket live streaming, anchored interim replacement, `CloseStream` final drain without duplicate insertion, EN/DE fail-closed Auto, DPAPI key seeding from `HKCU\Environment\DEEPGRAM_API_KEY`, and loopback WS tests.
-   - Open PR #5, get Linux + Windows CI green, merge to `main`.
+1. **Review Milestone 5 (`m5/deepgram-live-dictation` -> PR #5)**:
+   - Review the implementation and verification evidence in PR #5, then merge to `main` when authorized.
+   - The implementation run stops after opening the PR; it does not merge or wait on the PR-triggered CI run.
 
 2. **RAM-Diet Pass (M5.5 -> PR #6, HIGH PRIORITY — user measured ~130 MB vs Zig's ~30 MB on Windows + Intel Arc)**:
    - Target: **~65–85 MB active / ~40–55 MB minimized** while keeping GPUI + `gpui-kit`.

@@ -3,8 +3,19 @@ use crate::palette::{
     PaletteCatalogContext, PaletteCommand, PaletteEntry, PaletteEntryKind, PaletteFilterInput,
     PaletteMode, PaletteSection, PaletteState, build_palette_items, filter_palette,
 };
-use crate::timeline::{TimelineItem, build_timeline_items, extract_links_and_media};
+use crate::sync_bridge::{HubConnectionStatus, SyncBridge, SyncCommand, SyncEvent};
+use crate::timeline::{
+    TimelineItem, TimelineOptions, build_timeline_items_with_options, extract_links_and_media,
+};
+use postbox_core::archive::{
+    ArchiveStatus, ArchiveTable, PendingArchiveIntent, archive_baseline, unix_seconds,
+};
 use postbox_core::dictation::DictationLanguage;
+use postbox_core::drafts::validate_draft_text;
+use postbox_core::outbox::{OutboxRecord, generate_client_id};
+use postbox_core::read::{PendingReadQueue, ReadState, should_auto_mark_read};
+use postbox_core::threads::{can_broadcast, in_thread, local_thread_root, replies_fold};
+use postbox_core::views::{merge_order, save_order};
 use postbox_core::{
     Account, Chat, ChatKey, Draft, FontScale, Message, Provider, ReadStatus, ThemeChoice,
     UiSettings, ViewTab,
@@ -13,7 +24,7 @@ use postbox_keymap::{
     Action, CtrlBadgeState, InboxChord, Keymap, LatestChord, LatestChordOutcome,
     ctrl_a_selects_chats,
 };
-use postbox_store::{OutboxPhase, OutboxRecord, Store};
+use postbox_store::{MessageCursor, Store, StoreError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,6 +33,8 @@ const MAX_MESSAGES_QUERY: usize = 200;
 const MAX_FTS_HITS: usize = 20;
 const PAGE_STEP_CHATS: usize = 10;
 const PAGE_STEP_MESSAGES: usize = 10;
+const OLDER_PAGE_LIMIT: usize = 80;
+const MAX_HISTORY_MESSAGES: usize = 1000;
 
 /// Launch bundle passed from `postbox-app` to either desktop GPUI or headless mode.
 pub struct PostboxLaunchContext {
@@ -29,6 +42,8 @@ pub struct PostboxLaunchContext {
     pub keymap: Keymap,
     pub version: String,
     pub started_at: Instant,
+    pub hub_status: HubConnectionStatus,
+    pub sync_bridge: Option<SyncBridge>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +51,8 @@ pub enum FocusTarget {
     ChatList,
     MessageList,
     Composer,
+    ThreadComposer,
+    ThreadBroadcast,
     Palette,
     ShortcutsOverlay,
 }
@@ -43,19 +60,23 @@ pub enum FocusTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarChatRow {
     pub chat: Chat,
+    pub archive_status: ArchiveStatus,
     pub draft_preview: Option<String>,
     pub bulk_selected: bool,
     pub active: bool,
     pub slot_badge: Option<u8>,
 }
 
-fn provider_sort_rank(provider: Provider) -> u8 {
-    match provider {
-        Provider::Whatsapp => 0,
-        Provider::Slack => 1,
-        Provider::Telegram => 2,
-        Provider::Signal => 3,
-    }
+#[derive(Debug, Clone)]
+pub struct ThreadPanelState {
+    pub chat: ChatKey,
+    pub root_msg_id: String,
+    pub messages: Vec<Message>,
+    pub timeline_items: Vec<TimelineItem>,
+    pub composer_text: String,
+    pub broadcast: bool,
+    pub focus_on_broadcast: bool,
+    pub exhausted: bool,
 }
 
 fn now_epoch_secs() -> i64 {
@@ -95,6 +116,15 @@ fn format_utc_rfc3339(epoch_secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+fn new_client_id(seq: &mut u64) -> String {
+    *seq = seq.saturating_add(1);
+    if let Ok(cid) = generate_client_id() {
+        return cid;
+    }
+    let now = now_epoch_millis() as u64;
+    format!("{now:016x}{:016x}", *seq)
+}
+
 /// Pure headless view-model/controller driving Postbox UI state from `Store` and `Keymap`.
 /// Compiles and executes without GPU on both Linux and Windows.
 pub struct PostboxViewModel {
@@ -102,14 +132,24 @@ pub struct PostboxViewModel {
     keymap: Keymap,
     version: String,
 
+    hub_status: HubConnectionStatus,
+    sync_cmd_tx: Option<async_channel::Sender<SyncCommand>>,
+    emitted_sync_commands: Vec<SyncCommand>,
+
     theme: ThemeChoice,
     font_scale: FontScale,
     view_order: Vec<String>,
-    show_archived_inline: bool,
+    show_archived_by_view: BTreeMap<String, bool>,
+    view_selected_chat: BTreeMap<String, ChatKey>,
     dictation_language: DictationLanguage,
     playback_speed_pct: u16,
-    slack_threads_enabled: bool,
-    slack_reply_style: bool,
+    slack_threads_by_account: BTreeMap<String, bool>,
+    replies_fold_by_chat: BTreeMap<ChatKey, bool>,
+
+    archive_table: ArchiveTable,
+    read_state: ReadState,
+    pending_reads: PendingReadQueue,
+    user_viewed: bool,
 
     active_view: Option<ViewTab>,
     accounts: Vec<Account>,
@@ -123,10 +163,15 @@ pub struct PostboxViewModel {
     drafts: BTreeMap<ChatKey, Draft>,
 
     messages: Vec<Message>,
+    loaded_message_limit: usize,
+    outbox_for_chat: Vec<OutboxRecord>,
     timeline_items: Vec<TimelineItem>,
     selected_message_idx: Option<usize>,
     marked_messages: BTreeSet<String>,
     reply_to_msg_id: Option<String>,
+    exhausted_chats: BTreeSet<ChatKey>,
+
+    thread_panel: Option<ThreadPanelState>,
 
     composer_text: String,
     focus: FocusTarget,
@@ -149,26 +194,42 @@ impl PostboxViewModel {
     /// Creates a ViewModel before any view is active (`window_title() == "Postbox v<ver>"`).
     pub fn new_uninitialized(store: Store, keymap: Keymap, version: impl Into<String>) -> Self {
         let settings = store.load_ui_settings().unwrap_or_default();
+        let archive_table = store.load_archive_table().unwrap_or_default();
+        let read_state = store.load_read_state().unwrap_or_default();
+        let pending_reads = store.load_pending_reads().unwrap_or_default();
         let mut drafts = BTreeMap::new();
         if let Ok(loaded) = store.list_drafts() {
             for draft in loaded {
-                if !draft.text_body.is_empty() {
+                if !draft.text_body.is_empty() || draft.staged_image_path.is_some() {
                     drafts.insert(draft.chat.clone(), draft);
                 }
             }
         }
+        let mut show_archived_by_view = BTreeMap::new();
+        if settings.show_archived {
+            show_archived_by_view.insert("all".to_owned(), true);
+        }
+
         Self {
             store,
             keymap,
             version: version.into(),
+            hub_status: HubConnectionStatus::default(),
+            sync_cmd_tx: None,
+            emitted_sync_commands: Vec::new(),
             theme: settings.theme,
             font_scale: settings.font_scale,
             view_order: settings.view_order,
-            show_archived_inline: settings.show_archived,
+            show_archived_by_view,
+            view_selected_chat: BTreeMap::new(),
             dictation_language: DictationLanguage::Automatic,
             playback_speed_pct: 100,
-            slack_threads_enabled: true,
-            slack_reply_style: false,
+            slack_threads_by_account: BTreeMap::new(),
+            replies_fold_by_chat: BTreeMap::new(),
+            archive_table,
+            read_state,
+            pending_reads,
+            user_viewed: false,
             active_view: None,
             accounts: Vec::new(),
             show_archived_only: false,
@@ -179,10 +240,14 @@ impl PostboxViewModel {
             bulk_selected: BTreeSet::new(),
             drafts,
             messages: Vec::new(),
+            loaded_message_limit: MAX_MESSAGES_QUERY,
+            outbox_for_chat: Vec::new(),
             timeline_items: Vec::new(),
             selected_message_idx: None,
             marked_messages: BTreeSet::new(),
             reply_to_msg_id: None,
+            exhausted_chats: BTreeSet::new(),
+            thread_panel: None,
             composer_text: String::new(),
             focus: FocusTarget::ChatList,
             palette: PaletteState::default(),
@@ -201,12 +266,126 @@ impl PostboxViewModel {
     }
 
     /// Creates a fully initialized ViewModel with `CombinedInbox` active, accounts ordered,
-    /// chats loaded, and initial chat messages populated.
+    /// chats loaded, and initial chat messages populated (`user_viewed` remains `false`).
     pub fn new(store: Store, keymap: Keymap, version: impl Into<String>) -> Self {
         let mut vm = Self::new_uninitialized(store, keymap, version);
         vm.active_view = Some(ViewTab::CombinedInbox);
         vm.refresh_all();
         vm
+    }
+
+    pub fn with_hub_status(mut self, status: HubConnectionStatus) -> Self {
+        self.set_hub_status(status);
+        self
+    }
+
+    pub fn attach_sync_sender(&mut self, tx: async_channel::Sender<SyncCommand>) {
+        self.sync_cmd_tx = Some(tx);
+    }
+
+    pub fn take_emitted_sync_commands(&mut self) -> Vec<SyncCommand> {
+        std::mem::take(&mut self.emitted_sync_commands)
+    }
+
+    fn emit_sync_command(&mut self, cmd: SyncCommand) {
+        if let Some(tx) = &self.sync_cmd_tx {
+            let _ = tx.try_send(cmd.clone());
+        }
+        if self.emitted_sync_commands.len() >= 128 {
+            self.emitted_sync_commands.remove(0);
+        }
+        self.emitted_sync_commands.push(cmd);
+    }
+
+    pub fn hub_status(&self) -> &HubConnectionStatus {
+        &self.hub_status
+    }
+
+    pub fn set_hub_status(&mut self, status: HubConnectionStatus) {
+        self.hub_status = status;
+        if self.palette.open {
+            self.rebuild_palette_entries();
+        }
+    }
+
+    /// Applies a `SyncEvent` pushed from the background Tokio Hub worker.
+    /// Returns the number of prepended timeline items (for scroll anchor preservation) when applicable.
+    pub fn apply_sync_event(&mut self, event: SyncEvent) -> usize {
+        match event {
+            SyncEvent::StatusChanged(status) => {
+                self.set_hub_status(status);
+                0
+            }
+            SyncEvent::ChatsUpdated { .. } => {
+                // Reload persisted archive rules and read watermarks written by the sync worker.
+                if let Ok(table) = self.store.load_archive_table() {
+                    self.archive_table = table;
+                }
+                if let Ok(rs) = self.store.load_read_state() {
+                    self.read_state = rs;
+                }
+                // Background refresh MUST NOT trigger user_viewed auto mark-read!
+                let prev_user_viewed = self.user_viewed;
+                self.user_viewed = false;
+                self.refresh_accounts();
+                self.refresh_chats();
+                self.user_viewed = prev_user_viewed;
+                if self.palette.open {
+                    self.rebuild_palette_entries();
+                }
+                0
+            }
+            SyncEvent::MessagesUpdated {
+                chat,
+                prepended,
+                exhausted,
+            } => {
+                if exhausted {
+                    self.exhausted_chats.insert(chat.clone());
+                }
+                let is_open = self.selected_chat().is_some_and(|c| c.key == chat);
+                let mut timeline_prepended = 0usize;
+                if is_open {
+                    if prepended > 0 {
+                        self.loaded_message_limit = self
+                            .loaded_message_limit
+                            .saturating_add(prepended)
+                            .min(MAX_HISTORY_MESSAGES);
+                    }
+                    let old_len = self.timeline_items.len();
+                    self.refresh_messages();
+                    if prepended > 0 && self.timeline_items.len() > old_len {
+                        timeline_prepended = self.timeline_items.len() - old_len;
+                    }
+                    if self.user_viewed {
+                        self.maybe_mark_selected_chat_read();
+                    }
+                }
+                if self.thread_panel.as_ref().is_some_and(|p| p.chat == chat) {
+                    if let Some(panel) = &mut self.thread_panel {
+                        panel.exhausted |= exhausted;
+                    }
+                    self.refresh_thread_panel_messages();
+                }
+                timeline_prepended
+            }
+            SyncEvent::OutboxUpdated { chat, notice } => {
+                if let Some(n) = notice {
+                    self.status_notice = Some(n);
+                }
+                if self.selected_chat().is_some_and(|c| c.key == chat) {
+                    self.refresh_messages();
+                }
+                if self.thread_panel.as_ref().is_some_and(|p| p.chat == chat) {
+                    self.refresh_thread_panel_messages();
+                }
+                0
+            }
+            SyncEvent::Notice(msg) => {
+                self.status_notice = Some(msg);
+                0
+            }
+        }
     }
 
     pub fn store(&self) -> &Store {
@@ -241,6 +420,13 @@ impl PostboxViewModel {
         self.active_view.as_ref()
     }
 
+    pub fn active_view_key(&self) -> String {
+        self.active_view
+            .as_ref()
+            .map(ViewTab::view_key)
+            .unwrap_or_else(|| "all".to_owned())
+    }
+
     pub fn accounts(&self) -> &[Account] {
         &self.accounts
     }
@@ -265,6 +451,10 @@ impl PostboxViewModel {
         &self.messages
     }
 
+    pub fn outbox_for_chat(&self) -> &[OutboxRecord] {
+        &self.outbox_for_chat
+    }
+
     pub fn timeline_items(&self) -> &[TimelineItem] {
         &self.timeline_items
     }
@@ -278,12 +468,43 @@ impl PostboxViewModel {
             .and_then(|idx| self.messages.get(idx))
     }
 
+    pub fn thread_panel(&self) -> Option<&ThreadPanelState> {
+        self.thread_panel.as_ref()
+    }
+
+    pub fn archive_table(&self) -> &ArchiveTable {
+        &self.archive_table
+    }
+
+    pub fn read_state(&self) -> &ReadState {
+        &self.read_state
+    }
+
+    pub fn pending_reads(&self) -> &PendingReadQueue {
+        &self.pending_reads
+    }
+
+    pub fn user_viewed(&self) -> bool {
+        self.user_viewed
+    }
+
     pub fn focus(&self) -> FocusTarget {
         self.focus
     }
 
     pub fn set_focus(&mut self, focus: FocusTarget) {
         self.focus = focus;
+        if let Some(panel) = &mut self.thread_panel {
+            match focus {
+                FocusTarget::ThreadComposer => panel.focus_on_broadcast = false,
+                FocusTarget::ThreadBroadcast => panel.focus_on_broadcast = true,
+                _ => {}
+            }
+        }
+        if focus == FocusTarget::Composer {
+            self.user_viewed = true;
+            self.maybe_mark_selected_chat_read();
+        }
     }
 
     pub fn composer_focused(&self) -> bool {
@@ -293,6 +514,8 @@ impl PostboxViewModel {
     pub fn set_composer_focused(&mut self, focused: bool) {
         if focused {
             self.focus = FocusTarget::Composer;
+            self.user_viewed = true;
+            self.maybe_mark_selected_chat_read();
         } else if self.focus == FocusTarget::Composer {
             self.focus = FocusTarget::ChatList;
         }
@@ -303,8 +526,67 @@ impl PostboxViewModel {
     }
 
     pub fn set_composer_text(&mut self, text: impl Into<String>) {
-        self.composer_text = text.into();
+        let mut next = text.into();
+        if next.as_bytes().contains(&0) {
+            next = next.replace('\0', "");
+        }
+        if validate_draft_text(&next).is_err() {
+            let mut end = postbox_core::drafts::MAX_DRAFT_TEXT_BYTES.min(next.len());
+            while end > 0 && !next.is_char_boundary(end) {
+                end -= 1;
+            }
+            next.truncate(end);
+        }
+        self.composer_text = next;
         self.persist_active_draft();
+    }
+
+    /// Origin-scoped async text append (`drafts.zig:89-100`): appends text to `origin_chat`
+    /// without ever leaking into another chat if the user has switched away.
+    /// Returns `true` if `origin_chat` is currently open and live `composer_text` was updated.
+    pub fn append_to_chat_draft(&mut self, origin_chat: &ChatKey, text: &str) -> bool {
+        let is_open = self.selected_chat().is_some_and(|c| &c.key == origin_chat);
+        let prev = if is_open {
+            self.composer_text.clone()
+        } else {
+            self.drafts
+                .get(origin_chat)
+                .map(|d| d.text_body.clone())
+                .unwrap_or_default()
+        };
+        let combined = if !prev.is_empty() && !text.is_empty() {
+            format!("{prev} {text}")
+        } else {
+            format!("{prev}{text}")
+        };
+        if validate_draft_text(&combined).is_err() {
+            return false;
+        }
+        let draft = Draft {
+            chat: origin_chat.clone(),
+            text_body: combined.clone(),
+            reply_to_id: self
+                .drafts
+                .get(origin_chat)
+                .and_then(|d| d.reply_to_id.clone()),
+            staged_image_path: self
+                .drafts
+                .get(origin_chat)
+                .and_then(|d| d.staged_image_path.clone()),
+            updated_at: now_epoch_secs(),
+        };
+        if self.store.save_draft(&draft).is_ok() {
+            self.drafts.insert(origin_chat.clone(), draft);
+            if is_open {
+                self.composer_text = combined;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn draft_for_chat(&self, chat: &ChatKey) -> Option<&Draft> {
+        self.drafts.get(chat)
     }
 
     pub fn reply_to_msg_id(&self) -> Option<&str> {
@@ -320,7 +602,11 @@ impl PostboxViewModel {
     }
 
     pub fn show_archived_inline(&self) -> bool {
-        self.show_archived_inline
+        let key = self.active_view_key();
+        if let Some(&cached) = self.show_archived_by_view.get(&key) {
+            return cached;
+        }
+        self.store.get_view_show_archived(&key).unwrap_or(false)
     }
 
     pub fn show_archived_only(&self) -> bool {
@@ -364,11 +650,13 @@ impl PostboxViewModel {
     }
 
     pub fn window_title(&self) -> String {
+        let hub_notice = self.hub_status.title_notice();
+        let notice = self.title_notice.as_deref().or(hub_notice.as_deref());
         ViewTab::window_title_with_status(
             self.active_view.as_ref(),
             &self.version,
             self.marked_messages.len(),
-            self.title_notice.as_deref(),
+            notice,
         )
     }
 
@@ -390,6 +678,16 @@ impl PostboxViewModel {
         self.ctrl_badges.on_blur()
     }
 
+    pub fn chat_archive_status(&self, chat: &Chat) -> ArchiveStatus {
+        if self.archive_table.get(&chat.key).is_some() {
+            self.archive_table.status(&chat.key, chat.archived_remote)
+        } else if chat.is_archived() {
+            ArchiveStatus::Archived
+        } else {
+            ArchiveStatus::Incoming
+        }
+    }
+
     pub fn sidebar_rows(&self) -> Vec<SidebarChatRow> {
         let show_badges = self.ctrl_badges.visible();
         self.chats
@@ -399,10 +697,12 @@ impl PostboxViewModel {
                 let draft_preview = self
                     .drafts
                     .get(&chat.key)
-                    .filter(|d| !d.text_body.trim().is_empty())
+                    .filter(|d| !d.text_body.is_empty())
                     .map(Draft::sidebar_preview);
+                let archive_status = self.chat_archive_status(chat);
                 SidebarChatRow {
                     chat: chat.clone(),
+                    archive_status,
                     draft_preview,
                     bulk_selected: self.bulk_selected.contains(&chat.key),
                     active: self.selected_chat_idx == Some(idx),
@@ -421,7 +721,7 @@ impl PostboxViewModel {
             theme: self.theme,
             font_scale: self.font_scale,
             view_order: self.view_order.clone(),
-            show_archived: self.show_archived_inline,
+            show_archived: self.show_archived_inline(),
         };
         let _ = self.store.save_ui_settings(&settings);
     }
@@ -456,33 +756,33 @@ impl PostboxViewModel {
         self.refresh_count = self.refresh_count.saturating_add(1);
     }
 
+    pub fn request_hub_refresh(&mut self) {
+        self.refresh_all();
+        let open_chat = self.selected_chat().map(|c| c.key.clone());
+        self.emit_sync_command(SyncCommand::RefreshAll { open_chat });
+    }
+
+    pub fn request_restart_live_sync(&mut self) {
+        self.sync_requested = true;
+        self.status_notice = Some("Restarting live sync...".into());
+        self.emit_sync_command(SyncCommand::RestartLiveSync);
+    }
+
+    /// Merges live accounts with `view_order`, preserving absent/drained saved accounts in exact `Alt+2..9` slots.
     pub fn refresh_accounts(&mut self) {
-        let mut accounts = self.store.list_accounts().unwrap_or_default();
-        let saved_order = &self.view_order;
-        accounts.sort_by(|a, b| {
-            let pos_a = saved_order.iter().position(|k| k == &a.view_key());
-            let pos_b = saved_order.iter().position(|k| k == &b.view_key());
-            match (pos_a, pos_b) {
-                (Some(ia), Some(ib)) => ia.cmp(&ib),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => provider_sort_rank(a.provider)
-                    .cmp(&provider_sort_rank(b.provider))
-                    .then_with(|| a.sort_order.cmp(&b.sort_order))
-                    .then_with(|| a.label.cmp(&b.label)),
-            }
-        });
-        self.accounts = accounts;
+        let live_accounts = self.store.list_accounts().unwrap_or_default();
+        self.accounts = merge_order(&self.view_order, &live_accounts);
     }
 
     pub fn refresh_chats(&mut self) {
         let prev_key = self.selected_chat().map(|c| c.key.clone());
         let view = self.active_view.clone().unwrap_or(ViewTab::CombinedInbox);
+        let include_archived = self.show_archived_inline();
         let mut chats = self
             .store
             .list_chats_filtered(
                 &view,
-                self.show_archived_inline,
+                include_archived,
                 self.show_archived_only,
                 self.unread_only,
                 MAX_CHATS_QUERY,
@@ -499,10 +799,22 @@ impl PostboxViewModel {
 
         self.chats = chats;
 
+        let view_key = view.view_key();
+        let remembered = self
+            .view_selected_chat
+            .get(&view_key)
+            .cloned()
+            .or_else(|| self.store.get_view_selected_chat(&view_key).ok().flatten());
+
         let fallback = (!self.chats.is_empty()).then_some(0);
         let new_idx = prev_key
             .as_ref()
             .and_then(|key| self.chats.iter().position(|c| &c.key == key))
+            .or_else(|| {
+                remembered
+                    .as_ref()
+                    .and_then(|key| self.chats.iter().position(|c| &c.key == key))
+            })
             .or(fallback);
 
         let chat_changed =
@@ -510,16 +822,45 @@ impl PostboxViewModel {
 
         self.selected_chat_idx = new_idx;
         if chat_changed {
-            self.load_active_draft();
+            self.loaded_message_limit = MAX_MESSAGES_QUERY;
             self.reply_to_msg_id = None;
             self.marked_messages.clear();
+            self.close_thread_panel();
+            self.load_active_draft();
         }
         self.refresh_messages();
     }
 
+    fn effective_replies_fold(&self, chat: &Chat) -> bool {
+        if let Some(&override_val) = self.replies_fold_by_chat.get(&chat.key) {
+            return override_val;
+        }
+        if let Ok(Some(saved)) = self.store.get_chat_replies_fold(&chat.key) {
+            return saved;
+        }
+        if chat.key.provider == Provider::Slack {
+            let acc_enabled = self
+                .slack_threads_by_account
+                .get(&chat.key.account)
+                .copied()
+                .unwrap_or_else(|| {
+                    self.store
+                        .get_account_slack_threads(Provider::Slack, &chat.key.account)
+                        .unwrap_or(true)
+                });
+            return acc_enabled;
+        }
+        replies_fold(None, chat.key.provider)
+    }
+
+    pub fn chat_folds_replies(&self, chat: &Chat) -> bool {
+        self.effective_replies_fold(chat)
+    }
+
     pub fn refresh_messages(&mut self) {
-        let Some(chat_key) = self.selected_chat().map(|c| c.key.clone()) else {
+        let Some(chat) = self.selected_chat().cloned() else {
             self.messages.clear();
+            self.outbox_for_chat.clear();
             self.timeline_items.clear();
             self.selected_message_idx = None;
             return;
@@ -528,7 +869,11 @@ impl PostboxViewModel {
         let prev_msg_id = self.selected_message().map(|m| m.msg_id.clone());
         self.messages = self
             .store
-            .list_messages(&chat_key, MAX_MESSAGES_QUERY, None)
+            .list_messages(&chat.key, self.loaded_message_limit, None)
+            .unwrap_or_default();
+        self.outbox_for_chat = self
+            .store
+            .list_outbox_for_chat(&chat.key)
             .unwrap_or_default();
 
         self.selected_message_idx = prev_msg_id
@@ -540,10 +885,26 @@ impl PostboxViewModel {
     }
 
     fn rebuild_timeline(&mut self) {
-        self.timeline_items = build_timeline_items(
+        let Some(chat) = self.selected_chat() else {
+            self.timeline_items.clear();
+            return;
+        };
+        let fold = self.effective_replies_fold(chat);
+        let outbox_map: BTreeMap<String, &OutboxRecord> = self
+            .outbox_for_chat
+            .iter()
+            .map(|r| (r.client_id.clone(), r))
+            .collect();
+        self.timeline_items = build_timeline_items_with_options(
             &self.messages,
             self.selected_message_idx,
             &self.marked_messages,
+            &TimelineOptions {
+                provider: chat.key.provider,
+                is_group: chat.is_group,
+                fold_replies: fold,
+                outbox_by_client_id: &outbox_map,
+            },
         );
     }
 
@@ -551,7 +912,12 @@ impl PostboxViewModel {
         let Some(chat_key) = self.selected_chat().map(|c| c.key.clone()) else {
             return;
         };
-        if self.composer_text.trim().is_empty() {
+        let existing_staged = self
+            .drafts
+            .get(&chat_key)
+            .and_then(|d| d.staged_image_path.clone());
+        // IGSH-497: preserve whitespace-only drafts; only delete when truly empty and no staged image.
+        if self.composer_text.is_empty() && existing_staged.is_none() {
             self.drafts.remove(&chat_key);
             let _ = self.store.delete_draft(&chat_key);
         } else {
@@ -559,11 +925,12 @@ impl PostboxViewModel {
                 chat: chat_key.clone(),
                 text_body: self.composer_text.clone(),
                 reply_to_id: self.reply_to_msg_id.clone(),
-                staged_image_path: None,
+                staged_image_path: existing_staged,
                 updated_at: now_epoch_secs(),
             };
-            let _ = self.store.save_draft(&draft);
-            self.drafts.insert(chat_key, draft);
+            if self.store.save_draft(&draft).is_ok() {
+                self.drafts.insert(chat_key, draft);
+            }
         }
     }
 
@@ -580,19 +947,72 @@ impl PostboxViewModel {
         }
     }
 
+    fn maybe_mark_selected_chat_read(&mut self) {
+        let Some(mut chat) = self.selected_chat().cloned() else {
+            return;
+        };
+        let has_unread = chat.unread_count > 0 || self.read_state.is_unread(&chat.key);
+        if !should_auto_mark_read(self.user_viewed, has_unread) {
+            return;
+        }
+        let newest_ts = self
+            .messages
+            .iter()
+            .rev()
+            .find_map(|m| unix_seconds(&m.ts))
+            .or_else(|| unix_seconds(&chat.last_msg_ts))
+            .unwrap_or_else(now_epoch_secs);
+
+        if self.read_state.mark_read(&chat.key, newest_ts) {
+            let wm = self.read_state.get(&chat.key);
+            let _ = self.store.upsert_read_watermark(&chat.key, &wm);
+        }
+
+        if chat.unread_count > 0 {
+            chat.unread_count = 0;
+            let _ = self.store.upsert_chat(&chat, now_epoch_secs());
+            if let Some(idx) = self.selected_chat_idx
+                && let Some(row) = self.chats.get_mut(idx)
+                && row.key == chat.key
+            {
+                row.unread_count = 0;
+            }
+        }
+
+        if self.pending_reads.enqueue(chat.key.clone()) {
+            let _ = self.store.save_pending_reads(&self.pending_reads);
+            self.emit_sync_command(SyncCommand::WakeMarkRead);
+        }
+    }
+
     pub fn select_chat_index(&mut self, idx: usize) -> bool {
         if idx >= self.chats.len() {
             return false;
         }
+        self.user_viewed = true;
         if self.selected_chat_idx == Some(idx) {
+            self.maybe_mark_selected_chat_read();
             return true;
         }
         self.persist_active_draft();
         self.selected_chat_idx = Some(idx);
+        let key = self.chats[idx].key.clone();
+        let view_key = self.active_view_key();
+        self.view_selected_chat
+            .insert(view_key.clone(), key.clone());
+        let _ = self.store.set_view_selected_chat(&view_key, Some(&key));
+
+        self.loaded_message_limit = MAX_MESSAGES_QUERY;
         self.reply_to_msg_id = None;
         self.marked_messages.clear();
+        self.close_thread_panel();
         self.load_active_draft();
         self.refresh_messages();
+        self.maybe_mark_selected_chat_read();
+        self.emit_sync_command(SyncCommand::FetchChatMessages {
+            chat: key,
+            limit: OLDER_PAGE_LIMIT,
+        });
         self.scroll_to_latest_pending = true;
         true
     }
@@ -601,12 +1021,15 @@ impl PostboxViewModel {
         if let Some(idx) = self.chats.iter().position(|c| &c.key == key) {
             return self.select_chat_index(idx);
         }
-        // Chat might be in another view or archived: switch to Combined Inbox and reveal if needed.
         if let Ok(Some(chat)) = self.store.get_chat(key) {
             self.active_view = Some(ViewTab::CombinedInbox);
             self.search_filter.clear();
             self.unread_only = false;
             self.show_archived_only = chat.is_archived();
+            if !chat.is_archived() && chat.unread_count == 0 && self.show_archived_inline() {
+                self.show_archived_by_view.insert("all".to_owned(), false);
+                let _ = self.store.set_view_show_archived("all", false);
+            }
             self.refresh_chats();
             if let Some(idx) = self.chats.iter().position(|c| &c.key == key) {
                 return self.select_chat_index(idx);
@@ -685,8 +1108,20 @@ impl PostboxViewModel {
         self.select_chat_index(target);
     }
 
+    fn save_current_view_selection(&mut self) {
+        let view_key = self.active_view_key();
+        if let Some(chat) = self.selected_chat() {
+            let key = chat.key.clone();
+            self.view_selected_chat
+                .insert(view_key.clone(), key.clone());
+            let _ = self.store.set_view_selected_chat(&view_key, Some(&key));
+        }
+    }
+
     pub fn switch_to_combined_inbox(&mut self) {
         self.persist_active_draft();
+        self.save_current_view_selection();
+        self.user_viewed = false;
         self.active_view = Some(ViewTab::CombinedInbox);
         self.show_archived_only = false;
         self.bulk_selected.clear();
@@ -703,6 +1138,8 @@ impl PostboxViewModel {
             return false;
         };
         self.persist_active_draft();
+        self.save_current_view_selection();
+        self.user_viewed = false;
         self.active_view = Some(account.to_view_tab());
         self.show_archived_only = false;
         self.bulk_selected.clear();
@@ -725,6 +1162,8 @@ impl PostboxViewModel {
             return false;
         };
         self.persist_active_draft();
+        self.save_current_view_selection();
+        self.user_viewed = false;
         self.active_view = Some(account.to_view_tab());
         self.show_archived_only = false;
         self.bulk_selected.clear();
@@ -735,6 +1174,7 @@ impl PostboxViewModel {
 
     pub fn toggle_unread_only(&mut self) {
         self.unread_only = !self.unread_only;
+        self.user_viewed = false;
         self.refresh_chats();
         self.status_notice = Some(if self.unread_only {
             "Showing unread chats".into()
@@ -744,10 +1184,14 @@ impl PostboxViewModel {
     }
 
     pub fn toggle_archived_inline(&mut self) {
-        self.show_archived_inline = !self.show_archived_inline;
+        let view_key = self.active_view_key();
+        let next = !self.show_archived_inline();
+        self.show_archived_by_view.insert(view_key.clone(), next);
+        let _ = self.store.set_view_show_archived(&view_key, next);
         self.persist_ui_settings();
+        self.user_viewed = false;
         self.refresh_chats();
-        self.status_notice = Some(if self.show_archived_inline {
+        self.status_notice = Some(if next {
             "Archived chats shown in this view".into()
         } else {
             "Archived chats hidden in this view".into()
@@ -756,6 +1200,7 @@ impl PostboxViewModel {
 
     pub fn toggle_archived_only(&mut self) {
         self.show_archived_only = !self.show_archived_only;
+        self.user_viewed = false;
         self.refresh_chats();
         self.status_notice = Some(if self.show_archived_only {
             "Showing archived chats".into()
@@ -765,41 +1210,113 @@ impl PostboxViewModel {
     }
 
     pub fn select_all_chats(&mut self) {
-        let text_focused = matches!(self.focus, FocusTarget::Composer | FocusTarget::Palette);
+        let text_focused = matches!(
+            self.focus,
+            FocusTarget::Composer | FocusTarget::Palette | FocusTarget::ThreadComposer
+        );
         let compose_focused = self.focus == FocusTarget::Composer;
         let compose_empty = self.composer_text.is_empty();
         if !ctrl_a_selects_chats(text_focused, compose_focused, compose_empty) {
             return;
         }
         self.bulk_selected = self.chats.iter().map(|c| c.key.clone()).collect();
-        self.status_notice = Some(format!("{} chats selected", self.bulk_selected.len()));
+        self.status_notice = Some(format!(
+            "{} chats selected - Ctrl+E archives, Esc cancels",
+            self.bulk_selected.len()
+        ));
+    }
+
+    pub fn cancel_bulk_selection(&mut self) {
+        if !self.bulk_selected.is_empty() {
+            self.bulk_selected.clear();
+            self.status_notice = Some("Selection cleared".into());
+        }
     }
 
     pub fn archive_selected(&mut self) {
+        let now_s = now_epoch_secs();
+        let now_ms = now_epoch_millis();
+        self.user_viewed = false;
+
         if !self.bulk_selected.is_empty() {
             let keys: Vec<ChatKey> = self.bulk_selected.iter().cloned().collect();
-            let now = now_epoch_secs();
+            let mut wake_wa = false;
             for key in &keys {
                 if let Ok(Some(mut chat)) = self.store.get_chat(key) {
+                    let baseline = archive_baseline(&chat.last_msg_ts, now_s);
+                    self.archive_table.archive(key, &baseline, false);
                     chat.archived_local = true;
-                    let _ = self.store.upsert_chat(&chat, now);
+                    let _ = self.store.upsert_chat(&chat, now_s);
+                    if let Some(entry) = self.archive_table.get(key) {
+                        let _ = self.store.upsert_archive_entry(entry);
+                    }
+                    if key.provider == Provider::Whatsapp {
+                        let _ = self.store.enqueue_pending_archive(
+                            key,
+                            PendingArchiveIntent::ArchivePending,
+                            now_ms,
+                        );
+                        wake_wa = true;
+                    }
                 }
             }
             let count = keys.len();
             self.bulk_selected.clear();
             self.refresh_chats();
+            if wake_wa {
+                self.emit_sync_command(SyncCommand::WakeArchive);
+            }
             self.status_notice = Some(format!("Archived {count} chats"));
             return;
         }
+
         let Some(mut chat) = self.selected_chat().cloned() else {
             return;
         };
-        let next_archived = !chat.is_archived();
-        chat.archived_local = next_archived;
-        if !next_archived {
+        let next_archived = !(self.show_archived_only || chat.is_archived());
+        if next_archived {
+            let baseline = archive_baseline(&chat.last_msg_ts, now_s);
+            self.archive_table.archive(&chat.key, &baseline, false);
+            chat.archived_local = true;
+            if let Some(entry) = self.archive_table.get(&chat.key) {
+                let _ = self.store.upsert_archive_entry(entry);
+            }
+            if chat.key.provider == Provider::Whatsapp {
+                let _ = self.store.enqueue_pending_archive(
+                    &chat.key,
+                    PendingArchiveIntent::ArchivePending,
+                    now_ms,
+                );
+                self.emit_sync_command(SyncCommand::WakeArchive);
+            }
+        } else {
+            if chat.key.provider == Provider::Whatsapp {
+                self.archive_table.return_to_inbox(&chat.key);
+                if let Some(entry) = self.archive_table.get(&chat.key) {
+                    let _ = self.store.upsert_archive_entry(entry);
+                }
+                let _ = self.store.enqueue_pending_archive(
+                    &chat.key,
+                    PendingArchiveIntent::UnarchivePending,
+                    now_ms,
+                );
+                self.emit_sync_command(SyncCommand::WakeArchive);
+            } else {
+                if chat.archived_remote {
+                    self.archive_table.set_local_unarchived(&chat.key);
+                    if let Some(entry) = self.archive_table.get(&chat.key) {
+                        let _ = self.store.upsert_archive_entry(entry);
+                    }
+                } else {
+                    self.archive_table.remove(&chat.key);
+                    let _ = self.store.delete_archive_entry(&chat.key);
+                }
+            }
+            chat.archived_local = false;
             chat.archived_remote = false;
         }
-        let _ = self.store.upsert_chat(&chat, now_epoch_secs());
+
+        let _ = self.store.upsert_chat(&chat, now_s);
         self.refresh_chats();
         self.status_notice = Some(if next_archived {
             format!("Archived {}", chat.title)
@@ -809,27 +1326,88 @@ impl PostboxViewModel {
     }
 
     pub fn keep_archived_selected(&mut self) {
+        let now_s = now_epoch_secs();
+        let now_ms = now_epoch_millis();
+        self.user_viewed = false;
+
+        if !self.bulk_selected.is_empty() {
+            let keys: Vec<ChatKey> = self.bulk_selected.iter().cloned().collect();
+            let mut wake_wa = false;
+            for key in &keys {
+                if let Ok(Some(mut chat)) = self.store.get_chat(key) {
+                    let baseline = archive_baseline(&chat.last_msg_ts, now_s);
+                    self.archive_table.archive(key, &baseline, true);
+                    chat.archived_local = true;
+                    let _ = self.store.upsert_chat(&chat, now_s);
+                    if let Some(entry) = self.archive_table.get(key) {
+                        let _ = self.store.upsert_archive_entry(entry);
+                    }
+                    if key.provider == Provider::Whatsapp {
+                        let _ = self.store.enqueue_pending_archive(
+                            key,
+                            PendingArchiveIntent::ArchivePending,
+                            now_ms,
+                        );
+                        wake_wa = true;
+                    }
+                }
+            }
+            let count = keys.len();
+            self.bulk_selected.clear();
+            self.refresh_chats();
+            if wake_wa {
+                self.emit_sync_command(SyncCommand::WakeArchive);
+            }
+            self.status_notice = Some(format!("Kept {count} chats archived"));
+            return;
+        }
+
         let Some(mut chat) = self.selected_chat().cloned() else {
             return;
         };
+        let baseline = archive_baseline(&chat.last_msg_ts, now_s);
+        self.archive_table.archive(&chat.key, &baseline, true);
         chat.archived_local = true;
-        let _ = self.store.upsert_chat(&chat, now_epoch_secs());
+        let _ = self.store.upsert_chat(&chat, now_s);
+        if let Some(entry) = self.archive_table.get(&chat.key) {
+            let _ = self.store.upsert_archive_entry(entry);
+        }
+        if chat.key.provider == Provider::Whatsapp {
+            let _ = self.store.enqueue_pending_archive(
+                &chat.key,
+                PendingArchiveIntent::ArchivePending,
+                now_ms,
+            );
+            self.emit_sync_command(SyncCommand::WakeArchive);
+        }
         self.refresh_chats();
         self.status_notice = Some(format!("Kept {} archived", chat.title));
     }
 
     pub fn toggle_pin_selected(&mut self) {
-        let Some(mut chat) = self.selected_chat().cloned() else {
+        let Some(chat) = self.selected_chat().cloned() else {
             return;
         };
-        chat.pinned = !chat.pinned;
-        let _ = self.store.upsert_chat(&chat, now_epoch_secs());
-        self.refresh_chats();
-        self.status_notice = Some(if chat.pinned {
-            format!("Pinned {}", chat.title)
+        let currently_pinned =
+            self.store.is_pinned(&chat.key).unwrap_or(chat.pinned) || chat.pinned;
+        if currently_pinned {
+            let _ = self.store.unpin_chat(&chat.key);
+            self.refresh_chats();
+            self.status_notice = Some(format!("Unpinned {}", chat.title));
         } else {
-            format!("Unpinned {}", chat.title)
-        });
+            match self.store.pin_chat(&chat.key, now_epoch_secs()) {
+                Ok(_) => {
+                    self.refresh_chats();
+                    self.status_notice = Some(format!("Pinned {}", chat.title));
+                }
+                Err(StoreError::PinLimitReached) => {
+                    self.status_notice = Some("Pin limit reached (16 chats)".into());
+                }
+                Err(_) => {
+                    self.status_notice = Some("Failed to pin chat".into());
+                }
+            }
+        }
     }
 
     pub fn select_message_index(&mut self, idx: usize) -> bool {
@@ -867,11 +1445,38 @@ impl PostboxViewModel {
         if self.messages.is_empty() {
             return;
         }
+        let at_top = self.selected_message_idx == Some(0);
+        if at_top {
+            self.request_older_messages();
+            return;
+        }
         let target = self
             .selected_message_idx
             .unwrap_or(self.messages.len() - 1)
             .saturating_sub(PAGE_STEP_MESSAGES);
         self.select_message_index(target);
+        if target == 0 {
+            self.request_older_messages();
+        }
+    }
+
+    pub fn request_older_messages(&mut self) -> bool {
+        let Some(chat) = self.selected_chat().map(|c| c.key.clone()) else {
+            return false;
+        };
+        if self.exhausted_chats.contains(&chat) || self.messages.len() >= MAX_HISTORY_MESSAGES {
+            return false;
+        }
+        let Some(oldest) = self.messages.first() else {
+            return false;
+        };
+        let cursor = MessageCursor::from_message(oldest).to_hub_before_cursor();
+        self.emit_sync_command(SyncCommand::FetchOlderMessages {
+            chat,
+            before_cursor: cursor,
+            limit: OLDER_PAGE_LIMIT,
+        });
+        true
     }
 
     pub fn page_down_messages(&mut self) {
@@ -903,41 +1508,237 @@ impl PostboxViewModel {
     }
 
     pub fn start_reply_selected(&mut self) {
-        if let Some(msg) = self.selected_message() {
-            self.reply_to_msg_id = Some(msg.msg_id.clone());
+        if let Some(msg) = self.selected_message().cloned() {
+            if let Some(chat) = self.selected_chat()
+                && self.effective_replies_fold(chat)
+                && chat.key.provider == Provider::Slack
+            {
+                let root = local_thread_root(&self.messages, &msg, chat.key.provider)
+                    .unwrap_or(msg.msg_id.as_str())
+                    .to_owned();
+                self.open_thread(&root);
+                return;
+            }
+            self.reply_to_msg_id = Some(msg.msg_id);
             self.focus = FocusTarget::Composer;
         }
     }
 
-    /// Submits the current composer text into the durable outbox and appends an optimistic
-    /// outgoing message to SQLite so the timeline updates immediately.
-    pub fn submit_composer_message(&mut self) -> bool {
-        let trimmed = self.composer_text.trim();
-        if trimmed.is_empty() {
-            return false;
-        }
-        let Some(mut chat) = self.selected_chat().cloned() else {
+    // -------------------------------------------------------------------------
+    // Right-Side Slack Thread Panel & Broadcast Toggle (IGSH-1898)
+    // -------------------------------------------------------------------------
+
+    pub fn open_thread_for_selected(&mut self) -> bool {
+        let Some(msg) = self.selected_message().cloned() else {
             return false;
         };
+        let Some(chat) = self.selected_chat().cloned() else {
+            return false;
+        };
+        let root = local_thread_root(&self.messages, &msg, chat.key.provider)
+            .unwrap_or(msg.msg_id.as_str())
+            .to_owned();
+        self.open_thread(&root)
+    }
 
-        self.local_send_seq = self.local_send_seq.saturating_add(1);
+    pub fn open_thread(&mut self, root_msg_id: &str) -> bool {
+        let Some(chat) = self.selected_chat().cloned() else {
+            return false;
+        };
+        if root_msg_id.is_empty() {
+            return false;
+        }
+        self.thread_panel = Some(ThreadPanelState {
+            chat: chat.key.clone(),
+            root_msg_id: root_msg_id.to_owned(),
+            messages: Vec::new(),
+            timeline_items: Vec::new(),
+            composer_text: String::new(),
+            broadcast: false,
+            focus_on_broadcast: false,
+            exhausted: self.exhausted_chats.contains(&chat.key),
+        });
+        self.refresh_thread_panel_messages();
+        self.focus = FocusTarget::ThreadComposer;
+        true
+    }
+
+    fn refresh_thread_panel_messages(&mut self) {
+        let Some(panel) = self.thread_panel.as_ref() else {
+            return;
+        };
+        let chat_key = panel.chat.clone();
+        let root_id = panel.root_msg_id.clone();
+        let is_group = self.selected_chat().is_some_and(|c| c.is_group);
+        let all_msgs = self
+            .store
+            .list_messages(&chat_key, MAX_HISTORY_MESSAGES, None)
+            .unwrap_or_default();
+        let thread_msgs: Vec<Message> = all_msgs
+            .iter()
+            .filter(|m| {
+                let parent = m.reply_to_id.as_deref().unwrap_or("");
+                in_thread(&m.msg_id, parent, &root_id)
+                    || local_thread_root(&all_msgs, m, chat_key.provider) == Some(root_id.as_str())
+            })
+            .cloned()
+            .collect();
+        let outbox = self
+            .store
+            .list_outbox_for_chat(&chat_key)
+            .unwrap_or_default();
+        let outbox_map: BTreeMap<String, &OutboxRecord> =
+            outbox.iter().map(|r| (r.client_id.clone(), r)).collect();
+        let items = build_timeline_items_with_options(
+            &thread_msgs,
+            None,
+            &self.marked_messages,
+            &TimelineOptions {
+                provider: chat_key.provider,
+                is_group,
+                fold_replies: false,
+                outbox_by_client_id: &outbox_map,
+            },
+        );
+        if let Some(panel) = &mut self.thread_panel {
+            panel.messages = thread_msgs;
+            panel.timeline_items = items;
+        }
+    }
+
+    pub fn close_thread_panel(&mut self) {
+        if let Some(mut panel) = self.thread_panel.take() {
+            panel.broadcast = false;
+            if matches!(
+                self.focus,
+                FocusTarget::ThreadComposer | FocusTarget::ThreadBroadcast
+            ) {
+                self.focus = FocusTarget::MessageList;
+            }
+        }
+    }
+
+    pub fn set_thread_composer_text(&mut self, text: impl Into<String>) {
+        if let Some(panel) = &mut self.thread_panel {
+            panel.composer_text = text.into();
+        }
+    }
+
+    pub fn set_thread_broadcast(&mut self, enabled: bool) {
+        let Some(panel) = &mut self.thread_panel else {
+            return;
+        };
+        if enabled && !can_broadcast(panel.chat.provider, Some(panel.root_msg_id.as_str()), false) {
+            panel.broadcast = false;
+            return;
+        }
+        panel.broadcast = enabled;
+    }
+
+    pub fn toggle_thread_broadcast(&mut self) {
+        if let Some(panel) = &self.thread_panel {
+            let next = !panel.broadcast;
+            self.set_thread_broadcast(next);
+        }
+    }
+
+    pub fn cycle_thread_focus(&mut self) {
+        let Some(panel) = &mut self.thread_panel else {
+            return;
+        };
+        if panel.chat.provider != Provider::Slack {
+            panel.focus_on_broadcast = false;
+            self.focus = FocusTarget::ThreadComposer;
+            return;
+        }
+        panel.focus_on_broadcast = !panel.focus_on_broadcast;
+        self.focus = if panel.focus_on_broadcast {
+            FocusTarget::ThreadBroadcast
+        } else {
+            FocusTarget::ThreadComposer
+        };
+    }
+
+    pub fn request_older_thread_messages(&mut self) -> bool {
+        let Some(panel) = self.thread_panel.as_ref() else {
+            return false;
+        };
+        if panel.exhausted {
+            return false;
+        }
+        let Some(oldest) = panel.messages.first() else {
+            return false;
+        };
+        let chat = panel.chat.clone();
+        let cursor = MessageCursor::from_message(oldest).to_hub_before_cursor();
+        self.emit_sync_command(SyncCommand::FetchOlderMessages {
+            chat,
+            before_cursor: cursor,
+            limit: OLDER_PAGE_LIMIT,
+        });
+        true
+    }
+
+    pub fn submit_thread_reply(&mut self) -> bool {
+        let (chat_key, root_msg_id, text, broadcast) = {
+            let Some(panel) = self.thread_panel.as_ref() else {
+                return false;
+            };
+            let trimmed = panel.composer_text.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+            let allow_bc = panel.broadcast
+                && can_broadcast(panel.chat.provider, Some(panel.root_msg_id.as_str()), false);
+            (
+                panel.chat.clone(),
+                panel.root_msg_id.clone(),
+                trimmed.to_owned(),
+                allow_bc,
+            )
+        };
+
+        let ok = self.enqueue_and_optimistic_send(&chat_key, &text, Some(root_msg_id), broadcast);
+        if ok {
+            if let Some(panel) = &mut self.thread_panel {
+                panel.composer_text.clear();
+                // IGSH-1898: auto-reset broadcast toggle after send!
+                panel.broadcast = false;
+            }
+            self.refresh_thread_panel_messages();
+        }
+        ok
+    }
+
+    fn enqueue_and_optimistic_send(
+        &mut self,
+        chat_key: &ChatKey,
+        trimmed: &str,
+        reply_to_id: Option<String>,
+        reply_broadcast: bool,
+    ) -> bool {
+        let Ok(Some(mut chat)) = self.store.get_chat(chat_key) else {
+            return false;
+        };
+        self.user_viewed = true;
+
         let now_ms = now_epoch_millis();
         let now_s = now_epoch_secs();
-        let client_id = format!("local-{now_ms}-{}", self.local_send_seq);
+        let client_id = new_client_id(&mut self.local_send_seq);
         let ts = format_utc_rfc3339(now_s);
 
-        let _ = self.store.enqueue_outbox(&OutboxRecord {
-            client_id: client_id.clone(),
-            chat: chat.key.clone(),
-            kind: "text".into(),
-            phase: OutboxPhase::Ready,
-            attempt_serial: 0,
-            text_body: trimmed.to_owned(),
-            reply_to_id: self.reply_to_msg_id.clone(),
-            reply_broadcast: false,
-            not_before_ms: now_ms,
-            created_at_ms: now_ms,
-        });
+        let rec = OutboxRecord::new_text(
+            client_id.clone(),
+            chat.key.clone(),
+            trimmed.to_owned(),
+            reply_to_id.clone(),
+            reply_broadcast,
+            now_ms,
+        );
+        if self.store.enqueue_outbox(&rec).is_err() {
+            self.status_notice = Some("Outbox full; retry or discard failed sends".into());
+            return false;
+        }
 
         let msg = Message {
             chat: chat.key.clone(),
@@ -947,8 +1748,8 @@ impl PostboxViewModel {
             from_me: true,
             ts: ts.clone(),
             body: trimmed.to_owned(),
-            reply_to_id: self.reply_to_msg_id.clone(),
-            reply_broadcast: false,
+            reply_to_id,
+            reply_broadcast,
             media_kind: None,
             mime_type: None,
             filename: None,
@@ -958,17 +1759,115 @@ impl PostboxViewModel {
         };
         let _ = self.store.upsert_message(&msg);
 
+        // Auto-unarchive on send for `.archived` (NOT `.kept_archived`, per main.zig:5925-5931).
+        if self.chat_archive_status(&chat) == ArchiveStatus::Archived {
+            chat.archived_local = false;
+            chat.archived_remote = false;
+            if chat.key.provider == Provider::Whatsapp {
+                self.archive_table.return_to_inbox(&chat.key);
+                if let Some(entry) = self.archive_table.get(&chat.key) {
+                    let _ = self.store.upsert_archive_entry(entry);
+                }
+                let _ = self.store.enqueue_pending_archive(
+                    &chat.key,
+                    PendingArchiveIntent::UnarchivePending,
+                    now_ms,
+                );
+                self.emit_sync_command(SyncCommand::WakeArchive);
+            } else {
+                self.archive_table.remove(&chat.key);
+                let _ = self.store.delete_archive_entry(&chat.key);
+            }
+        }
+
         chat.last_msg_ts = ts;
         chat.last_msg_preview = trimmed.to_owned();
         let _ = self.store.upsert_chat(&chat, now_s);
-
-        self.composer_text.clear();
-        self.reply_to_msg_id = None;
-        self.drafts.remove(&chat.key);
-        let _ = self.store.delete_draft(&chat.key);
-
+        self.emit_sync_command(SyncCommand::WakeOutbox);
         self.refresh_chats();
         self.scroll_to_latest_pending = true;
+        true
+    }
+
+    /// Submits the current composer text into the durable outbox and appends an optimistic
+    /// outgoing message to SQLite so the timeline updates immediately.
+    pub fn submit_composer_message(&mut self) -> bool {
+        let trimmed = self.composer_text.trim().to_owned();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let Some(chat_key) = self.selected_chat().map(|c| c.key.clone()) else {
+            return false;
+        };
+        let reply_to = self.reply_to_msg_id.clone();
+        if !self.enqueue_and_optimistic_send(&chat_key, &trimmed, reply_to, false) {
+            return false;
+        }
+        self.composer_text.clear();
+        self.reply_to_msg_id = None;
+        self.drafts.remove(&chat_key);
+        let _ = self.store.delete_draft(&chat_key);
+        true
+    }
+
+    /// Explicit user retry of a failed/held outbox message: mints a fresh 32-hex `client_id`
+    /// (`SendQueue.tla` `UserRetry`), updates the local optimistic row, and wakes the outbox worker.
+    pub fn retry_failed_message(&mut self, old_client_id: &str) -> bool {
+        let new_cid = new_client_id(&mut self.local_send_seq);
+        let now_ms = now_epoch_millis();
+        let Ok(updated) =
+            self.store
+                .user_retry_outbox_with_new_client_id(old_client_id, &new_cid, now_ms)
+        else {
+            return false;
+        };
+        let optimistic = Message {
+            chat: updated.chat.clone(),
+            msg_id: new_cid,
+            sender_id: "me".into(),
+            sender_name: "You".into(),
+            from_me: true,
+            ts: format_utc_rfc3339(now_epoch_secs()),
+            body: updated.text_body.clone(),
+            reply_to_id: updated.reply_to_id.clone(),
+            reply_broadcast: updated.reply_broadcast,
+            media_kind: None,
+            mime_type: None,
+            filename: None,
+            reactions: Vec::new(),
+            read_status: ReadStatus::Sending,
+            deleted: false,
+        };
+        let _ = self
+            .store
+            .replace_optimistic_message(&updated.chat, old_client_id, &optimistic);
+        self.emit_sync_command(SyncCommand::WakeOutbox);
+        self.refresh_messages();
+        self.status_notice = Some("Retrying message...".into());
+        true
+    }
+
+    pub fn retry_selected_failed_message(&mut self) -> bool {
+        let Some(msg) = self.selected_message().cloned() else {
+            return false;
+        };
+        self.retry_failed_message(&msg.msg_id)
+    }
+
+    pub fn delete_selected_message_for_everyone(&mut self) -> bool {
+        let Some(msg) = self.selected_message().cloned() else {
+            return false;
+        };
+        if !msg.from_me {
+            return false;
+        }
+        let client_id = new_client_id(&mut self.local_send_seq);
+        self.emit_sync_command(SyncCommand::DeleteMessage {
+            chat: msg.chat,
+            msg_id: msg.msg_id,
+            client_id,
+        });
+        self.status_notice = Some("Deleting message...".into());
         true
     }
 
@@ -1077,6 +1976,7 @@ impl PostboxViewModel {
         self.palette.query = query.to_owned();
         self.palette.selected_index = 0;
         if self.palette.mode == PaletteMode::SearchChats {
+            self.user_viewed = false;
             self.search_filter = query.trim().to_owned();
             self.refresh_chats();
         }
@@ -1131,7 +2031,8 @@ impl PostboxViewModel {
         }
         let target = target as usize;
         self.accounts.swap(pos, target);
-        self.view_order = self.accounts.iter().map(Account::view_key).collect();
+        self.view_order = save_order(&self.view_order, &self.accounts);
+        let _ = self.store.save_view_order(&self.view_order);
         self.persist_ui_settings();
         self.rebuild_palette_entries();
         if let Some(new_sel) = self.palette.entries.iter().position(|e| {
@@ -1146,18 +2047,37 @@ impl PostboxViewModel {
     }
 
     fn rebuild_palette_entries(&mut self) {
+        let selected_chat = self.selected_chat();
+        let slack_threads_enabled = selected_chat
+            .filter(|c| c.key.provider == Provider::Slack)
+            .map(|c| {
+                self.slack_threads_by_account
+                    .get(&c.key.account)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        self.store
+                            .get_account_slack_threads(Provider::Slack, &c.key.account)
+                            .unwrap_or(true)
+                    })
+            })
+            .unwrap_or(true);
+        let slack_reply_style = selected_chat
+            .map(|c| self.effective_replies_fold(c))
+            .unwrap_or(false);
+
         let catalog_ctx = PaletteCatalogContext {
             version: &self.version,
+            hub_status: &self.hub_status,
             theme: self.theme,
             font_scale: self.font_scale,
             dictation_language: self.dictation_language,
             playback_speed_pct: self.playback_speed_pct,
-            show_archived_inline: self.show_archived_inline,
+            show_archived_inline: self.show_archived_inline(),
             show_archived_only: self.show_archived_only,
-            slack_threads_enabled: self.slack_threads_enabled,
-            slack_reply_style: self.slack_reply_style,
+            slack_threads_enabled,
+            slack_reply_style,
             accounts: &self.accounts,
-            selected_chat: self.selected_chat(),
+            selected_chat,
             selected_message: self.selected_message(),
             bulk_selected_count: self.bulk_selected.len(),
             marked_messages_count: self.marked_messages.len(),
@@ -1300,18 +2220,59 @@ impl PostboxViewModel {
         }
 
         match cmd {
-            PaletteCommand::ComposeMessage => self.focus = FocusTarget::Composer,
+            PaletteCommand::ComposeMessage => {
+                self.set_focus(FocusTarget::Composer);
+            }
             PaletteCommand::ToggleSlackThreadsForAccount => {
-                self.slack_threads_enabled = !self.slack_threads_enabled;
-                self.status_notice = Some(if self.slack_threads_enabled {
-                    "Slack threads enabled".into()
-                } else {
-                    "Slack threads disabled".into()
-                });
+                if let Some(chat) = self.selected_chat().cloned()
+                    && chat.key.provider == Provider::Slack
+                {
+                    let cur = self
+                        .slack_threads_by_account
+                        .get(&chat.key.account)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            self.store
+                                .get_account_slack_threads(Provider::Slack, &chat.key.account)
+                                .unwrap_or(true)
+                        });
+                    let next = !cur;
+                    self.slack_threads_by_account
+                        .insert(chat.key.account.clone(), next);
+                    let _ = self.store.set_account_slack_threads(
+                        Provider::Slack,
+                        &chat.key.account,
+                        next,
+                    );
+                    self.rebuild_timeline();
+                    self.status_notice = Some(if next {
+                        "Slack threads enabled".into()
+                    } else {
+                        "Slack threads disabled".into()
+                    });
+                }
             }
             PaletteCommand::VersionInfo => {
                 self.status_notice = Some(format!("Postbox v{}", self.version));
             }
+            PaletteCommand::HubStatusInfo => match &self.hub_status {
+                HubConnectionStatus::Connected { .. } => {
+                    self.request_hub_refresh();
+                    self.status_notice = Some("Refreshed Hub".into());
+                }
+                HubConnectionStatus::Reconnecting { .. } | HubConnectionStatus::Error { .. } => {
+                    self.request_restart_live_sync();
+                }
+                HubConnectionStatus::Connecting { url } => {
+                    self.status_notice = Some(format!("Connecting to {url}..."));
+                }
+                HubConnectionStatus::NotConfigured { .. } => {
+                    self.status_notice = Some(
+                        "Set POSTBOX_HUB_URL / WAZIG_HUB_URL and POSTBOX_HUB_TOKEN / WAZIG_HUB_TOKEN"
+                            .into(),
+                    );
+                }
+            },
             PaletteCommand::Dictate => {
                 self.status_notice = Some("Dictation available in Milestone 5".into());
             }
@@ -1343,12 +2304,13 @@ impl PostboxViewModel {
             PaletteCommand::TogglePinSelected => self.toggle_pin_selected(),
             PaletteCommand::ToggleArchivedInline => self.toggle_archived_inline(),
             PaletteCommand::ArchiveBulkSelected => self.archive_selected(),
-            PaletteCommand::CancelBulkSelection => {
-                self.bulk_selected.clear();
-                self.status_notice = Some("Selection cleared".into());
-            }
+            PaletteCommand::CancelBulkSelection => self.cancel_bulk_selection(),
             PaletteCommand::SetReplyStyleSlack(slack) => {
-                self.slack_reply_style = *slack;
+                if let Some(chat) = self.selected_chat().cloned() {
+                    self.replies_fold_by_chat.insert(chat.key.clone(), *slack);
+                    let _ = self.store.set_chat_replies_fold(&chat.key, Some(*slack));
+                    self.rebuild_timeline();
+                }
                 self.status_notice = Some(if *slack {
                     "Replies: Slack style".into()
                 } else {
@@ -1371,6 +2333,16 @@ impl PostboxViewModel {
             }
             PaletteCommand::KeepSelectedArchived => self.keep_archived_selected(),
             PaletteCommand::ReplyToSelected => self.start_reply_selected(),
+            PaletteCommand::ResendFailedMessage => {
+                if !self.retry_selected_failed_message() {
+                    self.status_notice = Some("No failed message selected".into());
+                }
+            }
+            PaletteCommand::DeleteMessageForEveryone => {
+                if !self.delete_selected_message_for_everyone() {
+                    self.status_notice = Some("Select one of your own messages to delete".into());
+                }
+            }
             PaletteCommand::SelectNextMessage => self.next_message(),
             PaletteCommand::SelectPrevMessage => self.prev_message(),
             PaletteCommand::JumpToLatest => self.jump_to_latest(),
@@ -1380,12 +2352,11 @@ impl PostboxViewModel {
                 self.submit_composer_message();
             }
             PaletteCommand::Refresh => {
-                self.refresh_all();
+                self.request_hub_refresh();
                 self.status_notice = Some("Refreshed".into());
             }
             PaletteCommand::RestartLiveSync => {
-                self.sync_requested = true;
-                self.status_notice = Some("Live sync requested".into());
+                self.request_restart_live_sync();
             }
             PaletteCommand::ManageAccounts => {
                 self.status_notice = Some("Manage accounts on the hub".into());
@@ -1394,8 +2365,6 @@ impl PostboxViewModel {
                 self.quit_requested = true;
             }
             PaletteCommand::PickMention
-            | PaletteCommand::ResendFailedMessage
-            | PaletteCommand::DeleteMessageForEveryone
             | PaletteCommand::ReactToSelected
             | PaletteCommand::CopyMessageText
             | PaletteCommand::CopyMessageLink
@@ -1480,6 +2449,10 @@ impl PostboxViewModel {
             self.close_palette();
             return;
         }
+        if self.thread_panel.is_some() {
+            self.close_thread_panel();
+            return;
+        }
         if !self.marked_messages.is_empty() {
             self.marked_messages.clear();
             self.rebuild_timeline();
@@ -1528,7 +2501,8 @@ impl PostboxViewModel {
             Action::ArchiveSelected => self.archive_selected(),
             Action::KeepArchivedSelected => self.keep_archived_selected(),
             Action::SelectAllChats => self.select_all_chats(),
-            Action::Refresh => self.refresh_all(),
+            Action::Refresh => self.request_hub_refresh(),
+            Action::RestartLiveSync => self.request_restart_live_sync(),
             Action::Quit => self.quit_requested = true,
             Action::NextChat => self.next_chat(),
             Action::PrevChat => self.prev_chat(),
@@ -1549,8 +2523,20 @@ impl PostboxViewModel {
             Action::PageDownMessages => self.page_down_messages(),
             Action::JumpLatest => self.jump_to_latest(),
             Action::ReplyToMessage => self.start_reply_selected(),
+            Action::OpenThread => {
+                self.open_thread_for_selected();
+            }
+            Action::ResendFailedMessage => {
+                self.retry_selected_failed_message();
+            }
+            Action::CloseThreadPanel => self.close_thread_panel(),
+            Action::CycleThreadFocus => self.cycle_thread_focus(),
+            Action::ToggleThreadBroadcast => self.toggle_thread_broadcast(),
+            Action::SendThreadReply => {
+                self.submit_thread_reply();
+            }
             Action::OpenLinksAndMedia => self.open_links_palette(),
-            Action::FocusComposer => self.focus = FocusTarget::Composer,
+            Action::FocusComposer => self.set_focus(FocusTarget::Composer),
             Action::SendMessage => {
                 self.submit_composer_message();
             }
@@ -1705,7 +2691,7 @@ mod tests {
             "Combined inbox \u{00B7} 1 messages marked \u{00B7} Copied transcript - Postbox v0.1.0"
         );
 
-        assert!(vm.switch_to_account_slot(3)); // Slack (switching chats clears marked messages)
+        assert!(vm.switch_to_account_slot(3));
         assert_eq!(
             vm.window_title(),
             "Acme Slack \u{00B7} Copied transcript - Postbox v0.1.0"
@@ -1779,7 +2765,6 @@ mod tests {
         assert!(first_chat < first_msg);
         assert!(first_msg < first_cmd);
 
-        // Execute "Theme: Light" directly via query
         vm.set_palette_query("Theme: Light");
         assert!(vm.execute_palette_selected());
         assert!(!vm.palette_open());
@@ -1809,15 +2794,13 @@ mod tests {
     fn chords_f1_links_composer_and_escape_cascade_work_end_to_end() {
         let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
 
-        // Switch to Slack, then G then I jumps back to Combined Inbox
         assert!(vm.switch_to_account_slot(3));
         assert_eq!(vm.active_view().unwrap().label(), "Acme Slack");
         assert!(!vm.handle_inbox_chord_key('g', 1000, false, false));
         assert!(vm.handle_inbox_chord_key('i', 1400, false, false));
         assert_eq!(vm.active_view(), Some(&ViewTab::CombinedInbox));
 
-        // Alt+G, Alt+G jumps to latest message
-        assert!(vm.select_chat_index(0)); // Alice Light (2 messages)
+        assert!(vm.select_chat_index(0));
         vm.select_message_index(0);
         assert_eq!(vm.selected_message_idx(), Some(0));
         assert_eq!(vm.handle_alt_g(2000, false), LatestChordOutcome::ArmedHint);
@@ -1825,7 +2808,6 @@ mod tests {
         assert_eq!(vm.selected_message_idx(), Some(1));
         assert!(vm.take_scroll_to_latest_pending());
 
-        // Ctrl+O links mode extracts URL from selected message
         vm.select_message_index(0);
         vm.open_links_palette();
         assert_eq!(vm.palette_entries().len(), 1);
@@ -1836,13 +2818,11 @@ mod tests {
         vm.handle_escape();
         assert!(!vm.palette_open());
 
-        // F1 opens and Esc closes shortcuts overlay
         vm.toggle_shortcuts();
         assert!(vm.shortcuts_open());
         vm.handle_escape();
         assert!(!vm.shortcuts_open());
 
-        // Composer submit writes to SQLite + outbox and updates timeline
         vm.set_focus(FocusTarget::Composer);
         vm.set_composer_text("Hello from M1");
         assert!(vm.submit_composer_message());
@@ -1855,7 +2835,6 @@ mod tests {
         let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
         assert_eq!(vm.chats().len(), 2);
 
-        // Filter sidebar down to 1 chat via Ctrl+F (SearchChats) and confirm the Chat item.
         vm.open_search_palette();
         vm.set_palette_query("Engineering");
         assert_eq!(vm.chats().len(), 1);
@@ -1866,7 +2845,6 @@ mod tests {
         assert_eq!(vm.selected_chat().unwrap().title, "Engineering");
         assert_eq!(vm.focus(), FocusTarget::Composer);
 
-        // Filter sidebar down to 1 chat via Ctrl+F and confirm a MessageHit item.
         vm.open_search_palette();
         vm.set_palette_query("Alice");
         assert_eq!(vm.chats().len(), 1);
@@ -1924,7 +2902,6 @@ mod tests {
         assert_eq!(vm.palette_selected_section_row(), Some((0, 0)));
         vm.close_palette();
 
-        // Resetting chords disarms both G->I and Alt+G->Alt+G
         assert!(vm.switch_to_account_slot(2));
         assert!(!vm.handle_inbox_chord_key('g', 1000, false, false));
         vm.reset_inbox_chord();

@@ -1,5 +1,6 @@
 pub mod geometry;
 pub mod palette;
+pub mod sync_bridge;
 pub mod theme;
 pub mod timeline;
 pub mod viewmodel;
@@ -11,12 +12,20 @@ pub use geometry::RowGeometry;
 pub use palette::{
     PaletteCommand, PaletteEntry, PaletteEntryKind, PaletteGroupKind, PaletteMode, PaletteSection,
 };
+pub use sync_bridge::{
+    HubConnectionStatus, SyncBridge, SyncCommand, SyncEvent, SyncWorkerHandle, create_sync_bridge,
+};
 pub use theme::{
     ARCHIVED_ROW_FOREGROUND_WEIGHT, ShadcnPalette, archived_row_color, archived_text_color,
     contrast_ratio, relative_luminance,
 };
-pub use timeline::{TimelineItem, build_timeline_items, extract_links_and_media, format_time_hm};
-pub use viewmodel::{FocusTarget, PostboxLaunchContext, PostboxViewModel, SidebarChatRow};
+pub use timeline::{
+    OutboxBadge, ReadTickDisplay, TimelineItem, TimelineOptions, build_timeline_items,
+    build_timeline_items_with_options, extract_links_and_media, format_time_hm,
+};
+pub use viewmodel::{
+    FocusTarget, PostboxLaunchContext, PostboxViewModel, SidebarChatRow, ThreadPanelState,
+};
 
 pub const FONT_SANS: &str = "IBM Plex Sans";
 pub const FONT_MONO: &str = "IBM Plex Mono";

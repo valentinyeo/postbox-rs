@@ -2,6 +2,11 @@ pub mod archive;
 pub mod control;
 pub mod deep_link;
 pub mod dictation;
+pub mod drafts;
+pub mod outbox;
+pub mod read;
+pub mod threads;
+pub mod views;
 
 use serde::{Deserialize, Serialize};
 

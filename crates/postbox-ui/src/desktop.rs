@@ -3,13 +3,15 @@ use crate::geometry::{
     VIEW_RAIL_WIDTH_PX,
 };
 use crate::palette::PaletteMode;
+use crate::sync_bridge::{HubConnectionStatus, SyncBridge, SyncCommand, SyncEvent};
 use crate::theme::{ShadcnPalette, archived_row_color, archived_text_color};
-use crate::timeline::{TimelineItem, format_time_hm};
+use crate::timeline::{OutboxBadge, ReadTickDisplay, TimelineItem, format_time_hm};
 use crate::viewmodel::{FocusTarget, PostboxLaunchContext, PostboxViewModel, SidebarChatRow};
 use crate::{BASE_FONT_PX, FONT_MONO, FONT_SANS, scaled_px};
 use gpui_kit::assets::Assets;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::base::actions::Cancel;
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::kbd::Kbd;
@@ -17,13 +19,14 @@ use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerStat
 use gpui_kit::component::{IndexPath, Theme, ThemeMode, VirtualListScrollHandle, v_virtual_list};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Action as GpuiAction, AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle,
-    Focusable, Hsla, InteractiveElement as _, IntoElement, KeyBinding, KeyBindingContextPredicate,
-    KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, ParentElement as _,
-    Pixels, Point, Render, ScrollStrategy, SharedString, Size, StatefulInteractiveElement as _,
-    Styled as _, Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, div, hsla, px,
-    rgb, size,
+    Action as GpuiAction, AnyElement, App, AppContext as _, AsyncWindowContext, Bounds, Context,
+    Entity, FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement, KeyBinding,
+    KeyBindingContextPredicate, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
+    MouseButton, ParentElement as _, Pixels, Point, Render, ScrollStrategy, SharedString, Size,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, TitlebarOptions, WeakEntity,
+    Window, WindowBounds, WindowOptions, div, hsla, px, rgb, size,
 };
+use postbox_core::threads::replies_line;
 use postbox_core::{FontScale, Provider, ThemeChoice};
 use postbox_keymap::{Action as PbAction, Keymap, f1_shortcut_groups};
 use std::borrow::Cow;
@@ -43,6 +46,7 @@ gpui_kit::actions!(
         KeepArchivedSelected,
         SelectAllChats,
         Refresh,
+        RestartLiveSync,
         Quit,
         NextChat,
         PrevChat,
@@ -74,6 +78,11 @@ gpui_kit::actions!(
         PageDownMessages,
         JumpLatest,
         ReplyToMessage,
+        OpenThread,
+        ResendFailedMessage,
+        CloseThreadPanel,
+        CycleThreadFocus,
+        ToggleThreadBroadcast,
         OpenLinksAndMedia,
         FocusComposer,
         FontSmaller,
@@ -96,6 +105,7 @@ fn gpui_action_for(action: PbAction) -> Option<Box<dyn GpuiAction>> {
         PbAction::KeepArchivedSelected => Some(Box::new(KeepArchivedSelected)),
         PbAction::SelectAllChats => Some(Box::new(SelectAllChats)),
         PbAction::Refresh => Some(Box::new(Refresh)),
+        PbAction::RestartLiveSync => Some(Box::new(RestartLiveSync)),
         PbAction::Quit => Some(Box::new(Quit)),
         PbAction::NextChat => Some(Box::new(NextChat)),
         PbAction::PrevChat => Some(Box::new(PrevChat)),
@@ -127,6 +137,11 @@ fn gpui_action_for(action: PbAction) -> Option<Box<dyn GpuiAction>> {
         PbAction::PageDownMessages => Some(Box::new(PageDownMessages)),
         PbAction::JumpLatest => Some(Box::new(JumpLatest)),
         PbAction::ReplyToMessage => Some(Box::new(ReplyToMessage)),
+        PbAction::OpenThread => Some(Box::new(OpenThread)),
+        PbAction::ResendFailedMessage => Some(Box::new(ResendFailedMessage)),
+        PbAction::CloseThreadPanel => Some(Box::new(CloseThreadPanel)),
+        PbAction::CycleThreadFocus => Some(Box::new(CycleThreadFocus)),
+        PbAction::ToggleThreadBroadcast => Some(Box::new(ToggleThreadBroadcast)),
         PbAction::OpenLinksAndMedia => Some(Box::new(OpenLinksAndMedia)),
         PbAction::FocusComposer => Some(Box::new(FocusComposer)),
         PbAction::FontSmaller => Some(Box::new(FontSmaller)),
@@ -152,12 +167,53 @@ pub fn register_bundled_fonts(cx: &App) {
 }
 
 /// Translates `postbox-keymap` bindings (including `keymap.json` overrides) into GPUI `KeyBinding`s.
+///
+/// Scopes `PostboxComposerEmpty` (`ctrl-a`, `up`, `down`) and `PostboxThreadPanel` (`escape`, `tab`)
+/// beneath `gpui-base`'s inner `Input` context (`"PostboxComposerEmpty > Input"`) so they override
+/// `Textarea`'s default `Input` bindings while empty, and automatically defer to `Textarea` as soon
+/// as text is entered (`key_context` switches to `"PostboxComposer"`).
 pub fn bind_postbox_keys(cx: &mut App, keymap: &Keymap) {
     let mut bindings = Vec::new();
     for entry in keymap.bindings() {
         let Some(action) = gpui_action_for(entry.action) else {
             continue;
         };
+        // Scope `ToggleThreadBroadcast` ("space") strictly to `PostboxThreadBroadcast` so
+        // Space inserts `' '` normally inside `thread_composer` (`Textarea`) and toggles the
+        // broadcast checkbox only when focus is on `thread-broadcast-wrap` (via `Tab`).
+        if entry.context == postbox_keymap::KeyContext::ThreadPanel
+            && entry.action == PbAction::ToggleThreadBroadcast
+        {
+            let pred = KeyBindingContextPredicate::parse("PostboxThreadBroadcast")
+                .ok()
+                .map(Rc::new);
+            if let Ok(kb) = KeyBinding::load(&entry.stroke, action, pred, false, None, cx) {
+                bindings.push(kb);
+            }
+            continue;
+        }
+
+        let extra_descendant_ctx: Option<&'static str> = match entry.context {
+            postbox_keymap::KeyContext::ComposerEmpty => Some("PostboxComposerEmpty > Input"),
+            postbox_keymap::KeyContext::ThreadPanel
+                if matches!(entry.stroke.as_str(), "escape" | "tab") =>
+            {
+                Some("PostboxThreadPanel > Input")
+            }
+            _ => None,
+        };
+
+        if let Some(desc_ctx) = extra_descendant_ctx
+            && let Some(desc_action) = gpui_action_for(entry.action)
+        {
+            let pred = KeyBindingContextPredicate::parse(desc_ctx)
+                .ok()
+                .map(Rc::new);
+            if let Ok(kb) = KeyBinding::load(&entry.stroke, desc_action, pred, false, None, cx) {
+                bindings.push(kb);
+            }
+        }
+
         let predicate = KeyBindingContextPredicate::parse(entry.context.as_gpui_context())
             .ok()
             .map(Rc::new);
@@ -253,27 +309,54 @@ pub struct PostboxShell {
     root_focus: FocusHandle,
     sidebar_focus: FocusHandle,
     message_list_focus: FocusHandle,
+    thread_broadcast_focus: FocusHandle,
     sidebar_scroll: VirtualListScrollHandle,
     sidebar_item_sizes: Rc<Vec<Size<Pixels>>>,
     sidebar_rows_cache: Vec<SidebarChatRow>,
     timeline_state: Entity<MessageScrollerState>,
+    thread_timeline_state: Entity<MessageScrollerState>,
     composer: Entity<TextareaState>,
+    thread_composer: Entity<TextareaState>,
     palette_state: Entity<CommandState>,
     last_window_title: String,
     last_applied_theme: ThemeChoice,
     last_applied_scale: FontScale,
+    sync_cmd_tx: Option<async_channel::Sender<SyncCommand>>,
+    _sync_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+}
+
+impl Drop for PostboxShell {
+    fn drop(&mut self) {
+        if let Some(tx) = &self.sync_cmd_tx {
+            let _ = tx.try_send(SyncCommand::Shutdown);
+        }
+    }
 }
 
 impl PostboxShell {
     pub fn new(ctx: PostboxLaunchContext, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let started_at = ctx.started_at;
-        let vm = PostboxViewModel::new(ctx.store, ctx.keymap, ctx.version);
-        Self::from_view_model(vm, started_at, window, cx)
+        let mut vm = PostboxViewModel::new(ctx.store, ctx.keymap, ctx.version)
+            .with_hub_status(ctx.hub_status);
+        if let Some(bridge) = &ctx.sync_bridge {
+            vm.attach_sync_sender(bridge.cmd_tx.clone());
+        }
+        Self::from_view_model_with_bridge(vm, ctx.sync_bridge, started_at, window, cx)
     }
 
     pub fn from_view_model(
         vm: PostboxViewModel,
+        started_at: Instant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::from_view_model_with_bridge(vm, None, started_at, window, cx)
+    }
+
+    pub fn from_view_model_with_bridge(
+        vm: PostboxViewModel,
+        sync_bridge: Option<SyncBridge>,
         started_at: Instant,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -292,14 +375,22 @@ impl PostboxShell {
         let root_focus = cx.focus_handle();
         let sidebar_focus = cx.focus_handle();
         let message_list_focus = cx.focus_handle();
+        let thread_broadcast_focus = cx.focus_handle();
         sidebar_focus.focus(window, cx);
 
         let timeline_state = cx.new(|cx| MessageScrollerState::new(initial_timeline_len, cx));
+        let thread_timeline_state = cx.new(|cx| MessageScrollerState::new(0, cx));
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 6)
                 .submit_on_enter(true)
                 .placeholder("Write a message... (Ctrl+K for commands)")
+        });
+        let thread_composer = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 5)
+                .submit_on_enter(true)
+                .placeholder("Reply in thread...")
         });
         let palette_state = cx.new(|cx| CommandState::new(window, cx));
 
@@ -333,11 +424,61 @@ impl PostboxShell {
             },
         );
 
+        let thread_composer_sub = cx.subscribe_in(
+            &thread_composer,
+            window,
+            |this: &mut Self, state: &Entity<TextareaState>, event: &InputEvent, window, cx| {
+                match event {
+                    InputEvent::Change => {
+                        let value = state.read(cx).value().to_string();
+                        this.vm.set_thread_composer_text(value);
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { shift, .. }
+                        if !shift && this.vm.submit_thread_reply() =>
+                    {
+                        state.update(cx, |input, cx| input.clean(window, cx));
+                        this.sync_after_vm_change(window, cx);
+                    }
+                    InputEvent::Focus => {
+                        this.vm.set_focus(FocusTarget::ThreadComposer);
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+            },
+        );
+
         let activation_sub = cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() && this.vm.on_window_blur() {
                 this.sync_sidebar_cache();
                 cx.notify();
             }
+        });
+
+        let sync_cmd_tx = sync_bridge.as_ref().map(|b| b.cmd_tx.clone());
+        let sync_task = sync_bridge.map(|bridge| {
+            let rx = bridge.event_rx;
+            cx.spawn_in(
+                window,
+                async move |this: WeakEntity<PostboxShell>, cx: &mut AsyncWindowContext| {
+                    // Parked with 0% idle CPU/GPU until background Tokio sync engine sends an event.
+                    while let Ok(first) = rx.recv().await {
+                        let mut batch = vec![first];
+                        while let Ok(next) = rx.try_recv() {
+                            batch.push(next);
+                        }
+                        let alive = this
+                            .update_in(cx, |shell, window, cx| {
+                                shell.apply_sync_events(batch, window, cx);
+                            })
+                            .is_ok();
+                        if !alive {
+                            break;
+                        }
+                    }
+                },
+            )
         });
 
         window.set_window_title(&initial_title);
@@ -350,16 +491,21 @@ impl PostboxShell {
             root_focus,
             sidebar_focus,
             message_list_focus,
+            thread_broadcast_focus,
             sidebar_scroll: VirtualListScrollHandle::new(),
             sidebar_item_sizes,
             sidebar_rows_cache,
             timeline_state,
+            thread_timeline_state,
             composer,
+            thread_composer,
             palette_state,
             last_window_title: initial_title,
             last_applied_theme: initial_theme,
             last_applied_scale: initial_scale,
-            _subscriptions: vec![composer_sub, activation_sub],
+            sync_cmd_tx,
+            _sync_task: sync_task,
+            _subscriptions: vec![composer_sub, thread_composer_sub, activation_sub],
         }
     }
 
@@ -373,6 +519,24 @@ impl PostboxShell {
 
     fn now_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis() as u64
+    }
+
+    fn apply_sync_events(
+        &mut self,
+        events: Vec<SyncEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut total_prepended = 0usize;
+        for ev in events {
+            total_prepended += self.vm.apply_sync_event(ev);
+        }
+        if total_prepended > 0 {
+            self.timeline_state.update(cx, |state, cx| {
+                state.prepend(total_prepended, cx);
+            });
+        }
+        self.sync_after_vm_change(window, cx);
     }
 
     fn sync_sidebar_cache(&mut self) {
@@ -391,6 +555,10 @@ impl PostboxShell {
             FocusTarget::Composer => self
                 .composer
                 .update(cx, |input, cx| input.focus(window, cx)),
+            FocusTarget::ThreadComposer => self
+                .thread_composer
+                .update(cx, |input, cx| input.focus(window, cx)),
+            FocusTarget::ThreadBroadcast => self.thread_broadcast_focus.focus(window, cx),
             FocusTarget::Palette => self
                 .palette_state
                 .update(cx, |state, cx| state.focus(window, cx)),
@@ -408,6 +576,8 @@ impl PostboxShell {
             self.last_applied_scale = scale;
             if scale_changed {
                 self.timeline_state.update(cx, |s, cx| s.remeasure(cx));
+                self.thread_timeline_state
+                    .update(cx, |s, cx| s.remeasure(cx));
             }
         }
 
@@ -429,11 +599,37 @@ impl PostboxShell {
             });
         }
 
-        // Sync composer text if chat switched
+        let new_thread_len = self
+            .vm
+            .thread_panel()
+            .map(|p| p.timeline_items.len())
+            .unwrap_or(0);
+        if self.thread_timeline_state.read(cx).item_count() != new_thread_len {
+            self.thread_timeline_state.update(cx, |state, cx| {
+                state.reset(new_thread_len, cx);
+                if new_thread_len > 0 {
+                    state.scroll_to_end(cx);
+                }
+            });
+        }
+
+        // Sync main composer text if chat switched
         let wanted_composer = self.vm.composer_text().to_owned();
         if self.composer.read(cx).value().as_ref() != wanted_composer.as_str() {
             self.composer.update(cx, |input, cx| {
                 input.set_value(wanted_composer, window, cx);
+            });
+        }
+
+        // Sync thread composer text
+        let wanted_thread_composer = self
+            .vm
+            .thread_panel()
+            .map(|p| p.composer_text.clone())
+            .unwrap_or_default();
+        if self.thread_composer.read(cx).value().as_ref() != wanted_thread_composer.as_str() {
+            self.thread_composer.update(cx, |input, cx| {
+                input.set_value(wanted_thread_composer, window, cx);
             });
         }
 
@@ -502,6 +698,15 @@ impl PostboxShell {
             PbAction::OpenPalette => self.open_palette_mode(PaletteMode::Normal, window, cx),
             PbAction::SearchChats => self.open_palette_mode(PaletteMode::SearchChats, window, cx),
             PbAction::OpenLinksAndMedia => self.open_palette_mode(PaletteMode::Links, window, cx),
+            PbAction::PageUpMessages => {
+                let at_scroll_top = self.timeline_state.read(cx).logical_scroll_top().item_ix == 0;
+                if at_scroll_top || self.vm.selected_message_idx() == Some(0) {
+                    self.vm.request_older_messages();
+                }
+                let now = self.now_ms();
+                self.vm.handle_action(PbAction::PageUpMessages, now);
+                self.sync_after_vm_change(window, cx);
+            }
             PbAction::MoveViewUp | PbAction::MoveViewDown => {
                 let moved = if matches!(action, PbAction::MoveViewUp) {
                     self.vm.palette_move_view_up()
@@ -550,11 +755,8 @@ impl PostboxShell {
             return;
         }
 
-        // Any non-Alt+G keydown resets the Alt+G double-tap chord.
         self.vm.reset_latest_chord();
 
-        // G then I combined inbox chord (unmodified single char outside text inputs/overlays).
-        // Any modified key or multi-char named key (tab, enter, arrows, etc.) resets it.
         let mods_active = mods.control || mods.alt || mods.platform || mods.shift;
         if !mods_active && key.len() == 1 {
             if let Some(ch) = key.chars().next()
@@ -742,7 +944,7 @@ impl PostboxShell {
                     .child(preview_text),
             );
 
-        if row.chat.is_archived() {
+        if let Some(archive_label) = row.archive_status.label() {
             bottom_line = bottom_line.child(
                 div()
                     .px_1p5()
@@ -751,7 +953,7 @@ impl PostboxShell {
                     .bg(rgb(p.muted))
                     .text_size(px(TYPE_LABEL_PX))
                     .text_color(rgb(p.muted_foreground))
-                    .child("Archived"),
+                    .child(archive_label),
             );
         }
 
@@ -792,10 +994,13 @@ impl PostboxShell {
             .into_any_element()
     }
 
-    fn render_timeline_row(&self, ix: usize) -> AnyElement {
-        let Some(item) = self.vm.timeline_items().get(ix) else {
-            return div().into_any_element();
-        };
+    fn render_timeline_item(
+        &self,
+        item: &TimelineItem,
+        id_prefix: &str,
+        ix: usize,
+        shell: Entity<Self>,
+    ) -> AnyElement {
         let p = ShadcnPalette::for_choice(self.vm.theme());
         let scale = self.vm.font_scale().percent();
         let body_px = scaled_px(BASE_FONT_PX, scale);
@@ -827,6 +1032,9 @@ impl PostboxShell {
                 grouped_with_prev,
                 selected,
                 marked,
+                thread_reply_count,
+                outbox_status,
+                read_ticks,
                 ..
             } => {
                 let bubble_bg = if message.from_me {
@@ -844,6 +1052,14 @@ impl PostboxShell {
                 } else {
                     p.muted_foreground
                 };
+                let is_failed = matches!(outbox_status, Some(OutboxBadge::Failed { .. }));
+                let border_col = if is_failed {
+                    p.destructive
+                } else if *selected {
+                    p.ring
+                } else {
+                    p.border
+                };
 
                 let mut bubble = div()
                     .max_w(px(620.0))
@@ -852,7 +1068,7 @@ impl PostboxShell {
                     .rounded_lg()
                     .bg(rgb(bubble_bg))
                     .border_1()
-                    .border_color(rgb(if *selected { p.ring } else { p.border }))
+                    .border_color(rgb(border_col))
                     .flex()
                     .flex_col()
                     .gap_1();
@@ -867,6 +1083,11 @@ impl PostboxShell {
                 }
 
                 if let Some(reply_id) = &message.reply_to_id {
+                    let quote_label = if message.reply_broadcast {
+                        format!("Broadcast reply to {reply_id}")
+                    } else {
+                        format!("Replying to {reply_id}")
+                    };
                     bubble = bubble.child(
                         div()
                             .px_2()
@@ -875,7 +1096,7 @@ impl PostboxShell {
                             .bg(rgb(p.secondary))
                             .text_size(px(label_px))
                             .text_color(rgb(p.muted_foreground))
-                            .child(format!("Replying to {reply_id}")),
+                            .child(quote_label),
                     );
                 }
 
@@ -885,6 +1106,30 @@ impl PostboxShell {
                     message.body.clone()
                 };
 
+                let mut meta_row = div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .text_size(px(time_px))
+                    .text_color(rgb(bubble_meta))
+                    .when(*marked, |el| el.child("Marked"))
+                    .child(format_time_hm(&message.ts));
+
+                if *read_ticks != ReadTickDisplay::None {
+                    let tick_color = if *read_ticks == ReadTickDisplay::DoubleRead {
+                        p.ring
+                    } else {
+                        bubble_meta
+                    };
+                    meta_row = meta_row.child(
+                        div()
+                            .text_size(px(label_px))
+                            .text_color(rgb(tick_color))
+                            .child(read_ticks.symbol()),
+                    );
+                }
+
                 bubble = bubble
                     .child(
                         div()
@@ -892,19 +1137,74 @@ impl PostboxShell {
                             .text_color(rgb(bubble_fg))
                             .child(body_text),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .text_size(px(time_px))
-                            .text_color(rgb(bubble_meta))
-                            .when(*marked, |el| el.child("Marked"))
-                            .child(format_time_hm(&message.ts)),
-                    );
+                    .child(meta_row);
 
-                let row_wrapper = div()
+                if let Some(badge) = outbox_status {
+                    match badge {
+                        OutboxBadge::Sending => {
+                            bubble = bubble.child(
+                                div()
+                                    .text_size(px(label_px))
+                                    .text_color(rgb(bubble_meta))
+                                    .child("Sending..."),
+                            );
+                        }
+                        OutboxBadge::Failed { reason, ambiguous } => {
+                            let label = if *ambiguous {
+                                "Delivery unconfirmed — click or press Enter to retry".to_owned()
+                            } else {
+                                format!("Failed: {reason} — click or press Enter to retry")
+                            };
+                            let retry_id = message.msg_id.clone();
+                            let shell_retry = shell.clone();
+                            bubble = bubble.child(
+                                div()
+                                    .id(SharedString::from(format!("{id_prefix}-retry-{ix}")))
+                                    .test_support()
+                                    .text_size(px(label_px))
+                                    .text_color(rgb(p.destructive))
+                                    .cursor_pointer()
+                                    .on_click(move |_, window, cx| {
+                                        shell_retry.update(cx, |this, cx| {
+                                            this.vm.retry_failed_message(&retry_id);
+                                            this.sync_after_vm_change(window, cx);
+                                        });
+                                    })
+                                    .child(label),
+                            );
+                        }
+                    }
+                }
+
+                if *thread_reply_count > 0 {
+                    let root_id = message.msg_id.clone();
+                    let label = replies_line(*thread_reply_count);
+                    let shell_thread = shell.clone();
+                    bubble = bubble.child(
+                        div()
+                            .id(SharedString::from(format!("{id_prefix}-thread-pill-{ix}")))
+                            .test_support()
+                            .mt_1()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_sm()
+                            .bg(rgb(p.secondary))
+                            .border_1()
+                            .border_color(rgb(p.border))
+                            .text_size(px(label_px))
+                            .text_color(rgb(p.foreground))
+                            .cursor_pointer()
+                            .on_click(move |_, window, cx| {
+                                shell_thread.update(cx, |this, cx| {
+                                    this.vm.open_thread(&root_id);
+                                    this.sync_after_vm_change(window, cx);
+                                });
+                            })
+                            .child(label),
+                    );
+                }
+
+                div()
                     .w_full()
                     .max_w(px(CHAT_COLUMN_MAX_WIDTH_PX))
                     .mx_auto()
@@ -914,11 +1214,359 @@ impl PostboxShell {
                     .flex()
                     .when(message.from_me, |el| el.justify_end())
                     .when(!message.from_me, |el| el.justify_start())
-                    .child(bubble);
-
-                row_wrapper.into_any_element()
+                    .child(bubble)
+                    .into_any_element()
             }
         }
+    }
+
+    fn render_timeline_row(&self, ix: usize, shell: Entity<Self>) -> AnyElement {
+        let Some(item) = self.vm.timeline_items().get(ix) else {
+            return div().into_any_element();
+        };
+        self.render_timeline_item(item, "msg", ix, shell)
+    }
+
+    fn render_thread_timeline_row(&self, ix: usize, shell: Entity<Self>) -> AnyElement {
+        let Some(item) = self
+            .vm
+            .thread_panel()
+            .and_then(|p| p.timeline_items.get(ix))
+        else {
+            return div().into_any_element();
+        };
+        self.render_timeline_item(item, "thread", ix, shell)
+    }
+
+    fn render_hub_status_card(&self, p: &ShadcnPalette, cx: &mut Context<Self>) -> AnyElement {
+        let mut card = div()
+            .id("hub-status-card")
+            .test_support()
+            .max_w(px(540.0))
+            .w_full()
+            .p_5()
+            .rounded_lg()
+            .bg(rgb(p.card))
+            .border_1()
+            .border_color(rgb(
+                if matches!(self.vm.hub_status(), HubConnectionStatus::Error { .. }) {
+                    p.destructive
+                } else {
+                    p.border
+                },
+            ))
+            .flex()
+            .flex_col()
+            .gap_3();
+
+        match self.vm.hub_status() {
+            HubConnectionStatus::NotConfigured {
+                missing_url,
+                missing_token,
+                configured_url,
+                detail,
+            } => {
+                let subtitle = if *missing_url && *missing_token {
+                    "No Hub URL or token detected yet.".to_owned()
+                } else if *missing_url {
+                    "Missing Hub URL.".to_owned()
+                } else if let Some(u) = configured_url {
+                    format!("Missing Hub token for {u}.")
+                } else {
+                    "Missing Hub token.".to_owned()
+                };
+
+                card = card
+                    .child(
+                        div()
+                            .text_size(px(18.0))
+                            .text_color(rgb(p.foreground))
+                            .child("Connect Postbox to your Hub"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(TYPE_CHAT_NAME_PX))
+                            .text_color(rgb(p.muted_foreground))
+                            .child(subtitle),
+                    );
+                if let Some(d) = detail {
+                    card = card.child(
+                        div()
+                            .text_size(px(TYPE_TIME_PX))
+                            .text_color(rgb(p.destructive))
+                            .child(d.clone()),
+                    );
+                }
+                card = card
+                    .child(
+                        div()
+                            .p_3()
+                            .rounded_md()
+                            .bg(rgb(p.secondary))
+                            .border_1()
+                            .border_color(rgb(p.border))
+                            .flex()
+                            .flex_col()
+                            .gap_1p5()
+                            .font_family(FONT_MONO)
+                            .text_size(px(TYPE_TIME_PX))
+                            .text_color(rgb(p.foreground))
+                            .child("POSTBOX_HUB_URL (or WAZIG_HUB_URL) = https://your-hub.example")
+                            .child("POSTBOX_HUB_TOKEN (or WAZIG_HUB_TOKEN) = <your-bearer-token>"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(TYPE_TIME_PX))
+                            .text_color(rgb(p.muted_foreground))
+                            .child(
+                                "On Windows, Postbox automatically reads HKCU\\Environment and reuses existing Zig Postbox DPAPI credentials from HKCU\\Software\\Messages\\HubToken. Restart after setting environment variables, or press Ctrl+K for commands.",
+                            ),
+                    );
+            }
+            HubConnectionStatus::Connecting { url } => {
+                card = card
+                    .child(
+                        div()
+                            .text_size(px(18.0))
+                            .text_color(rgb(p.foreground))
+                            .child("Connecting to Hub..."),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(TYPE_CHAT_NAME_PX))
+                            .text_color(rgb(p.muted_foreground))
+                            .child(format!("Fetching chats from {url}")),
+                    );
+            }
+            HubConnectionStatus::Connected { url, .. } => {
+                let body = if self.vm.unread_only() {
+                    "No unread chats in this view. Press U to show all chats or Esc to reset."
+                        .to_owned()
+                } else if !self.vm.search_filter().is_empty() {
+                    "No matching chats. Press Esc to clear search.".to_owned()
+                } else {
+                    format!(
+                        "Connected to {url}. No chats in this view — press R to refresh, Esc to clear filters, or Ctrl+K for commands."
+                    )
+                };
+                card = card
+                    .child(
+                        div()
+                            .text_size(px(18.0))
+                            .text_color(rgb(p.foreground))
+                            .child("Connected to Hub"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(TYPE_CHAT_NAME_PX))
+                            .text_color(rgb(p.muted_foreground))
+                            .child(body),
+                    );
+            }
+            HubConnectionStatus::Reconnecting {
+                url,
+                attempt,
+                retry_in_secs,
+                last_error,
+            } => {
+                card = card
+                    .child(
+                        div()
+                            .text_size(px(18.0))
+                            .text_color(rgb(p.foreground))
+                            .child("Reconnecting to Hub..."),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(TYPE_CHAT_NAME_PX))
+                            .text_color(rgb(p.muted_foreground))
+                            .child(format!(
+                                "{url} — attempt #{attempt}, retrying in {retry_in_secs}s ({last_error})"
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("hub-retry-now-btn")
+                            .test_support()
+                            .px_3()
+                            .py_1p5()
+                            .rounded_md()
+                            .bg(rgb(p.primary))
+                            .text_size(px(TYPE_TIME_PX))
+                            .text_color(rgb(p.primary_foreground))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.vm.request_restart_live_sync();
+                                this.sync_after_vm_change(window, cx);
+                            }))
+                            .child("Retry now (S)"),
+                    );
+            }
+            HubConnectionStatus::Error { url, message } => {
+                let url_hint = url
+                    .as_deref()
+                    .map(|u| format!(" ({u})"))
+                    .unwrap_or_default();
+                card = card
+                    .child(
+                        div()
+                            .text_size(px(18.0))
+                            .text_color(rgb(p.destructive))
+                            .child(format!("Hub connection error{url_hint}")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(TYPE_CHAT_NAME_PX))
+                            .text_color(rgb(p.foreground))
+                            .child(message.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(TYPE_TIME_PX))
+                            .text_color(rgb(p.muted_foreground))
+                            .child(
+                                "Verify POSTBOX_HUB_URL / WAZIG_HUB_URL and POSTBOX_HUB_TOKEN / WAZIG_HUB_TOKEN, then press S to retry.",
+                            ),
+                    );
+            }
+        }
+
+        div()
+            .id("message-timeline-empty")
+            .test_support()
+            .flex_1()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_6()
+            .child(card)
+            .into_any_element()
+    }
+
+    fn render_thread_panel(&self, p: &ShadcnPalette, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let panel = self.vm.thread_panel()?;
+        let chat_title = self
+            .vm
+            .selected_chat()
+            .map(|c| c.title.clone())
+            .unwrap_or_else(|| "chat".to_owned());
+        let is_slack = panel.chat.provider == Provider::Slack;
+        let reply_count = panel.messages.len().saturating_sub(1);
+        let broadcast_checked = panel.broadcast;
+        let shell_for_thread = cx.entity();
+
+        let header = div()
+            .w_full()
+            .px_4()
+            .py_2p5()
+            .border_b_1()
+            .border_color(rgb(p.border))
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(TYPE_CHAT_NAME_PX))
+                            .text_color(rgb(p.foreground))
+                            .child("Thread"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(TYPE_LABEL_PX))
+                            .text_color(rgb(p.muted_foreground))
+                            .child(replies_line(reply_count)),
+                    ),
+            )
+            .child(
+                div()
+                    .id("thread-close-btn")
+                    .test_support()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .bg(rgb(p.secondary))
+                    .text_size(px(TYPE_LABEL_PX))
+                    .text_color(rgb(p.muted_foreground))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.vm.close_thread_panel();
+                        this.sync_after_vm_change(window, cx);
+                    }))
+                    .child("Esc"),
+            );
+
+        let body = MessageScroller::new(
+            "thread-message-timeline",
+            self.thread_timeline_state.clone(),
+            move |ix, _window, cx| {
+                shell_for_thread
+                    .read(cx)
+                    .render_thread_timeline_row(ix, shell_for_thread.clone())
+            },
+        )
+        .flex_1()
+        .w_full()
+        .with_bottom_fade(rgb(p.background));
+
+        let mut footer = div()
+            .w_full()
+            .p_3()
+            .border_t_1()
+            .border_color(rgb(p.border))
+            .bg(rgb(p.card))
+            .flex()
+            .flex_col()
+            .gap_2();
+
+        if is_slack {
+            footer = footer.child(
+                div()
+                    .id("thread-broadcast-wrap")
+                    .test_support()
+                    .key_context("PostboxThreadBroadcast")
+                    .track_focus(&self.thread_broadcast_focus)
+                    .child(
+                        Checkbox::new("thread-broadcast-checkbox")
+                            .label(format!("Also send to {chat_title}"))
+                            .checked(broadcast_checked)
+                            .on_change(cx.listener(|this, checked: &bool, window, cx| {
+                                this.vm.set_thread_broadcast(*checked);
+                                this.sync_after_vm_change(window, cx);
+                            })),
+                    ),
+            );
+        }
+
+        footer = footer.child(
+            Textarea::new(&self.thread_composer)
+                .aria_label("Thread reply composer")
+                .bordered(true),
+        );
+
+        Some(
+            div()
+                .id("thread-panel")
+                .test_support()
+                .key_context("PostboxThreadPanel")
+                .w(px(420.0))
+                .max_w(px(620.0))
+                .h_full()
+                .bg(rgb(p.background))
+                .border_l_1()
+                .border_color(rgb(p.border))
+                .flex()
+                .flex_col()
+                .child(header)
+                .child(body)
+                .child(footer)
+                .into_any_element(),
+        )
     }
 
     fn render_palette_overlay(&self, p: &ShadcnPalette, cx: &mut Context<Self>) -> AnyElement {
@@ -1124,8 +1772,9 @@ impl Render for PostboxShell {
 
         let p = ShadcnPalette::for_choice(self.vm.theme());
         let shell_for_timeline = cx.entity();
+        let bulk_count = self.vm.bulk_selected_count();
 
-        let sidebar_pane = div()
+        let mut sidebar_pane = div()
             .id("chat-sidebar")
             .test_support()
             .track_focus(&self.sidebar_focus)
@@ -1136,52 +1785,130 @@ impl Render for PostboxShell {
             .border_r_1()
             .border_color(rgb(p.border))
             .flex()
-            .flex_col()
-            .child(if self.sidebar_rows_cache.is_empty() {
+            .flex_col();
+
+        // Compact inline bulk-archive banner shown ONLY while Ctrl+A selection is active (zero permanent toolbar).
+        if bulk_count > 0 {
+            sidebar_pane = sidebar_pane.child(
                 div()
-                    .flex_1()
+                    .id("bulk-selection-banner")
+                    .test_support()
+                    .px_3()
+                    .py_2()
+                    .bg(rgb(p.secondary))
+                    .border_b_1()
+                    .border_color(rgb(p.border))
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .p_4()
-                    .text_size(px(TYPE_TIME_PX))
-                    .text_color(rgb(p.muted_foreground))
-                    .child("No chats in this view. Press Ctrl+K for commands.")
-                    .into_any_element()
-            } else {
-                v_virtual_list(
-                    cx.entity(),
-                    "chat-sidebar-list",
-                    self.sidebar_item_sizes.clone(),
-                    |this, visible_range, _window, cx| {
-                        visible_range
-                            .map(|ix| this.render_chat_row(ix, cx))
-                            .collect()
-                    },
-                )
-                .track_scroll(&self.sidebar_scroll)
-                .flex_1()
-                .w_full()
-                .into_any_element()
-            });
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(TYPE_LABEL_PX))
+                            .text_color(rgb(p.foreground))
+                            .child(format!("{bulk_count} selected")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .id("bulk-archive-btn")
+                                    .test_support()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .bg(rgb(p.primary))
+                                    .text_size(px(TYPE_LABEL_PX))
+                                    .text_color(rgb(p.primary_foreground))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.vm.archive_selected();
+                                        this.sync_after_vm_change(window, cx);
+                                    }))
+                                    .child("Archive"),
+                            )
+                            .child(
+                                div()
+                                    .id("bulk-cancel-btn")
+                                    .test_support()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .bg(rgb(p.muted))
+                                    .text_size(px(TYPE_LABEL_PX))
+                                    .text_color(rgb(p.muted_foreground))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.vm.cancel_bulk_selection();
+                                        this.sync_after_vm_change(window, cx);
+                                    }))
+                                    .child("Cancel"),
+                            ),
+                    ),
+            );
+        }
 
-        let timeline_pane = if self.vm.timeline_items().is_empty() {
+        sidebar_pane = sidebar_pane.child(if self.sidebar_rows_cache.is_empty() {
             div()
-                .id("message-timeline-empty")
-                .test_support()
                 .flex_1()
-                .w_full()
                 .flex()
                 .items_center()
                 .justify_center()
+                .p_4()
+                .text_size(px(TYPE_TIME_PX))
                 .text_color(rgb(p.muted_foreground))
-                .child("Press Ctrl+K to open the command palette or F1 for shortcuts")
+                .child(self.vm.hub_status().sidebar_empty_label())
                 .into_any_element()
+        } else {
+            v_virtual_list(
+                cx.entity(),
+                "chat-sidebar-list",
+                self.sidebar_item_sizes.clone(),
+                |this, visible_range, _window, cx| {
+                    visible_range
+                        .map(|ix| this.render_chat_row(ix, cx))
+                        .collect()
+                },
+            )
+            .track_scroll(&self.sidebar_scroll)
+            .flex_1()
+            .w_full()
+            .into_any_element()
+        });
+
+        let timeline_pane = if self.vm.timeline_items().is_empty() {
+            if self.vm.chats().is_empty() || !self.vm.hub_status().is_configured() {
+                self.render_hub_status_card(&p, cx)
+            } else {
+                div()
+                    .id("message-timeline-empty")
+                    .test_support()
+                    .flex_1()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p_6()
+                    .child(
+                        div()
+                            .text_size(px(TYPE_CHAT_NAME_PX))
+                            .text_color(rgb(p.muted_foreground))
+                            .child("No messages yet"),
+                    )
+                    .into_any_element()
+            }
         } else {
             MessageScroller::new(
                 "message-timeline",
                 self.timeline_state.clone(),
-                move |ix, _window, cx| shell_for_timeline.read(cx).render_timeline_row(ix),
+                move |ix, _window, cx| {
+                    shell_for_timeline
+                        .read(cx)
+                        .render_timeline_row(ix, shell_for_timeline.clone())
+                },
             )
             .flex_1()
             .w_full()
@@ -1247,7 +1974,7 @@ impl Render for PostboxShell {
                     .child(composer_section),
             );
 
-        // ZERO TOOLBAR: Root container holds only View Rail + Virtualized Sidebar + Timeline/Composer + Overlays.
+        // ZERO TOOLBAR: Root container holds only View Rail + Virtualized Sidebar + Timeline/Composer + Optional Thread Panel + Overlays.
         let mut root = div()
             .id("postbox-root")
             .test_support()
@@ -1307,6 +2034,9 @@ impl Render for PostboxShell {
             }))
             .on_action(cx.listener(|this, _: &Refresh, window, cx| {
                 this.dispatch_vm_action(PbAction::Refresh, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RestartLiveSync, window, cx| {
+                this.dispatch_vm_action(PbAction::RestartLiveSync, window, cx);
             }))
             .on_action(cx.listener(|this, _: &Quit, window, cx| {
                 this.dispatch_vm_action(PbAction::Quit, window, cx);
@@ -1401,6 +2131,21 @@ impl Render for PostboxShell {
             .on_action(cx.listener(|this, _: &ReplyToMessage, window, cx| {
                 this.dispatch_vm_action(PbAction::ReplyToMessage, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenThread, window, cx| {
+                this.dispatch_vm_action(PbAction::OpenThread, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResendFailedMessage, window, cx| {
+                this.dispatch_vm_action(PbAction::ResendFailedMessage, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseThreadPanel, window, cx| {
+                this.dispatch_vm_action(PbAction::CloseThreadPanel, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CycleThreadFocus, window, cx| {
+                this.dispatch_vm_action(PbAction::CycleThreadFocus, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleThreadBroadcast, window, cx| {
+                this.dispatch_vm_action(PbAction::ToggleThreadBroadcast, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenLinksAndMedia, window, cx| {
                 this.dispatch_vm_action(PbAction::OpenLinksAndMedia, window, cx);
             }))
@@ -1425,6 +2170,10 @@ impl Render for PostboxShell {
             .child(self.render_view_rail(&p, cx))
             .child(sidebar_pane)
             .child(main_column);
+
+        if let Some(thread_panel) = self.render_thread_panel(&p, cx) {
+            root = root.child(thread_panel);
+        }
 
         if self.vm.palette_open() {
             root = root.child(self.render_palette_overlay(&p, cx));
@@ -1473,6 +2222,7 @@ pub fn run_desktop(launch_ctx: PostboxLaunchContext) {
 #[cfg(all(test, feature = "desktop-test"))]
 mod desktop_tests {
     use super::*;
+    use crate::sync_bridge::create_sync_bridge;
     use gpui_kit::base::Root;
     use gpui_kit::test::{TestEventExt as _, TestWindowExt as _};
     use gpui_kit::{TestAppContext, WindowHandle};
@@ -1514,7 +2264,7 @@ mod desktop_tests {
             avatar_hash: None,
         };
         let bob = Chat {
-            key: ChatKey::new(Provider::Slack, "T1", "C-bob"),
+            key: ChatKey::new(Provider::Slack, "T1", "slack:T1:C-bob"),
             title: "Bob".into(),
             is_group: false,
             archived_local: false,
@@ -1546,17 +2296,62 @@ mod desktop_tests {
                 deleted: false,
             })
             .unwrap();
+        store
+            .upsert_message(&Message {
+                chat: bob.key.clone(),
+                msg_id: "1700.1".into(),
+                sender_id: "U1".into(),
+                sender_name: "Bob".into(),
+                from_me: false,
+                ts: "2025-01-15T11:00:00Z".into(),
+                body: "Thread root".into(),
+                reply_to_id: None,
+                reply_broadcast: false,
+                media_kind: None,
+                mime_type: None,
+                filename: None,
+                reactions: vec![],
+                read_status: ReadStatus::None,
+                deleted: false,
+            })
+            .unwrap();
+        store
+            .upsert_message(&Message {
+                chat: bob.key,
+                msg_id: "1700.2".into(),
+                sender_id: "U2".into(),
+                sender_name: "Carol".into(),
+                from_me: false,
+                ts: "2025-01-15T11:01:00Z".into(),
+                body: "First folded reply".into(),
+                reply_to_id: Some("1700.1".into()),
+                reply_broadcast: false,
+                media_kind: None,
+                mime_type: None,
+                filename: None,
+                reactions: vec![],
+                read_status: ReadStatus::None,
+                deleted: false,
+            })
+            .unwrap();
 
         PostboxLaunchContext {
             store,
             keymap: Keymap::postbox_defaults(),
             version: "0.1.0".into(),
             started_at: Instant::now(),
+            hub_status: HubConnectionStatus::Connected {
+                url: "https://hub.example".into(),
+                last_event_id: Some(1),
+            },
+            sync_bridge: None,
         }
     }
 
-    fn open_shell(cx: &mut TestAppContext) -> (WindowHandle<Root>, Entity<PostboxShell>) {
-        let launch_ctx = seeded_launch_ctx();
+    fn open_shell_with_ctx(
+        cx: &mut TestAppContext,
+        launch_ctx: PostboxLaunchContext,
+    ) -> (WindowHandle<Root>, Entity<PostboxShell>) {
         let keymap = launch_ctx.keymap.clone();
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -1581,6 +2376,10 @@ mod desktop_tests {
             .expect("open Postbox test window");
             (window.downcast::<Root>().expect("Base Root"), shell)
         })
+    }
+
+    fn open_shell(cx: &mut TestAppContext) -> (WindowHandle<Root>, Entity<PostboxShell>) {
+        open_shell_with_ctx(cx, seeded_launch_ctx())
     }
 
     #[gpui_kit::test]
@@ -1760,6 +2559,19 @@ mod desktop_tests {
             );
         });
 
+        // Note: clicking/navigating to Alice marked her read (user_viewed = true).
+        // Mark Alice unread again to test `u` unread filter cleanly.
+        cx.update(|cx| {
+            shell.update(cx, |this, cx| {
+                let mut alice = this.vm.selected_chat().unwrap().clone();
+                alice.unread_count = 1;
+                this.vm.store().upsert_chat(&alice, 200).unwrap();
+                this.vm.refresh_chats();
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             window.press("u", cx);
@@ -1813,7 +2625,6 @@ mod desktop_tests {
             assert_eq!(vm.marked_messages_count(), 1);
         });
 
-        // A second Esc (now with palette closed) clears the marked message cascade layer.
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             window.press("escape", cx);
@@ -1887,6 +2698,301 @@ mod desktop_tests {
                 shell_ref.palette_state.read(cx).selected_index(),
                 Some(IndexPath::new(0).section(0))
             );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn composer_empty_ctrl_a_up_down_override_textarea_and_nonempty_restores_input(
+        cx: &mut TestAppContext,
+    ) {
+        let mut ctx = seeded_launch_ctx();
+        // Seed a second message in Alice's chat so `up`/`down` selection is directly verifiable.
+        ctx.store
+            .upsert_message(&Message {
+                chat: ChatKey::new(Provider::Whatsapp, "main", "alice@s.whatsapp.net"),
+                msg_id: "m2".into(),
+                sender_id: "alice".into(),
+                sender_name: "Alice".into(),
+                from_me: false,
+                ts: "2025-01-15T12:01:00Z".into(),
+                body: "Second message from Alice".into(),
+                reply_to_id: None,
+                reply_broadcast: false,
+                media_kind: None,
+                mime_type: None,
+                filename: None,
+                reactions: vec![],
+                read_status: ReadStatus::Read,
+                deleted: false,
+            })
+            .unwrap();
+        let (handle, shell) = open_shell_with_ctx(cx, ctx);
+        // Focus empty composer (`c`), press `up` / `down` -> selects previous/next message!
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("c", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(
+                shell
+                    .read(cx)
+                    .view_model()
+                    .selected_message()
+                    .map(|m| m.msg_id.as_str()),
+                Some("m2")
+            );
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("up", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(
+                shell
+                    .read(cx)
+                    .view_model()
+                    .selected_message()
+                    .map(|m| m.msg_id.as_str()),
+                Some("m1")
+            );
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("down", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(
+                shell
+                    .read(cx)
+                    .view_model()
+                    .selected_message()
+                    .map(|m| m.msg_id.as_str()),
+                Some("m2")
+            );
+        });
+
+        // Press `ctrl-a` while composer is empty -> selects all visible chats!
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-a", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(shell.read(cx).view_model().bulk_selected_count(), 2);
+        });
+
+        // Clear bulk selection, type into composer so it is non-empty, press `ctrl-a`:
+        // should NOT select chats (Textarea keeps Input select-all).
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("escape", cx);
+            window.input("draft text", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-a", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert_eq!(shell.read(cx).view_model().bulk_selected_count(), 0);
+            assert_eq!(shell.read(cx).view_model().composer_text(), "draft text");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn hub_not_configured_shows_setup_card_and_palette_status(cx: &mut TestAppContext) {
+        let ctx = PostboxLaunchContext {
+            store: Store::open_in_memory().unwrap(),
+            keymap: Keymap::postbox_defaults(),
+            version: "0.1.0".into(),
+            started_at: Instant::now(),
+            hub_status: HubConnectionStatus::NotConfigured {
+                missing_url: true,
+                missing_token: true,
+                configured_url: None,
+                detail: None,
+            },
+            sync_bridge: None,
+        };
+        let (handle, shell) = open_shell_with_ctx(cx, ctx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("hub-status-card").is_some());
+            assert!(window.try_find("toolbar").is_none());
+            window.press("ctrl-k", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let entries = shell.read(cx).view_model().palette_entries();
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.label.contains("Hub: Not configured"))
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn slack_thread_panel_opens_toggles_broadcast_and_resets_on_send_and_esc(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, shell) = open_shell(cx);
+        // Select Bob (Slack chat with folded thread) and open thread panel.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("j", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                assert!(this.vm.open_thread("1700.1"));
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("thread-panel").is_some());
+            assert!(window.try_find("thread-broadcast-wrap").is_some());
+            // Typing Space inside `thread_composer` MUST insert `' '` and MUST NOT flip `broadcast`!
+            window.input("Broadcast", cx);
+            window.press("space", cx);
+            window.input("update", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let panel = shell.read(cx).view_model().thread_panel().unwrap();
+            assert_eq!(panel.composer_text, "Broadcast update");
+            assert!(!panel.broadcast);
+        });
+
+        // `Tab` moves focus to `thread-broadcast-wrap`, then `Space` toggles `broadcast`!
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("tab", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("space", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let vm = shell.read(cx).view_model();
+            assert_eq!(vm.focus(), FocusTarget::ThreadBroadcast);
+            assert!(vm.thread_panel().unwrap().broadcast);
+        });
+
+        cx.update(|cx| {
+            shell.update(cx, |this, cx| {
+                assert!(this.vm.submit_thread_reply());
+                let panel = this.vm.thread_panel().unwrap();
+                assert!(!panel.broadcast); // IGSH-1898 auto-reset!
+                this.vm.set_thread_broadcast(true);
+                this.vm.handle_escape();
+                assert!(this.vm.thread_panel().is_none());
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("thread-panel").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn sync_bridge_event_updates_sidebar_and_timeline_with_zero_polling(cx: &mut TestAppContext) {
+        let (bridge, worker) = create_sync_bridge();
+        let store = Store::open_shared_memory("desktop_sync_bridge_test").unwrap();
+        let writer_store = Store::open_shared_memory("desktop_sync_bridge_test").unwrap();
+        let ctx = PostboxLaunchContext {
+            store,
+            keymap: Keymap::postbox_defaults(),
+            version: "0.1.0".into(),
+            started_at: Instant::now(),
+            hub_status: HubConnectionStatus::Connecting {
+                url: "http://127.0.0.1:9999".into(),
+            },
+            sync_bridge: Some(bridge),
+        };
+        let (handle, shell) = open_shell_with_ctx(cx, ctx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("hub-status-card").is_some());
+        })
+        .unwrap();
+
+        // Background writer inserts a chat and notifies via SyncBridge.
+        let chat = Chat {
+            key: ChatKey::new(Provider::Whatsapp, "personal", "live@s.whatsapp.net"),
+            title: "Live Sync Chat".into(),
+            is_group: false,
+            archived_local: false,
+            archived_remote: false,
+            pinned: false,
+            unread_count: 1,
+            last_msg_ts: "2026-11-26T12:00:00Z".into(),
+            last_msg_preview: "Arrived via SSE".into(),
+            avatar_hash: None,
+        };
+        writer_store.upsert_chat(&chat, 1_000).unwrap();
+        worker
+            .event_tx
+            .try_send(SyncEvent::StatusChanged(HubConnectionStatus::Connected {
+                url: "http://127.0.0.1:9999".into(),
+                last_event_id: Some(7),
+            }))
+            .unwrap();
+        worker
+            .event_tx
+            .try_send(SyncEvent::ChatsUpdated { reset: true })
+            .unwrap();
+
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("chat-row-0").is_some());
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let vm = shell.read(cx).view_model();
+            assert_eq!(vm.chats().len(), 1);
+            assert_eq!(vm.chats()[0].title, "Live Sync Chat");
+            assert!(matches!(
+                vm.hub_status(),
+                HubConnectionStatus::Connected {
+                    last_event_id: Some(7),
+                    ..
+                }
+            ));
         });
     }
 }

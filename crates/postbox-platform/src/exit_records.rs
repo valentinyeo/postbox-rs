@@ -7,7 +7,54 @@ use crate::PlatformError;
 use postbox_core::crash::{EXIT_RECORD_FILE, ExitRecord, rotated};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+pub const PENDING_CRASH_FILE: &str = "pending-crash.json";
+
+// An upload of an older report must not remove a panic written while HTTP was in flight.
+static PENDING_CRASH_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn read_pending_crash(data_dir: &Path) -> Option<String> {
+    let _guard = PENDING_CRASH_LOCK.lock().ok()?;
+    std::fs::read_to_string(data_dir.join(PENDING_CRASH_FILE)).ok()
+}
+
+pub fn clear_pending_crash(data_dir: &Path) {
+    if let Ok(_guard) = PENDING_CRASH_LOCK.lock() {
+        let _ = std::fs::remove_file(data_dir.join(PENDING_CRASH_FILE));
+    }
+}
+
+pub fn clear_pending_crash_if_matches(data_dir: &Path, uploaded: &str) {
+    if let Ok(_guard) = PENDING_CRASH_LOCK.lock() {
+        let path = data_dir.join(PENDING_CRASH_FILE);
+        if std::fs::read_to_string(&path).ok().as_deref() == Some(uploaded) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn write_pending_crash(data_dir: &Path, record: &ExitRecord, backtrace: &str) {
+    let mut end = backtrace.len().min(4096);
+    while !backtrace.is_char_boundary(end) {
+        end -= 1;
+    }
+    let report = serde_json::json!({
+        "kind": "panic",
+        "version": record.version,
+        "os": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        "uptime_ms": record.uptime_ms,
+        "message": record.message,
+        "location": record.location,
+        "backtrace": &backtrace[..end],
+        "timestamp_ms": record.timestamp_unix_ms,
+    });
+    if let Ok(_guard) = PENDING_CRASH_LOCK.lock() {
+        let _ = std::fs::create_dir_all(data_dir);
+        let _ = std::fs::write(data_dir.join(PENDING_CRASH_FILE), report.to_string());
+    }
+}
 
 /// Append-only JSONL log of clean exits and panics.
 #[derive(Debug, Clone)]
@@ -92,6 +139,8 @@ pub fn install_panic_hook(store: ExitRecordStore, version: &'static str, started
             message.as_deref(),
             location.as_deref(),
         );
+        let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+        write_pending_crash(store.dir(), &record, &backtrace);
         let _ = store.record(&record);
         previous(info);
     }));
@@ -119,6 +168,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn pending_report_round_trips_sanitized_payload_and_clears() {
+        let dir = temp_dir("pending").join("nested");
+        assert_eq!(read_pending_crash(&dir), None);
+        clear_pending_crash(&dir);
+        let record = ExitRecord::panic(
+            "0.1.2",
+            42,
+            123,
+            Some("panic with token=abcdefghijklmnopqrstuvwxyz012345"),
+            Some("crates/postbox-ui/src/desktop.rs:3:1"),
+        );
+        write_pending_crash(&dir, &record, "frame one\nframe two");
+        let text = read_pending_crash(&dir).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(report["kind"], "panic");
+        assert_eq!(report["version"], "0.1.2");
+        assert_eq!(
+            report["os"],
+            format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+        );
+        assert_eq!(report["uptime_ms"], 42);
+        assert_eq!(report["timestamp_ms"], 123);
+        assert_eq!(report["message"], "panic with <redacted>");
+        assert_eq!(report["location"], "desktop.rs:3:1");
+        assert_eq!(report["backtrace"], "frame one\nframe two");
+        assert!(!text.contains("abcdefghijklmnopqrstuvwxyz012345"));
+        clear_pending_crash_if_matches(&dir, "an older upload");
+        assert!(read_pending_crash(&dir).is_some());
+        clear_pending_crash_if_matches(&dir, &text);
+        assert_eq!(read_pending_crash(&dir), None);
+        write_pending_crash(&dir, &record, "another trace");
+        clear_pending_crash(&dir);
+        assert_eq!(read_pending_crash(&dir), None);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn backtrace_is_bounded_without_splitting_a_utf8_character() {
+        let dir = temp_dir("backtrace");
+        let record = ExitRecord::panic("0.1.0", 1, 2, None, None);
+        let backtrace = format!("{}émore frames", "a".repeat(4095));
+        write_pending_crash(&dir, &record, &backtrace);
+        let text = read_pending_crash(&dir).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(report["backtrace"].as_str().unwrap().len(), 4095);
+        assert!(text.len() <= 16 * 1024);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -257,6 +356,12 @@ mod tests {
         assert_eq!(record.version, "0.1.0");
         assert_eq!(record.message.as_deref(), Some("simulated render panic"));
         assert!(record.location.is_some());
+        let text = read_pending_crash(&dir).expect("the hook also writes a pending report");
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(report["message"], "simulated render panic");
+        assert_eq!(report["version"], "0.1.0");
+        assert!(!report["backtrace"].as_str().unwrap().is_empty());
+        assert!(report["backtrace"].as_str().unwrap().len() <= 4096);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

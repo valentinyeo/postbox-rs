@@ -1,0 +1,13 @@
+{
+  "name": "postbox-crashes",
+  "account_id": "47f11f5cb07817c7704baf4926c4993c", // Public account ID, not a secret. trufflehog:ignore
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-27",
+  "workers_dev": true,
+  "kv_namespaces": [
+    {
+      "binding": "CRASHES",
+      "id": "7415da65eb4d42629dc7535f1f55ea3b"
+    }
+  ]
+}

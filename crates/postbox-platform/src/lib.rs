@@ -17,6 +17,12 @@ pub mod zip;
 #[allow(unsafe_code)]
 pub mod win;
 
+#[cfg(windows)]
+pub use win::crash::install_unhandled_exception_filter;
+
+#[cfg(not(windows))]
+pub fn install_unhandled_exception_filter(_data_dir: &std::path::Path, _version: &str) {}
+
 use postbox_core::ChatKey;
 use postbox_core::voice::AudioDeviceInfo;
 use std::collections::HashMap;

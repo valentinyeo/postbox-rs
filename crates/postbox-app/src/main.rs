@@ -4,6 +4,7 @@
 )]
 
 mod audio_service;
+mod crash_upload;
 mod sync;
 mod update_source;
 
@@ -460,10 +461,16 @@ fn main() {
     let started_at = Instant::now();
     let cfg = StartupConfig::from_args(std::env::args());
     let data_dir = default_data_dir();
+    let last_exit = arm_exit_records(&data_dir, started_at);
+    postbox_platform::install_unhandled_exception_filter(&data_dir, APP_VERSION);
+    crash_upload::install_panic_upload_hook(&data_dir);
+    let crash_dir = data_dir.clone();
+    let _ = std::thread::Builder::new()
+        .name("postbox-crash-upload".to_owned())
+        .spawn(move || crash_upload::upload_pending_crash(&crash_dir));
 
     #[cfg(feature = "desktop")]
     {
-        let last_exit = arm_exit_records(&data_dir, started_at);
         let role = resolve_startup_role(&cfg, &data_dir);
         match role {
             // Another Postbox already owns the single-instance lock and has the URL.
@@ -488,7 +495,7 @@ fn main() {
 
     #[cfg(not(feature = "desktop"))]
     {
-        let _ = arm_exit_records(&data_dir, started_at);
+        let _ = last_exit;
         let launch_ctx = build_launch_context(&cfg, started_at, false);
         let mut vm = postbox_ui::PostboxViewModel::new_uninitialized(
             launch_ctx.store,

@@ -27,3 +27,6 @@ postbox-store.workspace = true
 postbox-ui.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

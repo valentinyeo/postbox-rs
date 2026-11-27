@@ -5502,6 +5502,8 @@ dependencies = [
 name = "postbox-platform"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
+ "miniz_oxide 0.9.1",
  "postbox-core",
  "serde_json",
  "thiserror 2.0.21",

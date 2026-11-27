@@ -32,12 +32,15 @@ const BUFFER_BYTES: u32 = 64 * 1024;
 const RETRY_MS: u64 = 250;
 
 /// `\\.\pipe\<name>` as a path `std::fs` can open.
+///
+/// A name that already carries the namespace, in any case, is used as it is; the prefix is
+/// never added twice, which is what `postbox_core` hands over.
 pub fn pipe_path(name: &str) -> PathBuf {
-    if name.starts_with(r"\\.\pipe\") {
-        PathBuf::from(name)
-    } else {
-        PathBuf::from(format!(r"\\.\pipe\{name}"))
-    }
+    PathBuf::from(format!(
+        "{}{}",
+        crate::control_pipe::PIPE_PREFIX,
+        crate::control_pipe::underlying_pipe_name(name)
+    ))
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -194,6 +197,25 @@ pub fn disconnect(file: &mut File) -> Result<(), PlatformError> {
 mod tests {
     use super::*;
     use postbox_core::os_integration::{control_pipe_name, link_pipe_name};
+
+    #[test]
+    fn a_prefixed_name_is_never_prefixed_twice() {
+        for raw in [
+            r"postbox-control-test",
+            r"\\.\pipe\postbox-control-test",
+            r"\\.\PIPE\postbox-control-test",
+        ] {
+            assert_eq!(
+                pipe_path(raw),
+                PathBuf::from(r"\\.\pipe\postbox-control-test"),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            pipe_path(r"\\.\pipe\\.\pipe\postbox-link-test"),
+            PathBuf::from(r"\\.\pipe\postbox-link-test")
+        );
+    }
 
     #[test]
     fn pipe_paths_are_absolute_win32_names() {

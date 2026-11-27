@@ -466,6 +466,38 @@ mod control_round_trip {
     }
 
     #[test]
+    fn every_pipe_endpoint_names_itself_exactly_once() {
+        // The Windows CI failure this test replaces: `default_control_transport` handed the
+        // already-prefixed name to `Transport::pipe`, and `display` prefixed it again.
+        for user in ["valentin", "runneradmin", "Valentin-Yeo"] {
+            for (full, bare) in [
+                (control_pipe_name(user), format!("postbox-control-{user}")),
+                (link_pipe_name(user), format!("postbox-link-{user}")),
+            ] {
+                assert_eq!(Transport::pipe(&full).display(), full);
+                assert_eq!(Transport::pipe(&bare).display(), full);
+                assert_eq!(Transport::parse(&full).display(), full);
+                assert_eq!(
+                    Transport::pipe(&full)
+                        .display()
+                        .matches(r"\\.\pipe\")
+                        .count(),
+                    1
+                );
+            }
+        }
+        // The env-provided default endpoint is the per-user control pipe, once.
+        let default = postbox_platform::control_pipe::default_control_transport();
+        if cfg!(windows) {
+            let user = postbox_core::os_integration::current_user();
+            assert_eq!(
+                default.display(),
+                format!(r"\\.\pipe\postbox-control-{user}")
+            );
+        }
+    }
+
+    #[test]
     fn the_pipe_override_names_the_same_endpoint_the_server_uses() {
         let dir = temp_dir("ctl-override");
         let socket = dir.join("control.sock");
@@ -570,6 +602,106 @@ mod updater {
         let backup = report.backup.expect("the previous build was kept");
         assert_eq!(std::fs::read(&backup).unwrap(), b"installed build");
         assert!(!dir.join("postbox-windows-x64.zip.staged").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A release zip as the PowerShell workflow writes it: every entry deflated, sizes and
+    /// CRC-32 only in the central directory, and a data descriptor after the payload.
+    fn deflated_release_zip(name: &str, payload: &[u8]) -> Vec<u8> {
+        let raw = miniz_oxide::deflate::compress_to_vec(payload, 6);
+        let crc = crc32fast::hash(payload);
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes()); // local header
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0x0808u16.to_le_bytes());
+        out.extend_from_slice(&8u16.to_le_bytes()); // deflate
+        out.extend_from_slice(&[0u8; 16]); // time, date, crc, sizes: streamed
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&raw);
+        out.extend_from_slice(&0x0807_4b50u32.to_le_bytes()); // data descriptor
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+
+        let central_offset = out.len();
+        out.extend_from_slice(&0x0201_4b50u32.to_le_bytes()); // central header
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0x0808u16.to_le_bytes());
+        out.extend_from_slice(&8u16.to_le_bytes());
+        out.extend_from_slice(&[0u8; 4]); // time, date
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&[0u8; 12]); // extra, comment, disk, attrs
+        out.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        out.extend_from_slice(name.as_bytes());
+
+        let central_size = out.len() - central_offset;
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes()); // end of central dir
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&(central_size as u32).to_le_bytes());
+        out.extend_from_slice(&(central_offset as u32).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn a_compressed_release_zip_installs_like_the_uncompressed_one() {
+        // The Windows release workflow runs `Compress-Archive`, which deflates by default.
+        // This proves that archive installs without the CI workaround of storing entries.
+        let dir = temp_dir("update-deflated");
+        let live = dir.join("postbox.exe");
+        std::fs::write(&live, b"installed build").unwrap();
+
+        let payload: Vec<u8> = (0..50_000u32).map(|i| (i % 97) as u8).collect();
+        let archive = deflated_release_zip("postbox-windows-x64/postbox.exe", &payload);
+        let asset = manifest_for(&archive, "v0.2.0").select_asset().unwrap();
+
+        let report = postbox_platform::install(
+            &asset,
+            &archive,
+            &dir,
+            postbox_platform::updater::EXE_ASSET_NAME,
+            &postbox_platform::ZipExtractor,
+            &postbox_platform::NativeReplacer,
+        )
+        .expect("a deflated release zip installs");
+
+        assert_eq!(std::fs::read(&live).unwrap(), payload);
+        assert_eq!(report.verified_sha256, digest_hex(&archive));
+        assert_eq!(report.backup, Some(dir.join("postbox.exe.backup.exe")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unsupported_compression_method_never_reaches_the_live_binary() {
+        let dir = temp_dir("update-unsupported");
+        let live = dir.join("postbox.exe");
+        std::fs::write(&live, b"installed build").unwrap();
+
+        let mut archive = deflated_release_zip("postbox.exe", b"new build");
+        // Method 14 is LZMA: never produced by the release workflow, so it is refused.
+        let central = archive.len() - 22 - 46 - "postbox.exe".len();
+        archive[central + 10] = 14;
+        let asset = manifest_for(&archive, "v0.2.0").select_asset().unwrap();
+
+        let err = postbox_platform::install(
+            &asset,
+            &archive,
+            &dir,
+            postbox_platform::updater::EXE_ASSET_NAME,
+            &postbox_platform::ZipExtractor,
+            &postbox_platform::NativeReplacer,
+        )
+        .expect_err("an unknown method is refused");
+        assert!(matches!(err, UpdateError::Io(_)), "{err:?}");
+        assert_eq!(std::fs::read(&live).unwrap(), b"installed build");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

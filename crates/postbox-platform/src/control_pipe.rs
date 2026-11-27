@@ -14,6 +14,25 @@ use std::time::Duration;
 pub const READ_TIMEOUT_MS: u64 = 2_000;
 /// How long `postboxctl` waits for the app to answer.
 pub const CONNECT_TIMEOUT_MS: u64 = 2_000;
+/// The Win32 namespace every named pipe lives in.
+pub const PIPE_PREFIX: &str = r"\\.\pipe\";
+
+/// The kernel name of a named pipe: `\\.\pipe\foo` and `foo` both give `foo`.
+///
+/// Callers hand over either form (`Transport::parse` and `postbox_core` hand over the
+/// full path), so the prefix is stripped here and added back exactly once by
+/// [`Transport::display`] and by `crate::win::ipc`.
+pub fn underlying_pipe_name(raw: &str) -> &str {
+    let mut name = raw.trim();
+    while name.len() > PIPE_PREFIX.len()
+        && name
+            .get(..PIPE_PREFIX.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(PIPE_PREFIX))
+    {
+        name = &name[PIPE_PREFIX.len()..];
+    }
+    name
+}
 
 /// Where the control channel lives on this host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,9 +45,12 @@ pub enum Transport {
 
 impl Transport {
     /// A pipe name that can never collide between users or test runs.
+    ///
+    /// Either `postbox-control-valentin` or `\\.\pipe\postbox-control-valentin` is
+    /// accepted; both name the same endpoint and [`Transport::display`] prints it once.
     pub fn pipe(name: &str) -> Self {
         Self::NamedPipe {
-            name: name.to_owned(),
+            name: underlying_pipe_name(name).to_owned(),
         }
     }
 
@@ -39,8 +61,8 @@ impl Transport {
     /// Parses `--pipe`: a path when it contains a separator, a named pipe otherwise.
     pub fn parse(raw: &str) -> Self {
         let trimmed = raw.trim();
-        if trimmed.starts_with(r"\\.\pipe\") || trimmed.starts_with("\\\\.\\pipe\\") {
-            return Self::pipe(trimmed.split('\\').next_back().unwrap_or(trimmed));
+        if underlying_pipe_name(trimmed) != trimmed {
+            return Self::pipe(trimmed);
         }
         if trimmed.contains(['/', '\\']) || trimmed.ends_with(".sock") {
             return Self::socket(trimmed);
@@ -51,7 +73,7 @@ impl Transport {
     /// Human-readable endpoint, for error messages and `postboxctl --help`.
     pub fn display(&self) -> String {
         match self {
-            Self::NamedPipe { name } => format!(r"\\.\pipe\{name}"),
+            Self::NamedPipe { name } => format!("{PIPE_PREFIX}{name}"),
             Self::UnixSocket { path } => path.display().to_string(),
         }
     }
@@ -305,6 +327,44 @@ mod tests {
         assert_eq!(
             Transport::parse(r"\\.\pipe\postbox-control-valentin").display(),
             r"\\.\pipe\postbox-control-valentin"
+        );
+    }
+
+    #[test]
+    fn a_prefixed_pipe_name_displays_exactly_once_on_every_platform() {
+        // `default_control_transport` and `postbox_core` hand over the full path, so
+        // `Transport::pipe` must accept it and `display` must not add the prefix twice.
+        let full = r"\\.\pipe\foo";
+        assert_eq!(Transport::pipe(full).display(), full);
+        assert_eq!(Transport::pipe("foo").display(), full);
+        assert_eq!(Transport::pipe("foo"), Transport::pipe(full));
+        assert_eq!(Transport::parse(full).display(), full);
+        // The full path pasted twice by a user still names one pipe.
+        let pasted_twice = format!("{PIPE_PREFIX}{PIPE_PREFIX}foo");
+        assert_eq!(Transport::pipe(&pasted_twice).display(), full);
+        assert_eq!(
+            Transport::parse(r"\\.\pipe\postbox-control-valentin").display(),
+            r"\\.\pipe\postbox-control-valentin"
+        );
+        assert_eq!(
+            Transport::pipe(full)
+                .display()
+                .matches(r"\\.\pipe\")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_default_control_pipe_has_one_prefix_on_every_platform() {
+        let user = postbox_core::os_integration::current_user();
+        let expected = format!(r"\\.\pipe\postbox-control-{user}");
+        let transport = Transport::pipe(&postbox_core::os_integration::control_pipe_name(&user));
+        assert_eq!(transport.display(), expected);
+        assert_eq!(transport.display().matches(r"\\.\pipe\").count(), 1);
+        assert_eq!(
+            transport,
+            Transport::pipe(&format!("postbox-control-{user}"))
         );
     }
 

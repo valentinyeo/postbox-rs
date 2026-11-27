@@ -215,6 +215,24 @@ mod tests {
     use postbox_core::os_integration::{
         handler_command_line, link_pipe_name, normalize_user, url_protocol_values,
     };
+    use std::path::PathBuf;
+
+    #[test]
+    fn forwarding_names_the_same_pipe_the_window_serves() {
+        // A second launch forwards to the link pipe the running window listens on. Both
+        // sides now tolerate the `\\.\pipe\` prefix, so neither can name a pipe twice.
+        let user = "valentin";
+        let served = name_for_link(user);
+        assert_eq!(served, "postbox-link-valentin");
+        assert_eq!(
+            ipc::pipe_path(&served),
+            PathBuf::from(r"\\.\pipe\postbox-link-valentin")
+        );
+        assert_eq!(
+            ipc::pipe_path(&link_pipe_name(user)),
+            ipc::pipe_path(&served)
+        );
+    }
 
     #[test]
     fn the_link_pipe_name_strips_to_the_kernel_name() {

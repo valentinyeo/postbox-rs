@@ -10,6 +10,7 @@ pub mod updater;
 pub mod video;
 pub mod voice_auth;
 pub mod window_state;
+pub mod zip;
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
@@ -71,6 +72,7 @@ pub use voice_auth::{
     save_microphone_choice,
 };
 pub use window_state::{MonitorRect, WINDOW_STATE_VALUE, WindowState};
+pub use zip::{CTL_ASSET_NAME, ZipEntry, ZipExtractor, extract_entry, find_zip_entry};
 
 #[derive(Debug, Error)]
 pub enum PlatformError {

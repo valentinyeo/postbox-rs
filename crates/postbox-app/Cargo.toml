@@ -25,4 +25,5 @@ postbox-media.workspace = true
 postbox-platform.workspace = true
 postbox-store.workspace = true
 postbox-ui.workspace = true
+reqwest.workspace = true
 tokio.workspace = true

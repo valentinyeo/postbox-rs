@@ -14,6 +14,7 @@ use crate::timeline::{
 use postbox_core::archive::{
     ArchiveStatus, ArchiveTable, PendingArchiveIntent, archive_baseline, unix_seconds,
 };
+use postbox_core::deep_link::DeepLinkTarget;
 use postbox_core::dictation::DictationLanguage;
 use postbox_core::drafts::validate_draft_text;
 use postbox_core::outbox::{OutboxRecord, generate_client_id};
@@ -63,6 +64,15 @@ pub struct PostboxLaunchContext {
     pub audio_backend: Option<std::sync::Arc<dyn postbox_platform::AudioBackend>>,
     /// Milestone 6: disk cache for video thumbnails (keyed by video content SHA-256).
     pub video_thumb_cache: Option<postbox_media::VideoThumbnailCache>,
+    /// Milestone 7: `postbox://` URL this launch should open.
+    pub startup_link: Option<String>,
+    /// Milestone 7: the previous run's exit record, so a crash can be reported.
+    pub last_exit_record: Option<postbox_core::crash::ExitRecord>,
+    /// Milestone 7: `false` in tests and in CI, so no registry, mutex or pipe is touched.
+    pub os_integration: bool,
+    /// Milestone 7: manifest/archive source for "Check for updates". `None` keeps the shell
+    /// offline; the app injects the GitHub Releases source.
+    pub release_source: Option<std::sync::Arc<dyn postbox_platform::ReleaseSource>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +242,12 @@ pub struct PostboxViewModel {
     pub(crate) m4: M4State,
     pub(crate) m5: M5State,
     pub(crate) m6: M6State,
+    /// Milestone 7: deep links, the "Chat not found" card and the updater state.
+    pub(crate) m7: crate::m7::M7State,
+    /// Milestone 7: per-chat high-water mark so a replayed page never toasts twice.
+    pub(crate) notification_gate: postbox_core::toast::NotificationGate,
+    /// Milestone 7: set by the palette command, cleared by whoever starts the real check.
+    pub(crate) update_check_requested: bool,
 }
 
 impl PostboxViewModel {
@@ -331,6 +347,9 @@ impl PostboxViewModel {
             m4,
             m5: M5State::default(),
             m6: M6State::default(),
+            m7: crate::m7::M7State::default(),
+            notification_gate: postbox_core::toast::NotificationGate::new(),
+            update_check_requested: false,
         }
     }
 
@@ -2683,6 +2702,7 @@ impl PostboxViewModel {
             selected_message: self.selected_message(),
             bulk_selected_count: self.bulk_selected.len(),
             marked_messages_count: self.marked_voice_messages_count(),
+            update_label: self.m7.update_label(),
         };
         let commands = build_palette_items(&catalog_ctx);
 
@@ -3015,10 +3035,14 @@ impl PostboxViewModel {
             PaletteCommand::PlayVideoInline => {
                 self.request_video_player_open_selected();
             }
+            PaletteCommand::CheckForUpdates => {
+                // The desktop shell kicks off the real check; headless keeps a visible notice.
+                self.status_notice = Some(self.m7.update_label().to_owned());
+                self.update_check_requested = true;
+            }
             PaletteCommand::CopyMessageLink
             | PaletteCommand::OpenVideoExternal
-            | PaletteCommand::AttachFile
-            | PaletteCommand::CheckForUpdates => {
+            | PaletteCommand::AttachFile => {
                 self.status_notice = Some("Command queued".into());
             }
             PaletteCommand::SearchChats
@@ -3082,8 +3106,153 @@ impl PostboxViewModel {
         self.latest_chord.reset();
     }
 
+    // -------------------------------------------------------------------------
+    // Milestone 7: deep links, status cards and the updater
+    // -------------------------------------------------------------------------
+
+    /// Applies a `postbox://` link or a `focus` signal and reports what the shell should do.
+    ///
+    /// Selecting the chat is done here, so the caller only has to raise the window. A link to
+    /// a chat that is not on disk leaves a dismissible card instead of failing the launch.
+    pub fn open_deep_link(&mut self, line: &str, now_ms: u64) -> crate::m7::LinkAction {
+        let action = self.m7.accept_link(line, now_ms, |target| {
+            self.store.get_chat(&target.chat).ok().flatten().is_some()
+                || self.chats.iter().any(|chat| chat.key == target.chat)
+        });
+        if let Some(target) = action.open.clone() {
+            self.focus_deep_link_chat(&target);
+        }
+        action
+    }
+
+    fn focus_deep_link_chat(&mut self, target: &DeepLinkTarget) {
+        // A cross-account link must switch the view first, otherwise the chat list cannot
+        // contain the chat and `select_chat_key` gives up.
+        let view_key = format!("{}:{}", target.chat.provider.as_str(), target.chat.account);
+        let already_in_view = self
+            .active_view()
+            .map(|view| view.view_key() == view_key)
+            .unwrap_or(false);
+        if !already_in_view {
+            let _ = self.switch_to_view_key(&view_key);
+        }
+        if !self.select_chat_key(&target.chat) {
+            // Fall back to the combined inbox, which lists every account.
+            self.switch_to_combined_inbox();
+            let _ = self.select_chat_key(&target.chat);
+        }
+        if let Some(message) = target.message.as_deref()
+            && let Some(idx) = self
+                .messages
+                .iter()
+                .position(|msg| msg.msg_id == message && msg.chat == target.chat)
+        {
+            self.select_message_index(idx);
+            self.marked_messages.insert(message.to_owned());
+            self.rebuild_timeline();
+            self.status_notice = Some("Opening linked message".into());
+        }
+        self.focus = FocusTarget::MessageList;
+    }
+
+    /// The status card currently shown, if any.
+    pub fn status_card(&self) -> Option<&crate::m7::StatusCard> {
+        self.m7.card.as_ref()
+    }
+
+    /// Dismisses the status card. Returns `true` when something was dismissed.
+    pub fn close_status_card(&mut self) -> bool {
+        self.m7.close_card()
+    }
+
+    /// Expires a stale card; the shell calls this on its render tick.
+    pub fn tick_status_card(&mut self, now_ms: u64) -> bool {
+        self.m7.tick(now_ms)
+    }
+
+    /// Records the newest exit record so the shell can offer a crash note.
+    pub fn set_last_exit_record(&mut self, record: Option<postbox_core::crash::ExitRecord>) {
+        self.m7.last_exit_record = record;
+    }
+
+    /// `true` once, when the user asked for an update check from `Ctrl+K`.
+    pub fn take_update_check_request(&mut self) -> bool {
+        std::mem::take(&mut self.update_check_requested)
+    }
+
+    /// The palette label for the update command, so it reads as state rather than an action
+    /// once a check has run.
+    pub fn update_command_label(&self) -> &'static str {
+        self.m7.update_label()
+    }
+
+    pub fn m7(&self) -> &crate::m7::M7State {
+        &self.m7
+    }
+
+    pub fn m7_mut(&mut self) -> &mut crate::m7::M7State {
+        &mut self.m7
+    }
+
+    /// Applies an update manifest and returns what to do next.
+    pub fn check_for_updates(
+        &mut self,
+        manifest: &postbox_core::update::UpdateManifest,
+    ) -> postbox_core::update::CheckOutcome {
+        let current = postbox_core::update::Version::parse(self.version())
+            .unwrap_or_else(|| postbox_core::update::Version::new(0, 0, 0));
+        let outcome = self.m7.apply_manifest(manifest, current);
+        self.status_notice = self.m7.update_note.clone();
+        outcome
+    }
+
+    /// `true` when the current chat is the one an arriving message belongs to and the window
+    /// has focus, so the toast policy can stay silent.
+    pub fn focused_chat_key(&self) -> Option<&ChatKey> {
+        self.selected_chat().map(|chat| &chat.key)
+    }
+
+    /// Raises a toast for a new message unless the policy says it is redundant.
+    pub fn notify_incoming(
+        &mut self,
+        message: &Message,
+        ts_seconds: i64,
+        window_focused: bool,
+        notifier: &dyn postbox_platform::Notifier,
+    ) -> bool {
+        let focused_chat = self.selected_chat().map(|chat| chat.key.clone());
+        let focus = postbox_core::toast::ToastFocus {
+            window_focused,
+            chat: focused_chat.as_ref(),
+        };
+        if self
+            .notification_gate
+            .check(&message.chat, ts_seconds, message.from_me, focus)
+            .is_some()
+        {
+            return false;
+        }
+        let title = message.sender_name.trim();
+        let body = postbox_core::toast::preview_body(title, &message.body);
+        notifier.notify_message(&message.chat, title, &body).is_ok()
+    }
+
+    /// Seeds the notification gate from the chats already on screen, so a fresh launch does
+    /// not replay a toast for every unread chat.
+    pub fn prime_notifications(&mut self) {
+        for chat in &self.chats {
+            if let Some(ts) = postbox_core::archive::unix_seconds(&chat.last_msg_ts) {
+                self.notification_gate.prime(&chat.key, ts);
+            }
+        }
+    }
+
     /// Exact Postbox `Esc` cascade (`main.zig:21127-21132`, `main.zig:21364-21513`).
     pub fn handle_escape(&mut self) {
+        // M7: a status card is the outermost, least modal thing on screen.
+        if self.m7.close_card() {
+            return;
+        }
         if self.m3.lightbox.is_some() {
             self.close_lightbox();
             return;

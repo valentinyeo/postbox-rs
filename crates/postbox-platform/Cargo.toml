@@ -8,8 +8,13 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+crc32fast.workspace = true
+miniz_oxide.workspace = true
 postbox-core.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -373,7 +373,7 @@ fn slot_kbd_badge(slot: u8) -> Kbd {
 
 pub struct PostboxShell {
     pub(crate) vm: PostboxViewModel,
-    started_at: Instant,
+    pub(crate) started_at: Instant,
     init_elapsed_ms: u128,
     root_focus: FocusHandle,
     sidebar_focus: FocusHandle,
@@ -422,6 +422,18 @@ pub struct PostboxShell {
     sync_cmd_tx: Option<async_channel::Sender<SyncCommand>>,
     _sync_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+    /// Milestone 7: OS queue for links and `postboxctl` requests, when OS integration is on.
+    pub(crate) os_runtime: Option<crate::desktop_m7::OsRuntime>,
+    /// Milestone 7: Toast sink (`NativePlatform` on Windows, a mock in tests).
+    pub(crate) notifier: Option<std::sync::Arc<dyn postbox_platform::Notifier>>,
+    /// Milestone 7: frames-per-second over a one-second window, reported by `postboxctl status`.
+    pub(crate) fps_meter: crate::desktop_m7::SharedFpsMeter,
+    /// Milestone 7: timer that drains the OS queue into UI work.
+    pub(crate) os_pump_task: Option<Task<()>>,
+    /// Milestone 7: directory the running executable lives in, where updates are staged.
+    pub(crate) install_dir: std::path::PathBuf,
+    /// Milestone 7: manifest/archive source, injected by `postbox-app`.
+    pub(crate) release_source: Option<std::sync::Arc<dyn postbox_platform::ReleaseSource>>,
 }
 
 impl Drop for PostboxShell {
@@ -448,6 +460,7 @@ impl PostboxShell {
         Self::from_view_model_with_bridge(vm, ctx.sync_bridge, started_at, window, cx)
             .with_memory_platform(ctx.memory_platform)
             .with_video_support(ctx.video_backend, ctx.audio_backend, ctx.video_thumb_cache)
+            .with_release_source(ctx.release_source)
     }
 
     /// Installs the Milestone 6 video backend (Media Foundation + Intel Arc DXVA), the WASAPI
@@ -754,6 +767,15 @@ impl PostboxShell {
                 giphy_search_sub,
                 activation_sub,
             ],
+            os_runtime: None,
+            notifier: None,
+            fps_meter: crate::desktop_m7::SharedFpsMeter::default(),
+            os_pump_task: None,
+            install_dir: std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+                .unwrap_or_else(std::env::temp_dir),
+            release_source: None,
         };
         shell.refresh_visible_gpu_textures(window, cx);
         shell.sync_reaction_retry_timer(window, cx);
@@ -1056,7 +1078,13 @@ impl PostboxShell {
 
         if self.vm.quit_requested() {
             self.gpu_textures.clear_all(window, cx);
+            self.record_clean_exit();
             cx.quit();
+        }
+
+        // Milestone 7: the `Ctrl+K` "Check for updates" command, run off the UI thread.
+        if self.vm.take_update_check_request() {
+            self.spawn_update_check(cx);
         }
 
         cx.notify();
@@ -2409,6 +2437,12 @@ impl Focusable for PostboxShell {
 impl Render for PostboxShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.frames_rendered = self.frames_rendered.saturating_add(1);
+        let now_ms = crate::viewmodel::now_epoch_millis_public() as u64;
+        self.fps_meter.on_frame(now_ms, self.frames_rendered);
+        // Milestone 7: an old status card folds itself away on the next painted frame.
+        if self.vm.tick_status_card(now_ms) {
+            cx.notify();
+        }
         let title = self.vm.window_title();
         if title != self.last_window_title {
             window.set_window_title(&title);
@@ -2658,6 +2692,20 @@ impl Render for PostboxShell {
             .bg(rgb(p.background));
         if let Some(voice_bar) = self.render_voice_playback_bar(&p, cx) {
             main_column = main_column.child(voice_bar);
+        }
+        // Milestone 7: a dismissible, non-modal card sits above the timeline and never blocks
+        // the composer, the sidebar or the palette.
+        let mut main_column = main_column;
+        if let Some(card) = self.render_status_card(&p, cx) {
+            main_column = main_column.child(
+                div()
+                    .w_full()
+                    .max_w(px(CHAT_COLUMN_MAX_WIDTH_PX))
+                    .mx_auto()
+                    .px_4()
+                    .pt_2()
+                    .child(card),
+            );
         }
         let main_column = main_column.child(timeline_pane).child(
             div()
@@ -3058,6 +3106,26 @@ pub fn run_desktop(launch_ctx: PostboxLaunchContext) {
     let settings = launch_ctx.store.load_ui_settings().unwrap_or_default();
     let initial_title = postbox_core::ViewTab::CombinedInbox.window_title(&launch_ctx.version);
 
+    // Milestone 7: start the control server and the link pipe before the window opens, so a
+    // `postboxctl status` or a second launch's URL lands as soon as the shell is live.
+    let os_runtime = if launch_ctx.os_integration {
+        let user = postbox_core::os_integration::current_user();
+        Some(crate::desktop_m7::OsRuntime::start(
+            &launch_ctx.data_dir,
+            &user,
+        ))
+    } else {
+        None
+    };
+    let notifier: Option<std::sync::Arc<dyn postbox_platform::Notifier>> =
+        if launch_ctx.os_integration {
+            Some(std::sync::Arc::new(
+                postbox_platform::NativePlatform::default(),
+            ))
+        } else {
+            None
+        };
+
     gpui_kit::application()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
@@ -3079,9 +3147,26 @@ pub fn run_desktop(launch_ctx: PostboxLaunchContext) {
                 ..Default::default()
             };
 
+            let startup_link = launch_ctx.startup_link.clone();
+            let os_runtime = os_runtime;
+            let notifier = notifier;
             gpui_kit::open_window(options, cx, move |window, cx| {
                 window.set_window_title(&initial_title);
-                cx.new(|cx| PostboxShell::new(launch_ctx, window, cx))
+                cx.new(|cx| {
+                    let mut shell = PostboxShell::new(launch_ctx, window, cx);
+                    if let Some(os) = os_runtime {
+                        shell = shell.with_os_integration(os, notifier);
+                    }
+
+                    // Milestone 7: the launch may already carry a `postbox://` URL.
+                    if let Some(link) = startup_link.as_deref() {
+                        shell.apply_startup_link(link);
+                    }
+                    if shell.os_runtime.is_some() {
+                        shell.os_pump_task = shell.start_os_pump(window, cx);
+                    }
+                    shell
+                })
             })
             .expect("failed to open Postbox window");
         });
@@ -3224,6 +3309,10 @@ mod desktop_tests {
             video_backend: None,
             audio_backend: None,
             video_thumb_cache: None,
+            startup_link: None,
+            last_exit_record: None,
+            os_integration: false,
+            release_source: None,
         }
     }
 
@@ -3889,6 +3978,10 @@ mod desktop_tests {
             video_backend: None,
             audio_backend: None,
             video_thumb_cache: None,
+            startup_link: None,
+            last_exit_record: None,
+            os_integration: false,
+            release_source: None,
         };
         let (handle, shell) = open_shell_with_ctx(cx, ctx);
         cx.update_window(handle.into(), |_, window, cx| {
@@ -4008,6 +4101,10 @@ mod desktop_tests {
             video_backend: None,
             audio_backend: None,
             video_thumb_cache: None,
+            startup_link: None,
+            last_exit_record: None,
+            os_integration: false,
+            release_source: None,
         };
         let (handle, shell) = open_shell_with_ctx(cx, ctx);
         cx.update_window(handle.into(), |_, window, cx| {

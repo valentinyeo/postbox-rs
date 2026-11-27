@@ -341,6 +341,9 @@ pub struct PaletteCatalogContext<'a> {
     pub selected_message: Option<&'a Message>,
     pub bulk_selected_count: usize,
     pub marked_messages_count: usize,
+    /// Milestone 7: the update command reads as state ("Postbox is up to date") once a check
+    /// has run.
+    pub update_label: &'a str,
 }
 
 fn cmd_entry(
@@ -774,7 +777,7 @@ pub fn build_palette_items(ctx: &PaletteCatalogContext<'_>) -> Vec<PaletteEntry>
         PaletteCommand::AttachFile,
     ));
     items.push(cmd_entry(
-        "Check for updates now",
+        ctx.update_label,
         None,
         PaletteCommand::CheckForUpdates,
     ));
@@ -1061,6 +1064,7 @@ mod tests {
             selected_message: None,
             bulk_selected_count: 0,
             marked_messages_count: 0,
+            update_label: "Check for updates now",
         };
         let commands = build_palette_items(&ctx);
         let visible = vec![test_chat("c1", "Light Design", false)];

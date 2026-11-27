@@ -20,14 +20,14 @@ pub use normalize::{
     unite_messages, view_account,
 };
 pub use request::{
-    MAX_CACHED_HISTORY, MAX_CLIENT_ID_LEN, MAX_DOWNLOAD_BYTES, MAX_FILE_BYTES, MAX_ID_LEN,
-    MAX_ROWS, MAX_SLACK_EMOJI_INDEX_BYTES, MAX_SLACK_EMOJI_MEDIA_BYTES, MAX_TEXT_LEN,
-    OLDER_PAGE_LIMIT, USER_AGENT, archive_batch_request, archive_request, before_cursor,
-    chats_request, delete_request, encode_send_file_multipart, encode_uri_component,
-    events_request, generate_boundary, mark_read_request, media_request, messages_request,
-    react_request, send_text_request, slack_emoji_index_request, slack_emoji_media_request,
-    valid_client_id, valid_id, valid_last_event_id, valid_team, valid_text, valid_token,
-    workspace_icon_request,
+    MAX_CACHED_HISTORY, MAX_CLIENT_ID_LEN, MAX_CRASH_REPORT_BYTES, MAX_DOWNLOAD_BYTES,
+    MAX_FILE_BYTES, MAX_ID_LEN, MAX_ROWS, MAX_SLACK_EMOJI_INDEX_BYTES, MAX_SLACK_EMOJI_MEDIA_BYTES,
+    MAX_TEXT_LEN, OLDER_PAGE_LIMIT, USER_AGENT, archive_batch_request, archive_request,
+    before_cursor, chats_request, crash_report_request, delete_request, encode_send_file_multipart,
+    encode_uri_component, events_request, generate_boundary, mark_read_request, media_request,
+    messages_request, react_request, send_text_request, slack_emoji_index_request,
+    slack_emoji_media_request, valid_client_id, valid_id, valid_last_event_id, valid_team,
+    valid_text, valid_token, workspace_icon_request,
 };
 pub use sse::{MAX_SSE_FRAME_BYTES, SseParser};
 pub use sync::{
@@ -43,6 +43,40 @@ pub use types::{
 mod tests {
     use super::*;
     use postbox_core::Provider;
+
+    #[test]
+    fn crash_report_uploads_are_hub_only_and_redacted() {
+        use postbox_core::crash::{CrashReport, CrashReportKind};
+        let report = CrashReport {
+            report_id: "panic-0123456789abcdef".to_owned(),
+            kind: CrashReportKind::Panic,
+            version: "0.1.1".to_owned(),
+            os: "windows".to_owned(),
+            arch: "x86_64".to_owned(),
+            timestamp_unix_ms: 1_700_000_000_000,
+            location: Some("desktop.rs:42:9".to_owned()),
+            exception_code: None,
+            last_stage: Some("ready".to_owned()),
+            summary: "send failed token=super-secret-value for ada@example.com".to_owned(),
+        };
+        let req = crash_report_request(&report).unwrap();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/v1/wazig/crash-reports");
+        let body = req.body.expect("a body");
+        assert!(!body.contains("super-secret-value"), "{body}");
+        assert!(!body.contains("ada@example.com"), "{body}");
+        assert!(
+            body.contains("\"report_id\":\"panic-0123456789abcdef\""),
+            "{body}"
+        );
+        assert!(body.len() <= MAX_CRASH_REPORT_BYTES);
+
+        let mut oversized = report.clone();
+        oversized.summary = "x".repeat(MAX_CRASH_REPORT_BYTES * 2);
+        // The summary is clipped by sanitisation, so the body still fits the cap.
+        let req = crash_report_request(&oversized).unwrap();
+        assert!(req.body.unwrap().len() <= MAX_CRASH_REPORT_BYTES);
+    }
 
     #[test]
     fn enforces_https_except_explicit_loopback() {

@@ -2,7 +2,7 @@ use crate::error::HubError;
 use crate::normalize::{merge_archived_chats, normalize_chats, normalize_messages};
 use crate::request::{
     MAX_DOWNLOAD_BYTES, MAX_SLACK_EMOJI_INDEX_BYTES, MAX_SLACK_EMOJI_MEDIA_BYTES, USER_AGENT,
-    archive_batch_request, archive_request, chats_request, delete_request,
+    archive_batch_request, archive_request, chats_request, crash_report_request, delete_request,
     encode_send_file_multipart, events_request, generate_boundary, mark_read_request,
     media_request, messages_request, react_request, send_text_request, slack_emoji_index_request,
     slack_emoji_media_request, valid_last_event_id, valid_token, workspace_icon_request,
@@ -279,6 +279,26 @@ impl HubClient {
         let status = resp.status().as_u16();
         let bytes = Self::read_capped_bytes(resp, MAX_DOWNLOAD_BYTES).await?;
         Self::parse_send_reply(status, &bytes, req.client_id)
+    }
+
+    /// Uploads one sanitised crash report to `/v1/wazig/crash-reports`.
+    ///
+    /// Best effort by design: the caller ignores every error, and nothing here surfaces to the
+    /// user. A non-2xx response is reported as an error so the caller can count the attempt.
+    pub async fn send_crash_report(
+        &self,
+        report: &postbox_core::crash::CrashReport,
+    ) -> Result<(), HubError> {
+        let req = crash_report_request(report)?;
+        let (status, bytes) = self.execute_rest(&req, 16 * 1024).await?;
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(HubError::HttpStatus {
+                status,
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            })
+        }
     }
 
     pub async fn mark_read(&self, chat: &str, message_id: &str) -> Result<(), HubError> {

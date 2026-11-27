@@ -1,5 +1,6 @@
 use crate::error::HubError;
 use crate::types::{HubRequest, SendFileRequest};
+use postbox_core::crash::CrashReport;
 
 pub const MAX_ID_LEN: usize = 191;
 pub const MAX_CLIENT_ID_LEN: usize = 128;
@@ -12,6 +13,27 @@ pub const OLDER_PAGE_LIMIT: usize = 80;
 pub const MAX_ROWS: usize = 500;
 pub const MAX_CACHED_HISTORY: usize = 1000;
 pub const USER_AGENT: &str = "Postbox/1.0";
+/// One serialised crash report never exceeds this many bytes.
+pub const MAX_CRASH_REPORT_BYTES: usize = postbox_core::crash::MAX_CRASH_REPORT_BYTES;
+
+/// Builds the Hub-only crash report upload. The report is redacted again here, so a caller
+/// that assembled one by hand still cannot ship message content or credentials.
+pub fn crash_report_request(report: &CrashReport) -> Result<HubRequest, HubError> {
+    let redacted = report.clone().redacted();
+    if redacted.report_id.is_empty() {
+        return Err(HubError::InvalidId);
+    }
+    let body = redacted.to_line();
+    if body.len() > MAX_CRASH_REPORT_BYTES {
+        return Err(HubError::InvalidSend);
+    }
+    Ok(HubRequest {
+        method: "POST",
+        path: "/v1/wazig/crash-reports".to_owned(),
+        body: Some(body),
+        last_event_id: None,
+    })
+}
 
 /// Exact port of `hub.zig:361-364`: `1 <= len <= 191`, no control bytes (`< 0x20` or `0x7F`).
 pub fn valid_id(value: &str) -> Result<(), HubError> {

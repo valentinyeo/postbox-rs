@@ -1,6 +1,7 @@
 //! Windows-native platform implementations strictly quarantined under `#[cfg(windows)]`.
 
 pub mod clipboard;
+pub mod crash;
 pub mod dpapi;
 pub mod ipc;
 pub mod memory;

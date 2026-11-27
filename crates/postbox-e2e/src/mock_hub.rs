@@ -233,6 +233,8 @@ struct MockHubState {
     archive_batch_fault: Option<ArchiveBatchFault>,
     react_faults: VecDeque<u16>,
     delete_faults: VecDeque<u16>,
+    crash_report_faults: VecDeque<u16>,
+    crash_report_ids: Vec<String>,
     media: HashMap<(String, String), MediaBehavior>,
     avatars: HashMap<String, Result<Vec<u8>, u16>>,
     workspace_icons: HashMap<String, Result<Vec<u8>, u16>>,
@@ -263,6 +265,8 @@ impl MockHubState {
             archive_batch_fault: None,
             react_faults: VecDeque::new(),
             delete_faults: VecDeque::new(),
+            crash_report_faults: VecDeque::new(),
+            crash_report_ids: Vec::new(),
             media: HashMap::new(),
             avatars: HashMap::new(),
             workspace_icons: HashMap::new(),
@@ -388,6 +392,20 @@ impl MockHubServer {
 
     pub fn push_delete_fault(&self, status: u16) {
         self.state.lock().unwrap().delete_faults.push_back(status);
+    }
+
+    /// Makes the next crash-report upload answer with `status` instead of accepting it.
+    pub fn push_crash_report_fault(&self, status: u16) {
+        self.state
+            .lock()
+            .unwrap()
+            .crash_report_faults
+            .push_back(status);
+    }
+
+    /// Report ids the Hub accepted, in arrival order. A repeat would show up twice.
+    pub fn accepted_crash_report_ids(&self) -> Vec<String> {
+        self.state.lock().unwrap().crash_report_ids.clone()
     }
 
     pub fn set_media(
@@ -692,6 +710,7 @@ fn dispatch_hub_request(
         ("POST", "/v1/wazig/archive-batch") => Some(handle_archive_batch(req, state)),
         ("POST", "/v1/wazig/react") => Some(handle_react(req, state)),
         ("POST", "/v1/wazig/delete") => Some(handle_delete(req, state)),
+        ("POST", "/v1/wazig/crash-reports") => Some(handle_crash_report(req, state)),
         ("GET", "/v1/wazig/slack/emoji") => Some(handle_slack_emoji_index(req, state)),
         ("GET", "/v1/wazig/slack/emoji/media") => Some(handle_slack_emoji_media(req, state)),
         ("GET", p) if p.starts_with("/v1/wazig/media/") => Some(handle_media(p, state)),
@@ -1158,6 +1177,26 @@ fn record_idempotent_send(
         .or_default()
         .push(HubMessageRow::simple(chat, msg_id, "Me", text, ts, true));
     reply
+}
+
+fn handle_crash_report(req: &RawHttpRequest, state: &Arc<Mutex<MockHubState>>) -> RawHttpResponse {
+    let mut st = state.lock().unwrap();
+    if let Some(fault) = st.crash_report_faults.pop_front() {
+        return RawHttpResponse::json(fault, &json!({"error": "crash report fault"}));
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
+        return RawHttpResponse::json(400, &json!({"error": "invalid json"}));
+    };
+    let report_id = v.get("report_id").and_then(Value::as_str).unwrap_or("");
+    let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
+    if report_id.is_empty() {
+        return RawHttpResponse::json(400, &json!({"error": "missing report_id"}));
+    }
+    if !matches!(kind, "panic" | "native_exception" | "sudden_exit") {
+        return RawHttpResponse::json(400, &json!({"error": "unknown kind"}));
+    }
+    st.crash_report_ids.push(report_id.to_owned());
+    RawHttpResponse::json(200, &json!({"ok": true}))
 }
 
 fn handle_mark_read(req: &RawHttpRequest, state: &Arc<Mutex<MockHubState>>) -> RawHttpResponse {

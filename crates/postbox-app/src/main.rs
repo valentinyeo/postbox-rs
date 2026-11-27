@@ -4,6 +4,7 @@
 )]
 
 mod audio_service;
+mod crash_upload;
 mod sync;
 mod update_source;
 
@@ -11,7 +12,9 @@ use audio_service::spawn_offline_audio_worker;
 use postbox_hub::Endpoint;
 use postbox_keymap::Keymap;
 use postbox_media::VideoThumbnailCache;
-use postbox_platform::exit_records::{ExitRecordStore, install_panic_hook};
+use postbox_platform::exit_records::{
+    ExitRecordStore, install_native_exception_filter, install_panic_hook, now_unix_ms,
+};
 #[cfg(all(windows, feature = "desktop"))]
 use postbox_platform::os_integration::startup_relaunch;
 use postbox_platform::os_integration::{StartupRole, link_from_args};
@@ -218,6 +221,12 @@ fn build_launch_context(
                     let url_display = endpoint.base_url();
                     if spawn_background_sync {
                         let (bridge, worker) = create_sync_bridge();
+                        // Crash reports go out on their own thread, after the first frame.
+                        let _ = crash_upload::spawn_crash_reporter(
+                            endpoint.clone(),
+                            discovered.token.clone(),
+                            data_dir.clone(),
+                        );
                         let _ = spawn_sync_engine(
                             endpoint,
                             discovered.token,
@@ -445,15 +454,25 @@ fn resolve_startup_role(cfg: &StartupConfig, data_dir: &std::path::Path) -> Star
     }
 }
 
-/// Arms the crash hook and returns the last run's record, if any.
-fn arm_exit_records(
-    data_dir: &std::path::Path,
-    started_at: Instant,
-) -> Option<postbox_core::crash::ExitRecord> {
+/// Arms the two record writers: the Rust panic hook and, on Windows, the native exception
+/// filter. Both are cheap and safe to install before the single-instance role is known, so even
+/// a crash during startup leaves a record.
+fn arm_exit_records(data_dir: &std::path::Path, started_at: Instant) {
+    install_native_exception_filter(data_dir, APP_VERSION);
+    install_panic_hook(ExitRecordStore::new(data_dir), APP_VERSION, started_at);
+}
+
+/// Claims the run for this process and returns the previous run's record, if any.
+///
+/// Only the primary instance does this: a forwarded second launch must not overwrite the
+/// running instance's sentinel. Three capture paths feed one report each:
+/// 1. the Windows native exception filter, folded in here;
+/// 2. the dirty-session sentinel, which turns a vanished process into a `SuddenExit` record;
+/// 3. the Rust panic hook, installed by [`arm_exit_records`].
+fn start_session(data_dir: &std::path::Path) -> Option<postbox_core::crash::ExitRecord> {
     let store = ExitRecordStore::new(data_dir);
-    let previous = store.last().ok().flatten();
-    install_panic_hook(store, APP_VERSION, started_at);
-    previous
+    store.begin_session(APP_VERSION, now_unix_ms());
+    store.last().ok().flatten()
 }
 
 fn main() {
@@ -463,7 +482,7 @@ fn main() {
 
     #[cfg(feature = "desktop")]
     {
-        let last_exit = arm_exit_records(&data_dir, started_at);
+        arm_exit_records(&data_dir, started_at);
         let role = resolve_startup_role(&cfg, &data_dir);
         match role {
             // Another Postbox already owns the single-instance lock and has the URL.
@@ -471,6 +490,7 @@ fn main() {
                 println!("Postbox is already running; handed the request over.");
             }
             StartupRole::Primary { link } => {
+                let last_exit = start_session(&data_dir);
                 if let Ok(exe) = std::env::current_exe()
                     && let Some(install_dir) = exe.parent()
                     && let Some(exe_name) = exe.file_name().and_then(|name| name.to_str())
@@ -481,6 +501,8 @@ fn main() {
                 launch_ctx.startup_link = link.map(|target| postbox_ui::toast_launch_url(&target));
                 launch_ctx.last_exit_record = last_exit;
                 launch_ctx.os_integration = !cfg.no_os_integration;
+                let _ = ExitRecordStore::new(&data_dir)
+                    .update_stage(postbox_core::crash::SESSION_STAGE_READY);
                 postbox_ui::desktop::run_desktop(launch_ctx);
             }
         }
@@ -488,7 +510,8 @@ fn main() {
 
     #[cfg(not(feature = "desktop"))]
     {
-        let _ = arm_exit_records(&data_dir, started_at);
+        arm_exit_records(&data_dir, started_at);
+        let _ = start_session(&data_dir);
         let launch_ctx = build_launch_context(&cfg, started_at, false);
         let mut vm = postbox_ui::PostboxViewModel::new_uninitialized(
             launch_ctx.store,
@@ -501,6 +524,8 @@ fn main() {
         .with_deepgram_key_available(launch_ctx.deepgram_key_available)
         .with_llm_format_key_available(launch_ctx.llm_format_key_available);
         vm.initialize();
+        let _ =
+            ExitRecordStore::new(&data_dir).update_stage(postbox_core::crash::SESSION_STAGE_READY);
         let elapsed_ms = launch_ctx.started_at.elapsed().as_millis();
         println!(
             "{} (headless check) | hub={} | font={} | theme={} | scale={}% | {} bindings | {} cached chats | init={}ms",

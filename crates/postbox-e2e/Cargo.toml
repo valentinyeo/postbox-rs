@@ -40,3 +40,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 postbox-ui = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "macros", "net"] }

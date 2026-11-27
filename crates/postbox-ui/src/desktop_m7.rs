@@ -547,6 +547,9 @@ impl PostboxShell {
         {
             let uptime_ms = self.started_at.elapsed().as_millis() as u64;
             let _ = records.record_clean(self.vm.version(), uptime_ms);
+            // Remove the dirty-session sentinel, so the next launch does not read this
+            // deliberate exit as a sudden one.
+            records.clear_session();
         }
     }
 

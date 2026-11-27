@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod clipboard;
 pub mod control_pipe;
+pub mod crash_upload;
 pub mod exit_records;
 pub mod giphy_auth;
 pub mod hub_auth;
@@ -35,6 +36,7 @@ pub use clipboard::{
     is_reparse_point_or_symlink, mark_downloaded_file_zone, open_external_image,
 };
 pub use control_pipe::{ServerHandle, Transport, round_trip, serve};
+pub use crash_upload::{Delivery, UploadSummary, upload_pending_reports};
 
 /// The endpoint a control client or server binds: a named pipe on Windows, a socket elsewhere.
 pub use control_pipe::Transport as ControlTransport;

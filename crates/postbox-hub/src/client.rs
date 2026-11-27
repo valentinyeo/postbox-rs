@@ -2,16 +2,18 @@ use crate::error::HubError;
 use crate::normalize::{merge_archived_chats, normalize_chats, normalize_messages};
 use crate::request::{
     MAX_DOWNLOAD_BYTES, MAX_SLACK_EMOJI_INDEX_BYTES, MAX_SLACK_EMOJI_MEDIA_BYTES, USER_AGENT,
-    archive_batch_request, archive_request, chats_request, delete_request,
-    encode_send_file_multipart, events_request, generate_boundary, mark_read_request,
-    media_request, messages_request, react_request, send_text_request, slack_emoji_index_request,
-    slack_emoji_media_request, valid_last_event_id, valid_token, workspace_icon_request,
+    archive_batch_request, archive_request, chats_request, chats_request_for_provider,
+    delete_request, encode_send_file_multipart, events_request, generate_boundary,
+    mark_read_request, media_request, messages_request, react_request, send_text_request,
+    slack_emoji_index_request, slack_emoji_media_request, valid_last_event_id, valid_token,
+    workspace_icon_request,
 };
 use crate::types::{
     ArchiveBatchItemResult, ArchiveOutcome, Endpoint, HubChat, HubMessage, HubRequest,
     MediaFetchDetailed, MediaFetchState, SendFileRequest, SendReply,
 };
 use futures_util::StreamExt;
+use postbox_core::Provider;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue};
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -195,8 +197,17 @@ impl HubClient {
         &self,
         limit: usize,
     ) -> Result<Vec<HubChat>, HubError> {
-        let archived_req = chats_request(true, limit);
-        let inbox_req = chats_request(false, limit);
+        self.fetch_archived_and_inbox_chats_for_provider(limit, None)
+            .await
+    }
+
+    pub async fn fetch_archived_and_inbox_chats_for_provider(
+        &self,
+        limit: usize,
+        provider: Option<Provider>,
+    ) -> Result<Vec<HubChat>, HubError> {
+        let archived_req = chats_request_for_provider(true, limit, provider);
+        let inbox_req = chats_request_for_provider(false, limit, provider);
         let (arch_res, inbox_res) = tokio::join!(
             self.execute_rest(&archived_req, MAX_DOWNLOAD_BYTES),
             self.execute_rest(&inbox_req, MAX_DOWNLOAD_BYTES),

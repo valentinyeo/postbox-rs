@@ -1,5 +1,6 @@
 use crate::error::HubError;
 use crate::types::{HubRequest, SendFileRequest};
+use postbox_core::Provider;
 
 pub const MAX_ID_LEN: usize = 191;
 pub const MAX_CLIENT_ID_LEN: usize = 128;
@@ -86,10 +87,27 @@ pub fn before_cursor(msg_id: &str, timestamp: &str) -> Result<String, HubError> 
     Ok(format!("{msg_id}:{timestamp}"))
 }
 
+pub fn provider_query_name(provider: Provider) -> &'static str {
+    provider.as_str()
+}
+
 pub fn chats_request(archived: bool, limit: usize) -> HubRequest {
+    chats_request_for_provider(archived, limit, None)
+}
+
+pub fn chats_request_for_provider(
+    archived: bool,
+    limit: usize,
+    provider: Option<Provider>,
+) -> HubRequest {
+    let mut path = format!("/v1/wazig/chats?archived={archived}&limit={limit}");
+    if let Some(provider) = provider {
+        path.push_str("&provider=");
+        path.push_str(provider_query_name(provider));
+    }
     HubRequest {
         method: "GET",
-        path: format!("/v1/wazig/chats?archived={archived}&limit={limit}"),
+        path,
         body: None,
         last_event_id: None,
     }
@@ -428,4 +446,32 @@ pub fn encode_send_file_multipart(
 
     let content_type = format!("multipart/form-data; boundary={boundary}");
     Ok((content_type, body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chats_requests_preserve_unfiltered_paths_and_scope_by_provider() {
+        for archived in [false, true] {
+            let path = format!("/v1/wazig/chats?archived={archived}&limit=500");
+            let unfiltered = chats_request_for_provider(archived, 500, None);
+            assert_eq!(unfiltered.path, path);
+            assert_eq!(chats_request(archived, 500), unfiltered);
+            for (provider, name) in [
+                (Provider::Whatsapp, "whatsapp"),
+                (Provider::Slack, "slack"),
+                (Provider::Signal, "signal"),
+                (Provider::Telegram, "telegram"),
+            ] {
+                assert_eq!(provider_query_name(provider), name);
+                let request = chats_request_for_provider(archived, 500, Some(provider));
+                assert_eq!(request.path, format!("{path}&provider={name}"));
+                assert_eq!(request.method, "GET");
+                assert_eq!(request.body, None);
+                assert_eq!(request.last_event_id, None);
+            }
+        }
+    }
 }

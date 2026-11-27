@@ -13,7 +13,7 @@ use postbox_core::views::{format_account_label, resolve_slack_workspace_name};
 use postbox_core::{Account, ChatKey, MediaKind, Message, Provider, ReadStatus};
 use postbox_hub::{
     ArchiveOutcome, Endpoint, EventStream, HubClient, HubError, MAX_ROWS, OLDER_PAGE_LIMIT,
-    SendFileRequest, SseParser, SseReconnectState, classify_signal_send_failure,
+    SendFileRequest, SseEvent, SseParser, SseReconnectState, classify_signal_send_failure,
     classify_telegram_send_failure, is_real_message, read_message_id, should_run_safety_poll,
 };
 use postbox_media::MEDIA_EVICTION_DAYS;
@@ -42,6 +42,48 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
+
+pub(crate) fn sse_event_provider(ev: &SseEvent) -> Option<Provider> {
+    if ev.chat.starts_with("slack:") {
+        Some(Provider::Slack)
+    } else if ev.chat.starts_with("telegram:") {
+        Some(Provider::Telegram)
+    } else if ev.chat.starts_with("signal:") {
+        Some(Provider::Signal)
+    } else if !ev.account.is_empty()
+        || [
+            "@s.whatsapp.net",
+            "@g.us",
+            "@lid",
+            "@broadcast",
+            "@newsletter",
+            "@c.us",
+        ]
+        .iter()
+        .any(|suffix| ev.chat.ends_with(suffix))
+    {
+        Some(Provider::Whatsapp)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn sse_batch_target_provider(events: &[SseEvent]) -> Option<Provider> {
+    if events.iter().any(|e| e.kind == "reset") {
+        return None;
+    }
+    let provider = sse_event_provider(events.first()?)?;
+    events
+        .iter()
+        .all(|e| sse_event_provider(e) == Some(provider))
+        .then_some(provider)
+}
+
+pub(crate) fn sse_batch_hits_open_chat(events: &[SseEvent], open_chat: &ChatKey) -> bool {
+    events
+        .iter()
+        .any(|e| e.kind != "reset" && !e.chat.is_empty() && e.chat == open_chat.id)
+}
 
 #[derive(Debug, Clone)]
 pub enum StoreLocation {
@@ -605,9 +647,19 @@ impl SyncEngine {
                             match self.sse_parser.push_bytes(&chunk) {
                                 Ok(events) if !events.is_empty() => {
                                     let is_reset = events.iter().any(|e| e.kind == "reset");
-                                    let _ = self.sync_chats(is_reset).await;
-                                    if let Some(chat) = self.open_chat.clone() {
-                                        let _ = self.sync_chat_messages(&chat, OLDER_PAGE_LIMIT, None).await;
+                                    if is_reset {
+                                        let _ = self.sync_chats_for_provider(true, None).await;
+                                        if let Some(chat) = self.open_chat.clone() {
+                                            let _ = self.sync_chat_messages(&chat, OLDER_PAGE_LIMIT, None).await;
+                                        }
+                                    } else {
+                                        let target_provider = sse_batch_target_provider(&events);
+                                        if let Some(chat) = self.open_chat.clone()
+                                            && sse_batch_hits_open_chat(&events, &chat)
+                                        {
+                                            let _ = self.sync_chat_messages(&chat, OLDER_PAGE_LIMIT, None).await;
+                                        }
+                                        let _ = self.sync_chats_for_provider(false, target_provider).await;
                                     }
                                     self.emit(SyncEvent::StatusChanged(HubConnectionStatus::Connected {
                                         url: self.client.endpoint().base_url(),
@@ -1569,7 +1621,19 @@ impl SyncEngine {
     }
 
     async fn sync_chats(&mut self, reset: bool) -> Result<(), HubError> {
-        let hub_chats = self.client.fetch_archived_and_inbox_chats(MAX_ROWS).await?;
+        self.sync_chats_for_provider(reset, None).await
+    }
+
+    async fn sync_chats_for_provider(
+        &mut self,
+        reset: bool,
+        provider: Option<Provider>,
+    ) -> Result<(), HubError> {
+        let provider = if reset { None } else { provider };
+        let hub_chats = self
+            .client
+            .fetch_archived_and_inbox_chats_for_provider(MAX_ROWS, provider)
+            .await?;
         let now_s = now_epoch_secs();
         let now_ms = now_epoch_millis();
 
@@ -2172,8 +2236,134 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    fn sse_event(kind: &str, chat: &str, account: &str) -> SseEvent {
+        SseEvent {
+            id: 1,
+            account: account.to_owned(),
+            chat: chat.to_owned(),
+            ts: String::new(),
+            kind: kind.to_owned(),
+        }
+    }
+
+    #[test]
+    fn sse_event_provider_recognizes_prefixes_jids_and_account_fallback() {
+        for (chat, provider) in [
+            ("slack:T1:C1", Provider::Slack),
+            ("telegram:123", Provider::Telegram),
+            ("signal:u1", Provider::Signal),
+        ] {
+            for account in ["", "account"] {
+                assert_eq!(
+                    sse_event_provider(&sse_event("msg", chat, account)),
+                    Some(provider)
+                );
+            }
+        }
+        for suffix in [
+            "@s.whatsapp.net",
+            "@g.us",
+            "@lid",
+            "@broadcast",
+            "@newsletter",
+            "@c.us",
+        ] {
+            for prefix in ["", "personal:"] {
+                let chat = format!("{prefix}123{suffix}");
+                assert_eq!(
+                    sse_event_provider(&sse_event("msg", &chat, "")),
+                    Some(Provider::Whatsapp)
+                );
+            }
+        }
+        for chat in ["", "unknown", "personal:123@s.whatsapp.net"] {
+            assert_eq!(
+                sse_event_provider(&sse_event("msg", chat, "personal")),
+                Some(Provider::Whatsapp)
+            );
+        }
+        for chat in ["", "unknown", "slack", "123@s.whatsapp.net.invalid"] {
+            assert_eq!(sse_event_provider(&sse_event("msg", chat, "")), None);
+        }
+    }
+
+    #[test]
+    fn sse_batch_target_provider_requires_one_known_provider_without_resets() {
+        assert_eq!(sse_batch_target_provider(&[]), None);
+        for (chat, provider) in [
+            ("personal:123@s.whatsapp.net", Provider::Whatsapp),
+            ("slack:T1:C1", Provider::Slack),
+            ("telegram:123", Provider::Telegram),
+            ("signal:u1", Provider::Signal),
+        ] {
+            let event = sse_event("msg", chat, "");
+            assert_eq!(
+                sse_batch_target_provider(std::slice::from_ref(&event)),
+                Some(provider)
+            );
+            assert_eq!(
+                sse_batch_target_provider(&[event.clone(), sse_event("read", chat, "")]),
+                Some(provider)
+            );
+            for other in [
+                sse_event("msg", "unknown", ""),
+                sse_event("reset", chat, ""),
+            ] {
+                assert_eq!(
+                    sse_batch_target_provider(&[event.clone(), other.clone()]),
+                    None
+                );
+                assert_eq!(sse_batch_target_provider(&[other, event.clone()]), None);
+            }
+        }
+        assert_eq!(
+            sse_batch_target_provider(&[
+                sse_event("msg", "personal:123@s.whatsapp.net", "personal"),
+                sse_event("msg", "slack:T1:C1", ""),
+            ]),
+            None
+        );
+        assert_eq!(
+            sse_batch_target_provider(&[sse_event("reset", "", "")]),
+            None
+        );
+        assert_eq!(
+            sse_batch_target_provider(&[sse_event("msg", "unknown", "")]),
+            None
+        );
+    }
+
+    #[test]
+    fn sse_batch_hits_open_chat_ignores_resets_empty_and_unrelated_chats() {
+        let open_chat = ChatKey::new(
+            Provider::Whatsapp,
+            "personal",
+            "personal:123@s.whatsapp.net",
+        );
+        let unrelated = sse_event("msg", "personal:456@s.whatsapp.net", "personal");
+        assert!(!sse_batch_hits_open_chat(&[], &open_chat));
+        assert!(!sse_batch_hits_open_chat(
+            std::slice::from_ref(&unrelated),
+            &open_chat
+        ));
+        assert!(!sse_batch_hits_open_chat(
+            &[sse_event("reset", &open_chat.id, "personal")],
+            &open_chat
+        ));
+        assert!(sse_batch_hits_open_chat(
+            &[unrelated, sse_event("msg", &open_chat.id, "personal")],
+            &open_chat
+        ));
+        let empty_chat = ChatKey::new(Provider::Whatsapp, "personal", "");
+        assert!(!sse_batch_hits_open_chat(
+            &[sse_event("msg", "", "personal")],
+            &empty_chat
+        ));
+    }
+
     #[derive(Default)]
     struct MockState {
+        chat_fetches: Vec<String>,
         chats_archived: String,
         chats_inbox: String,
         messages_by_chat: HashMap<String, String>,
@@ -2240,7 +2430,8 @@ mod tests {
                     let (status, resp_body) = if method == "GET"
                         && target.starts_with("/v1/wazig/chats?")
                     {
-                        let g = st.lock().unwrap();
+                        let mut g = st.lock().unwrap();
+                        g.chat_fetches.push(target.to_owned());
                         if target.contains("archived=true") {
                             (200, g.chats_archived.clone())
                         } else {
@@ -2293,6 +2484,96 @@ mod tests {
             }
         });
         (endpoint, handle)
+    }
+
+    #[tokio::test]
+    async fn provider_scoped_chat_sync_preserves_other_providers_and_resets_fetch_all() {
+        let slack_key = ChatKey::new(Provider::Slack, "T1", "slack:T1:C1");
+        let whatsapp_key = ChatKey::new(Provider::Whatsapp, "p", "p:123@s.whatsapp.net");
+        let mut store = Store::open_in_memory().unwrap();
+        let mut archive_table = ArchiveTable::new();
+        archive_table.archive(&slack_key, "2026-11-26T10:00:00Z", false);
+        store.save_archive_table(&archive_table).unwrap();
+        let state = Arc::new(Mutex::new(MockState {
+            chats_archived: "[]".to_owned(),
+            chats_inbox: r##"[
+                {"jid":"slack:T1:C1","provider":"slack","account":"T1","name":"#general","last_message_ts":"2026-11-26T10:00:00Z","unread":false},
+                {"jid":"p:123@s.whatsapp.net","provider":"whatsapp","account":"p","name":"Before","last_message_ts":"2026-11-26T10:00:00Z","unread":false}
+            ]"##.to_owned(),
+            ..Default::default()
+        }));
+        let (endpoint, server) = start_mock_server(state.clone()).await;
+        let client = HubClient::new(endpoint, "test-token").unwrap();
+        let (_bridge, worker) = create_sync_bridge();
+        let mut engine = SyncEngine::new(client, store, worker);
+        engine.sync_chats(true).await.unwrap();
+        let slack_chat = engine.store.get_chat(&slack_key).unwrap().unwrap();
+        let slack_archive = engine
+            .store
+            .load_archive_table()
+            .unwrap()
+            .get(&slack_key)
+            .unwrap()
+            .clone();
+        let slack_read = engine.store.load_read_state().unwrap().get(&slack_key);
+        {
+            let mut state = state.lock().unwrap();
+            assert_eq!(state.chat_fetches.len(), 2);
+            assert!(
+                state
+                    .chat_fetches
+                    .iter()
+                    .all(|path| !path.contains("provider="))
+            );
+            state.chat_fetches.clear();
+            state.chats_inbox = r#"[
+                {"jid":"p:123@s.whatsapp.net","provider":"whatsapp","account":"p","name":"After","last_message_ts":"2026-11-26T11:00:00Z","unread":false}
+            ]"#.to_owned();
+        }
+
+        engine
+            .sync_chats_for_provider(false, Some(Provider::Whatsapp))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            engine.store.get_chat(&whatsapp_key).unwrap().unwrap().title,
+            "After"
+        );
+        assert_eq!(
+            engine.store.get_chat(&slack_key).unwrap().unwrap(),
+            slack_chat
+        );
+        assert_eq!(
+            engine.store.load_archive_table().unwrap().get(&slack_key),
+            Some(&slack_archive)
+        );
+        assert_eq!(
+            engine.store.load_read_state().unwrap().get(&slack_key),
+            slack_read
+        );
+        {
+            let mut state = state.lock().unwrap();
+            state.chat_fetches.sort();
+            assert_eq!(
+                state.chat_fetches,
+                vec![
+                    "/v1/wazig/chats?archived=false&limit=500&provider=whatsapp",
+                    "/v1/wazig/chats?archived=true&limit=500&provider=whatsapp",
+                ]
+            );
+            state.chat_fetches.clear();
+        }
+
+        engine
+            .sync_chats_for_provider(true, Some(Provider::Whatsapp))
+            .await
+            .unwrap();
+
+        let requests = state.lock().unwrap().chat_fetches.clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|path| !path.contains("provider=")));
+        server.abort();
     }
 
     #[tokio::test]

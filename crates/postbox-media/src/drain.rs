@@ -517,6 +517,7 @@ impl MediaDrainTracker {
 pub struct ResolvedCacheHit {
     pub path: PathBuf,
     pub mime_type: String,
+    pub sha256: String,
 }
 
 /// Resolves the best MIME type on a disk cache hit, preferring non-empty caller metadata, then
@@ -558,11 +559,19 @@ pub enum CachedDownloadResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadOutcome {
-    Ready { path: PathBuf, mime_type: String },
+    Ready {
+        path: PathBuf,
+        mime_type: String,
+        sha256: String,
+    },
     Gone,
     Unavailable,
-    TransientFailure { http_status: u16 },
-    OtherFailure { http_status: u16 },
+    TransientFailure {
+        http_status: u16,
+    },
+    OtherFailure {
+        http_status: u16,
+    },
 }
 
 /// Async Hub media downloader bounded to `MAX_HUB_CONCURRENT = 3` concurrent slots, performing
@@ -628,6 +637,7 @@ impl MediaDownloader {
             Some(ResolvedCacheHit {
                 path: full,
                 mime_type: entry.mime_type,
+                sha256: entry.sha256,
             })
         } else {
             let _ = store.delete_media_cache(&key);
@@ -856,6 +866,7 @@ impl MediaDownloader {
                 Ok(DownloadOutcome::Ready {
                     path,
                     mime_type: cache_entry.mime_type,
+                    sha256: cache_entry.sha256,
                 })
             }
             CachedDownloadResult::Gone => {
@@ -894,6 +905,7 @@ impl MediaDownloader {
             return Ok(DownloadOutcome::Ready {
                 path: hit.path,
                 mime_type: effective_cached_mime(mime_type, &hit.mime_type),
+                sha256: hit.sha256,
             });
         }
         let spec = MediaDownloadSpec {

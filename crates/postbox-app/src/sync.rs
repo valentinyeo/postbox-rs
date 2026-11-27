@@ -1,3 +1,8 @@
+use crate::audio_service::{
+    AudioWorkerCmd, AudioWorkerHandle, persist_transcript_to_store, spawn_format_task,
+    spawn_transcription_task,
+};
+use postbox_audio::{DeepgramRestClient, TranscriptFormatter};
 use postbox_core::archive::{IncomingProbeMessage, PendingArchiveIntent, unix_seconds};
 use postbox_core::outbox::{
     OutboxKind, OutboxPhase, classify_http_outcome, verify_attachment_bytes,
@@ -26,7 +31,10 @@ use postbox_media::giphy::{
     GIPHY_DEFAULT_LIMIT, GIPHY_MSG_NEEDS_KEY, GiphyClient, giphy_error_message,
 };
 use postbox_media::unfurl::{ClassifiedUrl, UnfurlCard, UnfurlService};
-use postbox_store::Store;
+#[cfg(test)]
+use postbox_platform::NativePlatform;
+use postbox_platform::{AudioBackend, FormatProviderConfig};
+use postbox_store::{MediaCacheEntry, Store};
 use postbox_ui::{
     HubConnectionStatus, MediaDownloadTarget, SyncCommand, SyncEvent, SyncWorkerHandle,
 };
@@ -68,12 +76,16 @@ fn now_epoch_millis() -> i64 {
 /// Spawns the dedicated background OS thread owning a single-threaded Tokio runtime for live
 /// Hub HTTP/2 + SSE sync, durable SQLite outbox delivery, pending mark-read, archive batching,
 /// media auto-downloading, avatars/Slack emoji, link unfurls, and cancellable Giphy searches.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_sync_engine(
     endpoint: Endpoint,
     token: String,
     store_loc: StoreLocation,
     data_dir: PathBuf,
     giphy_api_key: Option<String>,
+    deepgram_api_key: Option<String>,
+    format_provider: Option<FormatProviderConfig>,
+    audio_backend: Arc<dyn AudioBackend>,
     worker: SyncWorkerHandle,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
@@ -143,8 +155,16 @@ pub fn spawn_sync_engine(
                     }
                 };
 
-                let mut engine =
-                    SyncEngine::with_m3(client, store, worker, data_dir, giphy_api_key);
+                let mut engine = SyncEngine::with_m4(
+                    client,
+                    store,
+                    worker,
+                    data_dir,
+                    giphy_api_key,
+                    deepgram_api_key,
+                    format_provider,
+                    audio_backend,
+                );
                 engine.run().await;
             });
         })
@@ -203,6 +223,17 @@ struct SyncEngine {
     bg_burst_started_ms: u64,
     bg_burst_files_started: usize,
     bg_drain_pending: bool,
+    deepgram_api_key: Arc<std::sync::Mutex<Option<String>>>,
+    deepgram_client: DeepgramRestClient,
+    format_provider: Option<FormatProviderConfig>,
+    formatter: TranscriptFormatter,
+    audio_worker: AudioWorkerHandle,
+}
+
+impl Drop for SyncEngine {
+    fn drop(&mut self) {
+        self.audio_worker.send(AudioWorkerCmd::Shutdown);
+    }
 }
 
 impl SyncEngine {
@@ -212,6 +243,7 @@ impl SyncEngine {
         Self::with_m3(client, store, worker, data_dir, None)
     }
 
+    #[cfg(test)]
     fn with_m3(
         client: HubClient,
         store: Store,
@@ -219,12 +251,36 @@ impl SyncEngine {
         data_dir: PathBuf,
         giphy_api_key: Option<String>,
     ) -> Self {
+        Self::with_m4(
+            client,
+            store,
+            worker,
+            data_dir,
+            giphy_api_key,
+            None,
+            None,
+            Arc::new(NativePlatform::default()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_m4(
+        client: HubClient,
+        store: Store,
+        worker: SyncWorkerHandle,
+        data_dir: PathBuf,
+        giphy_api_key: Option<String>,
+        deepgram_api_key: Option<String>,
+        format_provider: Option<FormatProviderConfig>,
+        audio_backend: Arc<dyn AudioBackend>,
+    ) -> Self {
         let downloader = Arc::new(MediaDownloader::new(data_dir.join("hub-media")));
         let unfurl_service = UnfurlService::new(data_dir.join("link-previews"))
             .ok()
             .map(Arc::new);
         let giphy_client = GiphyClient::new().ok();
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
+        let audio_worker = AudioWorkerHandle::spawn(audio_backend, worker.event_tx.clone());
         let now = Instant::now();
         Self {
             client: Arc::new(client),
@@ -258,6 +314,11 @@ impl SyncEngine {
             bg_burst_started_ms: 0,
             bg_burst_files_started: 0,
             bg_drain_pending: false,
+            deepgram_api_key: Arc::new(std::sync::Mutex::new(deepgram_api_key)),
+            deepgram_client: DeepgramRestClient::new(),
+            format_provider,
+            formatter: TranscriptFormatter::new(),
+            audio_worker,
         }
     }
 
@@ -868,7 +929,104 @@ impl SyncEngine {
                     }
                 }
             }
-            SyncCommand::RestartLiveSync | SyncCommand::Shutdown => {}
+            SyncCommand::TranscribeAudio {
+                chat,
+                msg_id,
+                path,
+                sha256,
+                mime_type,
+                language,
+                ..
+            } => {
+                if !sha256.is_empty()
+                    && let Ok(Some(rec)) = self.store.get_transcript_record(&sha256)
+                {
+                    self.emit(SyncEvent::TranscriptReady {
+                        chat,
+                        msg_id,
+                        sha256,
+                        raw_text: rec.raw_text,
+                        formatted_text: rec.formatted_text,
+                        language: rec.language,
+                    });
+                } else {
+                    spawn_transcription_task(
+                        self.deepgram_client.clone(),
+                        Arc::clone(&self.deepgram_api_key),
+                        chat,
+                        msg_id,
+                        path,
+                        sha256,
+                        mime_type,
+                        language,
+                        self.worker.event_tx.clone(),
+                    );
+                }
+            }
+            SyncCommand::FormatTranscript {
+                chat,
+                msg_id,
+                sha256,
+                raw_text,
+                from_me,
+                contact_name,
+                local_path,
+            } => {
+                persist_transcript_to_store(&self.store, &sha256, "auto", &raw_text);
+                spawn_format_task(
+                    self.formatter.clone(),
+                    self.format_provider.clone(),
+                    self.data_dir.clone(),
+                    chat,
+                    msg_id,
+                    sha256,
+                    raw_text,
+                    from_me,
+                    contact_name,
+                    local_path,
+                    self.worker.event_tx.clone(),
+                );
+            }
+            SyncCommand::VoicePlay {
+                chat,
+                msg_id,
+                path,
+                speed,
+                start_ms,
+            } => self.audio_worker.send(AudioWorkerCmd::Play {
+                chat,
+                msg_id,
+                path,
+                speed,
+                start_ms,
+            }),
+            SyncCommand::VoicePause => self.audio_worker.send(AudioWorkerCmd::Pause),
+            SyncCommand::VoiceResume => self.audio_worker.send(AudioWorkerCmd::Resume),
+            SyncCommand::VoiceStop => self.audio_worker.send(AudioWorkerCmd::Stop),
+            SyncCommand::VoiceSeek { pos_ms } => {
+                self.audio_worker.send(AudioWorkerCmd::Seek { pos_ms })
+            }
+            SyncCommand::VoiceSetSpeed(speed) => {
+                self.audio_worker.send(AudioWorkerCmd::SetSpeed(speed))
+            }
+            SyncCommand::VoiceRecordStart {
+                generation,
+                origin_chat,
+                preferred_mic,
+            } => self.audio_worker.send(AudioWorkerCmd::RecordStart {
+                generation,
+                origin_chat,
+                preferred_mic,
+            }),
+            SyncCommand::VoiceRecordFinish => self.audio_worker.send(AudioWorkerCmd::RecordFinish),
+            SyncCommand::VoiceRecordCancel => self.audio_worker.send(AudioWorkerCmd::RecordCancel),
+            SyncCommand::RefreshMicrophones => {
+                self.audio_worker.send(AudioWorkerCmd::RefreshMicrophones)
+            }
+            SyncCommand::Shutdown => {
+                self.audio_worker.send(AudioWorkerCmd::Shutdown);
+            }
+            SyncCommand::RestartLiveSync => {}
         }
     }
 
@@ -922,6 +1080,7 @@ impl SyncEngine {
                     msg_id: target.msg_id.clone(),
                     path: hit.path,
                     mime_type: effective_cached_mime(target.mime_type.as_deref(), &hit.mime_type),
+                    sha256: hit.sha256,
                 });
                 continue;
             }
@@ -1040,7 +1199,11 @@ impl SyncEngine {
                     Err(err) => Err(err),
                 };
                 match outcome {
-                    Ok(DownloadOutcome::Ready { path, mime_type }) => {
+                    Ok(DownloadOutcome::Ready {
+                        path,
+                        mime_type,
+                        sha256,
+                    }) => {
                         self.drain_tracker.note_success(&key);
                         self.retry_targets.remove(&key);
                         self.emit(SyncEvent::MediaDownloaded {
@@ -1048,6 +1211,7 @@ impl SyncEngine {
                             msg_id: target.msg_id,
                             path,
                             mime_type,
+                            sha256,
                         });
                     }
                     Ok(DownloadOutcome::Gone) => {
@@ -1187,6 +1351,7 @@ impl SyncEngine {
                     msg_id: target.msg_id,
                     path: hit.path,
                     mime_type: effective_cached_mime(target.mime_type.as_deref(), &hit.mime_type),
+                    sha256: hit.sha256,
                 });
                 continue;
             }
@@ -1624,7 +1789,8 @@ impl SyncEngine {
                             OutboxKind::File => Some(MediaKind::Document),
                             OutboxKind::Text | OutboxKind::React | OutboxKind::Delete => None,
                         },
-                        mime_type: None,
+                        mime_type: (claimed.kind == OutboxKind::Voice)
+                            .then(|| "audio/ogg".to_owned()),
                         filename: if claimed.wire_filename.is_empty() {
                             None
                         } else {
@@ -1640,10 +1806,47 @@ impl SyncEngine {
                         &claimed.client_id,
                         &confirmed,
                     );
+                    let mut downloaded_event = None;
+                    if claimed.kind == OutboxKind::Voice
+                        && let Some(staged) = claimed.staged_file_path.as_deref()
+                        && let Ok(bytes) = std::fs::read(staged)
+                    {
+                        let cache_key = media_cache_key(&claimed.chat, &confirmed.msg_id);
+                        let rel_path = format!("{cache_key}.bin.ogg");
+                        let dest_path = self.downloader.cache_dir().join(&rel_path);
+                        if let Some(parent) = dest_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        if atomic_write_file(&dest_path, &bytes).is_ok() {
+                            let sha_hex = claimed
+                                .file_sha256
+                                .map(|d| d.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                                .unwrap_or_default();
+                            let entry = MediaCacheEntry {
+                                cache_key,
+                                sha256: sha_hex.clone(),
+                                rel_path,
+                                mime_type: "audio/ogg".to_owned(),
+                                byte_size: bytes.len() as u64,
+                                last_accessed_at: now_epoch_secs(),
+                            };
+                            let _ = self.store.upsert_media_cache(&entry);
+                            downloaded_event = Some(SyncEvent::MediaDownloaded {
+                                chat: claimed.chat.clone(),
+                                msg_id: confirmed.msg_id.clone(),
+                                path: dest_path,
+                                mime_type: "audio/ogg".to_owned(),
+                                sha256: sha_hex,
+                            });
+                        }
+                    }
                     self.emit(SyncEvent::OutboxUpdated {
                         chat: claimed.chat,
                         notice: None,
                     });
+                    if let Some(ev) = downloaded_event {
+                        self.emit(ev);
+                    }
                 }
                 Err(err) => {
                     let (status, detail) = match &err {

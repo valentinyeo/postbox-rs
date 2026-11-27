@@ -4,10 +4,13 @@ pub mod clipboard;
 pub mod dpapi;
 pub mod registry;
 pub mod shell;
+pub mod wasapi;
 
+use crate::audio::{AudioBackend, AudioCaptureStream, AudioRenderStream};
 use crate::clipboard::{ClipboardBackend, ClipboardPayload, ZoneMarker, mark_downloaded_file_zone};
 use crate::{EnvRegistry, Notifier, PlatformError, SecretLoad, SecretLoadOutcome, SecretStore};
 use postbox_core::ChatKey;
+use postbox_core::voice::AudioDeviceInfo;
 use std::path::Path;
 
 #[derive(Debug, Default)]
@@ -70,5 +73,26 @@ impl ClipboardBackend for WindowsPlatform {
 impl ZoneMarker for WindowsPlatform {
     fn mark_downloaded_file(&self, path: &Path) -> Result<bool, PlatformError> {
         mark_downloaded_file_zone(path)
+    }
+}
+
+impl AudioBackend for WindowsPlatform {
+    fn list_capture_devices(&self) -> Result<Vec<AudioDeviceInfo>, PlatformError> {
+        wasapi::list_capture_devices()
+    }
+
+    fn open_render(
+        &self,
+        sample_rate: u32,
+        channels: u16,
+    ) -> Result<Box<dyn AudioRenderStream>, PlatformError> {
+        wasapi::open_render(sample_rate, channels)
+    }
+
+    fn open_capture(
+        &self,
+        preferred_mic_name: Option<&str>,
+    ) -> Result<Box<dyn AudioCaptureStream>, PlatformError> {
+        wasapi::open_capture(preferred_mic_name)
     }
 }

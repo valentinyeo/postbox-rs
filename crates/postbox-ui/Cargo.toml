@@ -16,6 +16,7 @@ desktop-test = ["desktop", "gpui-kit/test-support"]
 async-channel.workspace = true
 gpui-kit = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
+postbox-audio.workspace = true
 postbox-core.workspace = true
 postbox-keymap.workspace = true
 postbox-media.workspace = true

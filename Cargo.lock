@@ -4993,6 +4993,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "opus-pure"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2da6dcc20af557d030b6f206e75c764bcda8c28a5bd03c73935c7e8fcf5f4f4a"
+
+[[package]]
 name = "ordered-float"
 version = "5.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5386,6 +5392,7 @@ name = "postbox-app"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "postbox-audio",
  "postbox-core",
  "postbox-hub",
  "postbox-keymap",
@@ -5393,6 +5400,22 @@ dependencies = [
  "postbox-platform",
  "postbox-store",
  "postbox-ui",
+ "tokio",
+]
+
+[[package]]
+name = "postbox-audio"
+version = "0.1.0"
+dependencies = [
+ "opus-pure",
+ "postbox-core",
+ "postbox-platform",
+ "postbox-store",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
  "tokio",
 ]
 
@@ -5487,6 +5510,7 @@ dependencies = [
  "async-channel",
  "gpui-kit",
  "image",
+ "postbox-audio",
  "postbox-core",
  "postbox-keymap",
  "postbox-media",

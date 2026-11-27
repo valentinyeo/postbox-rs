@@ -186,8 +186,13 @@ async fn loopback_media_download_200_202_206_410_and_429() {
         .await
         .unwrap();
     match ok {
-        DownloadOutcome::Ready { path, mime_type } => {
+        DownloadOutcome::Ready {
+            path,
+            mime_type,
+            sha256,
+        } => {
             assert_eq!(mime_type, "image/png");
+            assert_eq!(sha256.len(), 64);
             assert!(path.to_string_lossy().ends_with(".png"));
             assert_eq!(std::fs::read(&path).unwrap(), b"\x89PNG\r\n\x1a\nPAYLOAD");
         }
@@ -562,13 +567,19 @@ async fn loopback_media_redownload_replaces_stale_extension_alias_and_preserves_
         )
         .await
         .unwrap();
-    let DownloadOutcome::Ready { path, mime_type } = out1 else {
+    let DownloadOutcome::Ready {
+        path,
+        mime_type,
+        sha256,
+    } = out1
+    else {
         panic!("expected Ready, got {out1:?}");
     };
     assert_eq!(mime_type, "image/png");
+    assert_eq!(sha256.len(), 64);
     assert_eq!(std::fs::read(&path).unwrap(), b"NEW-BYTES-V2");
 
-    // Second call with mime_type: None must preserve persisted "image/png" from SQLite!
+    // Second call with mime_type: None must preserve persisted "image/png" and sha256 from SQLite!
     let out2 = downloader
         .download_one(
             &client,
@@ -588,6 +599,7 @@ async fn loopback_media_redownload_replaces_stale_extension_alias_and_preserves_
         DownloadOutcome::Ready {
             path,
             mime_type: "image/png".to_owned(),
+            sha256,
         }
     );
 

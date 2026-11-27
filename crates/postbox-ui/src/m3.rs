@@ -288,6 +288,9 @@ impl PostboxViewModel {
                             .touch_media_cache(&cache_key, now_epoch_secs_public());
                         postbox_media::age::touch_file_mtime(&full);
                         self.m3.media_paths.insert(pair.clone(), full.clone());
+                        if !entry.sha256.is_empty() {
+                            self.m4.media_sha256.insert(pair.clone(), entry.sha256);
+                        }
                         self.m3
                             .media_statuses
                             .insert(pair, MediaItemStatus::Ready(full));

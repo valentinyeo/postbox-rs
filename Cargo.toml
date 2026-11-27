@@ -7,6 +7,7 @@ members = [
     "crates/postbox-keymap",
     "crates/postbox-platform",
     "crates/postbox-media",
+    "crates/postbox-audio",
     "crates/postbox-ui",
     "crates/postbox-app",
     "crates/postbox-ctl",
@@ -24,10 +25,12 @@ postbox-store = { path = "crates/postbox-store" }
 postbox-keymap = { path = "crates/postbox-keymap" }
 postbox-platform = { path = "crates/postbox-platform" }
 postbox-media = { path = "crates/postbox-media" }
+postbox-audio = { path = "crates/postbox-audio" }
 postbox-ui = { path = "crates/postbox-ui" }
 
 async-channel = "2.5.0"
 bytes = "1.12.2"
+opus-pure = "0.2.5"
 futures-util = { version = "0.3.34", default-features = false }
 getrandom = "0.3.4"
 gpui-kit = { version = "0.11.0", default-features = false, features = ["component", "assets"] }
@@ -62,15 +65,23 @@ tokio = { version = "1.54.1", features = [
 ] }
 url = "2.5.9"
 windows = { version = "0.62.2", features = [
+    "Win32_Devices_FunctionDiscovery",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
     "Win32_Security_Cryptography",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Pipes",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_System_Variant",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

@@ -3,17 +3,21 @@
     windows_subsystem = "windows"
 )]
 
+mod audio_service;
 mod sync;
 
+use audio_service::spawn_offline_audio_worker;
 use postbox_hub::Endpoint;
 use postbox_keymap::Keymap;
 use postbox_platform::{
-    GiphyKeyOutcome, HubDiscoveryOutcome, NativePlatform, discover_giphy_api_key_from_system,
-    discover_hub_credentials_from_system,
+    ApiKeyOutcome, AudioBackend, GiphyKeyOutcome, HubDiscoveryOutcome, NativePlatform,
+    discover_deepgram_api_key_from_system, discover_format_provider_from_system,
+    discover_giphy_api_key_from_system, discover_hub_credentials_from_system,
 };
 use postbox_store::Store;
 use postbox_ui::{HubConnectionStatus, PostboxLaunchContext, create_sync_bridge};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use sync::{StoreLocation, spawn_sync_engine};
@@ -132,6 +136,7 @@ fn build_launch_context(
 
     // Feature #42: Auto-discover Hub URL & Bearer token on startup (HKCU\Environment -> env -> DPAPI HubToken).
     // Feature #26: Auto-discover GIPHY_API_KEY -> DPAPI GiphyApiKey.
+    // Feature #29: Auto-discover DEEPGRAM_API_KEY -> DPAPI DeepgramApiKey + optional Anthropic/OpenRouter keys.
     let platform = NativePlatform::default();
     let discovery =
         discover_hub_credentials_from_system(cfg.hub_url.as_deref(), &platform, &platform);
@@ -140,6 +145,17 @@ fn build_launch_context(
         GiphyKeyOutcome::Missing | GiphyKeyOutcome::Error(_) => None,
     };
     let giphy_key_available = giphy_api_key.is_some();
+
+    let deepgram_api_key = match discover_deepgram_api_key_from_system(&platform, &platform) {
+        ApiKeyOutcome::Ready(key) => Some(key),
+        ApiKeyOutcome::Missing | ApiKeyOutcome::Error(_) => None,
+    };
+    let deepgram_key_available = deepgram_api_key.is_some();
+
+    let format_provider = discover_format_provider_from_system(&platform, &platform);
+    let llm_format_key_available = format_provider.is_some();
+
+    let audio_backend: Arc<dyn AudioBackend> = Arc::new(NativePlatform::default());
 
     let (hub_status, sync_bridge) = match discovery {
         HubDiscoveryOutcome::Configured(discovered) => {
@@ -155,6 +171,9 @@ fn build_launch_context(
                             store_loc,
                             data_dir.clone(),
                             giphy_api_key,
+                            deepgram_api_key,
+                            format_provider,
+                            audio_backend,
                             worker,
                         );
                         (
@@ -165,41 +184,105 @@ fn build_launch_context(
                         (HubConnectionStatus::Connecting { url: url_display }, None)
                     }
                 }
-                Err(err) => (
-                    HubConnectionStatus::Error {
-                        url: Some(discovered.url),
-                        message: format!("Invalid Hub URL: {err}"),
-                    },
-                    None,
-                ),
+                Err(err) => {
+                    let bridge = if spawn_background_sync {
+                        let (bridge, worker) = create_sync_bridge();
+                        let _ = spawn_offline_audio_worker(
+                            store_loc,
+                            data_dir.clone(),
+                            deepgram_api_key,
+                            format_provider,
+                            audio_backend,
+                            worker,
+                        );
+                        Some(bridge)
+                    } else {
+                        None
+                    };
+                    (
+                        HubConnectionStatus::Error {
+                            url: Some(discovered.url),
+                            message: format!("Invalid Hub URL: {err}"),
+                        },
+                        bridge,
+                    )
+                }
             }
         }
-        HubDiscoveryOutcome::UnconfiguredMissingUrl => (
-            HubConnectionStatus::NotConfigured {
-                missing_url: true,
-                missing_token: true,
-                configured_url: None,
-                detail: None,
-            },
-            None,
-        ),
-        HubDiscoveryOutcome::UnconfiguredMissingToken { url } => (
-            HubConnectionStatus::NotConfigured {
-                missing_url: false,
-                missing_token: true,
-                configured_url: Some(url),
-                detail: None,
-            },
-            None,
-        ),
+        HubDiscoveryOutcome::UnconfiguredMissingUrl => {
+            let bridge = if spawn_background_sync {
+                let (bridge, worker) = create_sync_bridge();
+                let _ = spawn_offline_audio_worker(
+                    store_loc,
+                    data_dir.clone(),
+                    deepgram_api_key,
+                    format_provider,
+                    audio_backend,
+                    worker,
+                );
+                Some(bridge)
+            } else {
+                None
+            };
+            (
+                HubConnectionStatus::NotConfigured {
+                    missing_url: true,
+                    missing_token: true,
+                    configured_url: None,
+                    detail: None,
+                },
+                bridge,
+            )
+        }
+        HubDiscoveryOutcome::UnconfiguredMissingToken { url } => {
+            let bridge = if spawn_background_sync {
+                let (bridge, worker) = create_sync_bridge();
+                let _ = spawn_offline_audio_worker(
+                    store_loc,
+                    data_dir.clone(),
+                    deepgram_api_key,
+                    format_provider,
+                    audio_backend,
+                    worker,
+                );
+                Some(bridge)
+            } else {
+                None
+            };
+            (
+                HubConnectionStatus::NotConfigured {
+                    missing_url: false,
+                    missing_token: true,
+                    configured_url: Some(url),
+                    detail: None,
+                },
+                bridge,
+            )
+        }
         HubDiscoveryOutcome::InvalidToken { url, reason }
-        | HubDiscoveryOutcome::SecretStoreError { url, reason } => (
-            HubConnectionStatus::Error {
-                url: Some(url),
-                message: reason,
-            },
-            None,
-        ),
+        | HubDiscoveryOutcome::SecretStoreError { url, reason } => {
+            let bridge = if spawn_background_sync {
+                let (bridge, worker) = create_sync_bridge();
+                let _ = spawn_offline_audio_worker(
+                    store_loc,
+                    data_dir.clone(),
+                    deepgram_api_key,
+                    format_provider,
+                    audio_backend,
+                    worker,
+                );
+                Some(bridge)
+            } else {
+                None
+            };
+            (
+                HubConnectionStatus::Error {
+                    url: Some(url),
+                    message: reason,
+                },
+                bridge,
+            )
+        }
     };
 
     PostboxLaunchContext {
@@ -211,6 +294,8 @@ fn build_launch_context(
         sync_bridge,
         data_dir,
         giphy_key_available,
+        deepgram_key_available,
+        llm_format_key_available,
     }
 }
 
@@ -234,7 +319,9 @@ fn main() {
         )
         .with_hub_status(launch_ctx.hub_status)
         .with_data_dir(launch_ctx.data_dir)
-        .with_giphy_key_available(launch_ctx.giphy_key_available);
+        .with_giphy_key_available(launch_ctx.giphy_key_available)
+        .with_deepgram_key_available(launch_ctx.deepgram_key_available)
+        .with_llm_format_key_available(launch_ctx.llm_format_key_available);
         vm.initialize();
         let elapsed_ms = launch_ctx.started_at.elapsed().as_millis();
         println!(

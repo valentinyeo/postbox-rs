@@ -1,5 +1,6 @@
 use crate::geometry::RowGeometry;
 use crate::m3::M3State;
+use crate::m4::M4State;
 use crate::palette::{
     PaletteCatalogContext, PaletteCommand, PaletteEntry, PaletteEntryKind, PaletteFilterInput,
     PaletteMode, PaletteSection, PaletteState, build_palette_items, filter_palette,
@@ -50,6 +51,8 @@ pub struct PostboxLaunchContext {
     pub sync_bridge: Option<SyncBridge>,
     pub data_dir: PathBuf,
     pub giphy_key_available: bool,
+    pub deepgram_key_available: bool,
+    pub llm_format_key_available: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,12 +169,12 @@ pub struct PostboxViewModel {
     view_order: Vec<String>,
     show_archived_by_view: BTreeMap<String, bool>,
     view_selected_chat: BTreeMap<String, ChatKey>,
-    dictation_language: DictationLanguage,
-    playback_speed_pct: u16,
+    pub(crate) dictation_language: DictationLanguage,
+    pub(crate) playback_speed_pct: u16,
     slack_threads_by_account: BTreeMap<String, bool>,
     replies_fold_by_chat: BTreeMap<ChatKey, bool>,
 
-    archive_table: ArchiveTable,
+    pub(crate) archive_table: ArchiveTable,
     read_state: ReadState,
     pending_reads: PendingReadQueue,
     user_viewed: bool,
@@ -182,38 +185,39 @@ pub struct PostboxViewModel {
     unread_only: bool,
     search_filter: String,
 
-    chats: Vec<Chat>,
+    pub(crate) chats: Vec<Chat>,
     selected_chat_idx: Option<usize>,
     bulk_selected: BTreeSet<ChatKey>,
     drafts: BTreeMap<ChatKey, Draft>,
 
     pub(crate) messages: Vec<Message>,
     loaded_message_limit: usize,
-    outbox_for_chat: Vec<OutboxRecord>,
+    pub(crate) outbox_for_chat: Vec<OutboxRecord>,
     timeline_items: Vec<TimelineItem>,
-    selected_message_idx: Option<usize>,
-    marked_messages: BTreeSet<String>,
-    reply_to_msg_id: Option<String>,
+    pub(crate) selected_message_idx: Option<usize>,
+    pub(crate) marked_messages: BTreeSet<String>,
+    pub(crate) reply_to_msg_id: Option<String>,
     exhausted_chats: BTreeSet<ChatKey>,
 
     thread_panel: Option<ThreadPanelState>,
 
     composer_text: String,
-    focus: FocusTarget,
-    palette: PaletteState,
+    pub(crate) focus: FocusTarget,
+    pub(crate) palette: PaletteState,
     shortcuts_open: bool,
     ctrl_badges: CtrlBadgeState,
     inbox_chord: InboxChord,
     latest_chord: LatestChord,
 
-    status_notice: Option<String>,
-    title_notice: Option<String>,
+    pub(crate) status_notice: Option<String>,
+    pub(crate) title_notice: Option<String>,
     quit_requested: bool,
     sync_requested: bool,
     pub(crate) scroll_to_latest_pending: bool,
     refresh_count: u64,
     pub(crate) local_send_seq: u64,
     pub(crate) m3: M3State,
+    pub(crate) m4: M4State,
 }
 
 impl PostboxViewModel {
@@ -240,6 +244,16 @@ impl PostboxViewModel {
             let joined = saved_recents.join(",");
             m3.emoji_recents = EmojiCatalog::global().parse_recents(&joined);
         }
+        let saved_speed = store
+            .load_playback_speed()
+            .unwrap_or(postbox_core::voice::PlaybackSpeed::X1);
+        let m4 = M4State {
+            playback_speed: saved_speed,
+            played_keys: store.list_played_voice_keys().unwrap_or_default(),
+            resume_positions: store.load_all_voice_positions().unwrap_or_default(),
+            selected_microphone: store.load_microphone_preference().ok().flatten(),
+            ..M4State::default()
+        };
 
         Self {
             store,
@@ -254,7 +268,7 @@ impl PostboxViewModel {
             show_archived_by_view,
             view_selected_chat: BTreeMap::new(),
             dictation_language: DictationLanguage::Automatic,
-            playback_speed_pct: 100,
+            playback_speed_pct: saved_speed.percent(),
             slack_threads_by_account: BTreeMap::new(),
             replies_fold_by_chat: BTreeMap::new(),
             archive_table,
@@ -294,6 +308,7 @@ impl PostboxViewModel {
             refresh_count: 0,
             local_send_seq: 0,
             m3,
+            m4,
         }
     }
 
@@ -421,7 +436,11 @@ impl PostboxViewModel {
                 0
             }
             SyncEvent::MediaDownloaded {
-                chat, msg_id, path, ..
+                chat,
+                msg_id,
+                path,
+                sha256,
+                ..
             } => {
                 let pair = (chat.clone(), msg_id.clone());
                 self.m3.media_paths.insert(pair.clone(), path.clone());
@@ -431,8 +450,9 @@ impl PostboxViewModel {
                 if let Some(lb) = &mut self.m3.lightbox
                     && lb.chat == chat
                 {
-                    lb.update_local_path(&msg_id, path);
+                    lb.update_local_path(&msg_id, path.clone());
                 }
+                self.on_voice_media_downloaded(&chat, &msg_id, sha256);
                 0
             }
             SyncEvent::MediaStatusChanged {
@@ -444,11 +464,15 @@ impl PostboxViewModel {
                 if let MediaItemStatus::Ready(ref path) = status {
                     self.m3.media_paths.insert(pair.clone(), path.clone());
                 }
-                if matches!(status, MediaItemStatus::Unavailable | MediaItemStatus::Gone)
-                    && let Some(lb) = &mut self.m3.lightbox
-                    && lb.chat == chat
-                {
-                    let _ = lb.mark_failed_and_check_external(&msg_id);
+                if matches!(status, MediaItemStatus::Unavailable | MediaItemStatus::Gone) {
+                    if self.m4.pending_auto_advance.as_ref() == Some(&pair) {
+                        self.m4.pending_auto_advance = None;
+                    }
+                    if let Some(lb) = &mut self.m3.lightbox
+                        && lb.chat == chat
+                    {
+                        let _ = lb.mark_failed_and_check_external(&msg_id);
+                    }
                 }
                 self.m3.media_statuses.insert(pair, status);
                 0
@@ -578,6 +602,101 @@ impl PostboxViewModel {
                 {
                     self.status_notice = Some(message);
                 }
+                0
+            }
+            SyncEvent::TranscriptReady {
+                chat,
+                msg_id,
+                sha256,
+                raw_text,
+                formatted_text,
+                language,
+            } => {
+                self.handle_transcript_ready(
+                    chat,
+                    msg_id,
+                    sha256,
+                    raw_text,
+                    formatted_text,
+                    language,
+                );
+                0
+            }
+            SyncEvent::TranscriptFailed {
+                chat,
+                msg_id,
+                error,
+            } => {
+                self.handle_transcript_failed(chat, msg_id, error);
+                0
+            }
+            SyncEvent::TranscriptFormatted {
+                chat,
+                msg_id,
+                sha256,
+                formatted_text,
+            } => {
+                self.handle_transcript_formatted(chat, msg_id, sha256, formatted_text);
+                0
+            }
+            SyncEvent::VoicePlaybackProgress {
+                chat,
+                msg_id,
+                pos_ms,
+                dur_ms,
+                waveform,
+                playing,
+            } => {
+                self.handle_voice_playback_progress(
+                    chat, msg_id, pos_ms, dur_ms, waveform, playing,
+                );
+                0
+            }
+            SyncEvent::VoicePlaybackEnded { chat, msg_id } => {
+                self.handle_voice_playback_ended(chat, msg_id);
+                0
+            }
+            SyncEvent::VoicePlaybackFailed {
+                chat,
+                msg_id,
+                message,
+            } => {
+                self.handle_voice_playback_failed(chat, msg_id, message);
+                0
+            }
+            SyncEvent::VoiceRecordTick {
+                generation,
+                elapsed_ms,
+                bars,
+            } => {
+                self.handle_voice_record_tick(generation, elapsed_ms, bars);
+                0
+            }
+            SyncEvent::VoiceRecordFinished {
+                generation,
+                origin_chat,
+                ogg_bytes,
+                duration_secs,
+                waveform,
+            } => {
+                self.handle_voice_record_finished(
+                    generation,
+                    origin_chat,
+                    ogg_bytes,
+                    duration_secs,
+                    waveform,
+                );
+                0
+            }
+            SyncEvent::VoiceRecordFailed {
+                generation,
+                message,
+            } => {
+                self.handle_voice_record_failed(generation, message);
+                0
+            }
+            SyncEvent::MicrophonesUpdated(devices) => {
+                self.set_microphones(devices);
                 0
             }
             SyncEvent::Notice(msg) => {
@@ -1075,9 +1194,13 @@ impl PostboxViewModel {
 
         self.selected_chat_idx = new_idx;
         if chat_changed {
+            self.cancel_voice_recording_on_chat_switch();
+            self.m4.pending_auto_advance = None;
+            self.begin_transcription_open();
             self.loaded_message_limit = MAX_MESSAGES_QUERY;
             self.reply_to_msg_id = None;
             self.marked_messages.clear();
+            self.m4.marked_anchor_idx = None;
             self.close_thread_panel();
             self.close_lightbox();
             self.close_composer_popup();
@@ -1145,11 +1268,13 @@ impl PostboxViewModel {
             .or_else(|| self.messages.len().checked_sub(1));
 
         self.reapply_pending_reactions(&chat.key);
+        self.apply_voice_sent_echoes();
         self.rebuild_timeline();
         self.trigger_open_chat_media_and_metadata();
+        self.schedule_chat_transcriptions();
     }
 
-    fn rebuild_timeline(&mut self) {
+    pub(crate) fn rebuild_timeline(&mut self) {
         let Some(chat) = self.selected_chat() else {
             self.timeline_items.clear();
             return;
@@ -1260,6 +1385,8 @@ impl PostboxViewModel {
             return true;
         }
         self.persist_active_draft();
+        self.cancel_voice_recording_on_chat_switch();
+        self.m4.pending_auto_advance = None;
         self.selected_chat_idx = Some(idx);
         let key = self.chats[idx].key.clone();
         let view_key = self.active_view_key();
@@ -1267,9 +1394,11 @@ impl PostboxViewModel {
             .insert(view_key.clone(), key.clone());
         let _ = self.store.set_view_selected_chat(&view_key, Some(&key));
 
+        self.begin_transcription_open();
         self.loaded_message_limit = MAX_MESSAGES_QUERY;
         self.reply_to_msg_id = None;
         self.marked_messages.clear();
+        self.m4.marked_anchor_idx = None;
         self.close_thread_panel();
         self.close_lightbox();
         self.close_composer_popup();
@@ -1772,6 +1901,10 @@ impl PostboxViewModel {
         if !self.marked_messages.remove(msg_id) {
             self.marked_messages.insert(msg_id.to_owned());
         }
+        if let Some(idx) = self.messages.iter().position(|m| m.msg_id == msg_id) {
+            self.m4.marked_anchor_idx = Some(idx);
+            self.selected_message_idx = Some(idx);
+        }
         self.rebuild_timeline();
     }
 
@@ -2119,24 +2252,64 @@ impl PostboxViewModel {
         else {
             return false;
         };
+        let (body, media_kind, mime_type, filename, file_size) = match updated.kind {
+            postbox_core::outbox::OutboxKind::Voice => (
+                format!(
+                    "Voice message {}",
+                    postbox_core::voice::format_voice_clock(
+                        u64::from(updated.voice_seconds.max(1)) * 1000
+                    )
+                ),
+                Some(postbox_core::MediaKind::Voice),
+                Some("audio/ogg".to_owned()),
+                Some(if updated.wire_filename.is_empty() {
+                    "voice.ogg".to_owned()
+                } else {
+                    updated.wire_filename.clone()
+                }),
+                (updated.file_bytes > 0).then_some(updated.file_bytes),
+            ),
+            postbox_core::outbox::OutboxKind::File => (
+                updated.text_body.clone(),
+                Some(postbox_core::MediaKind::Document),
+                None,
+                (!updated.wire_filename.is_empty()).then(|| updated.wire_filename.clone()),
+                (updated.file_bytes > 0).then_some(updated.file_bytes),
+            ),
+            _ => (updated.text_body.clone(), None, None, None, None),
+        };
         let optimistic = Message {
             chat: updated.chat.clone(),
-            msg_id: new_cid,
+            msg_id: new_cid.clone(),
             sender_id: "me".into(),
             sender_name: "You".into(),
             from_me: true,
             ts: format_utc_rfc3339(now_epoch_secs()),
-            body: updated.text_body.clone(),
+            body,
             reply_to_id: updated.reply_to_id.clone(),
             reply_broadcast: updated.reply_broadcast,
-            media_kind: None,
-            mime_type: None,
-            filename: None,
-            file_size: None,
+            media_kind,
+            mime_type,
+            filename,
+            file_size,
             reactions: Vec::new(),
             read_status: ReadStatus::Sending,
             deleted: false,
         };
+        let old_pair = (updated.chat.clone(), old_client_id.to_owned());
+        let new_pair = (updated.chat.clone(), new_cid);
+        if let Some(p) = self.m3.media_paths.remove(&old_pair) {
+            self.m3.media_paths.insert(new_pair.clone(), p);
+        }
+        if let Some(s) = self.m3.media_statuses.remove(&old_pair) {
+            self.m3.media_statuses.insert(new_pair.clone(), s);
+        }
+        if let Some(h) = self.m4.media_sha256.remove(&old_pair) {
+            self.m4.media_sha256.insert(new_pair.clone(), h);
+        }
+        if let Some(w) = self.m4.waveforms.remove(&old_pair) {
+            self.m4.waveforms.insert(new_pair, w);
+        }
         let _ = self
             .store
             .replace_optimistic_message(&updated.chat, old_client_id, &optimistic);
@@ -2369,7 +2542,7 @@ impl PostboxViewModel {
         true
     }
 
-    fn rebuild_palette_entries(&mut self) {
+    pub(crate) fn rebuild_palette_entries(&mut self) {
         let selected_chat = self.selected_chat();
         let slack_threads_enabled = selected_chat
             .filter(|c| c.key.provider == Provider::Slack)
@@ -2400,10 +2573,12 @@ impl PostboxViewModel {
             slack_threads_enabled,
             slack_reply_style,
             accounts: &self.accounts,
+            microphones: &self.m4.microphones,
+            selected_microphone: self.m4.selected_microphone.as_deref(),
             selected_chat,
             selected_message: self.selected_message(),
             bulk_selected_count: self.bulk_selected.len(),
-            marked_messages_count: self.marked_messages.len(),
+            marked_messages_count: self.marked_voice_messages_count(),
         };
         let commands = build_palette_items(&catalog_ctx);
 
@@ -2600,19 +2775,20 @@ impl PostboxViewModel {
                 self.status_notice = Some("Dictation available in Milestone 5".into());
             }
             PaletteCommand::RecordVoiceNote => {
-                self.status_notice = Some("Voice recording available in Milestone 4".into());
+                self.toggle_voice_recording(true);
             }
             PaletteCommand::SetDictationLanguage(lang) => {
                 self.dictation_language = *lang;
                 self.status_notice = Some(format!("Dictation language set: {lang:?}"));
             }
             PaletteCommand::SelectMicrophoneDefault => {
-                self.status_notice = Some("Microphone: System default".into());
+                self.select_microphone(None);
+            }
+            PaletteCommand::SelectMicrophone(name) => {
+                self.select_microphone(Some(name.clone()));
             }
             PaletteCommand::SetPlaybackSpeed(speed) => {
-                self.playback_speed_pct = *speed;
-                self.status_notice =
-                    Some(format!("Playback speed: {:.1}x", f32::from(*speed) / 100.0));
+                self.set_playback_speed(postbox_core::voice::PlaybackSpeed::from_percent(*speed));
             }
             PaletteCommand::FontSmaller => self.font_smaller(),
             PaletteCommand::FontLarger => self.font_larger(),
@@ -2710,12 +2886,22 @@ impl PostboxViewModel {
             PaletteCommand::OpenImageExternal => {
                 self.open_selected_image_externally();
             }
-            PaletteCommand::CopyMessageText
-            | PaletteCommand::CopyMessageLink
-            | PaletteCommand::CopyTranscript
-            | PaletteCommand::CopyAllTranscripts
-            | PaletteCommand::PlayPauseVoice
-            | PaletteCommand::ToggleTranscript
+            PaletteCommand::CopyMessageText => {
+                self.copy_selected_message_text();
+            }
+            PaletteCommand::CopyTranscript => {
+                self.copy_selected_transcript();
+            }
+            PaletteCommand::CopyAllTranscripts => {
+                self.copy_all_marked_transcripts();
+            }
+            PaletteCommand::PlayPauseVoice => {
+                self.play_or_pause_selected_voice();
+            }
+            PaletteCommand::ToggleTranscript => {
+                self.toggle_selected_transcript();
+            }
+            PaletteCommand::CopyMessageLink
             | PaletteCommand::OpenVideoExternal
             | PaletteCommand::AttachFile
             | PaletteCommand::CheckForUpdates => {
@@ -2784,6 +2970,10 @@ impl PostboxViewModel {
 
     /// Exact Postbox `Esc` cascade (`main.zig:21364-21513`).
     pub fn handle_escape(&mut self) {
+        if self.m4.recording.is_active() {
+            self.cancel_voice_recording("Voice note cancelled");
+            return;
+        }
         if self.m3.lightbox.is_some() {
             self.close_lightbox();
             return;
@@ -2982,6 +3172,24 @@ impl PostboxViewModel {
                 self.execute_palette_selected();
             }
             Action::ClosePalette => self.close_palette(),
+            Action::PlayPauseVoice => {
+                self.play_or_pause_selected_voice();
+            }
+            Action::ToggleTranscript => {
+                self.toggle_selected_transcript();
+            }
+            Action::ToggleVoiceRecord => {
+                self.toggle_voice_recording(true);
+            }
+            Action::FinishVoiceRecord => {
+                self.finish_voice_recording();
+            }
+            Action::CancelVoiceRecord => {
+                self.cancel_voice_recording("Voice note cancelled");
+            }
+            Action::CopyMessageText | Action::SmartCopy => {
+                self.copy_selected_message_text();
+            }
             Action::MoveViewUp => {
                 self.palette_move_view_up();
             }

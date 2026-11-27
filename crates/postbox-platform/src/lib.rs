@@ -1,18 +1,25 @@
+pub mod audio;
 pub mod clipboard;
 pub mod giphy_auth;
 pub mod hub_auth;
+pub mod voice_auth;
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
 pub mod win;
 
 use postbox_core::ChatKey;
+use postbox_core::voice::AudioDeviceInfo;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
+pub use audio::{
+    AudioBackend, AudioCaptureStream, AudioRenderStream, CaptureFormat, CapturePacket,
+    MockAudioBackend, MockRenderSnapshot,
+};
 pub use clipboard::{
     ALLOWED_EXTERNAL_IMAGE_EXTENSIONS, ClipboardBackend, ClipboardPayload, MAX_CLIPBOARD_BYTES,
     MAX_CLIPBOARD_PIXELS, ZONE_IDENTIFIER_CONTENT, ZoneMarker, external_image_extension_allowed,
@@ -26,6 +33,16 @@ pub use hub_auth::{
     CredentialSource, DiscoveredHubConfig, ENV_POSTBOX_HUB_TOKEN, ENV_POSTBOX_HUB_URL,
     ENV_WAZIG_HUB_TOKEN, ENV_WAZIG_HUB_URL, HUB_TOKEN_SECRET_NAME, HubDiscoveryOutcome,
     discover_hub_credentials, discover_hub_credentials_from_system, valid_hub_token,
+};
+pub use voice_auth::{
+    ANTHROPIC_API_KEY_SECRET_NAME, ANTHROPIC_WORKSPACE_ID_SECRET_NAME, ApiKeyOutcome,
+    DEEPGRAM_API_KEY_SECRET_NAME, DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENROUTER_MODEL,
+    ENV_ANTHROPIC_API_KEY, ENV_ANTHROPIC_WORKSPACE_ID, ENV_DEEPGRAM_API_KEY,
+    ENV_OPENROUTER_API_KEY, ENV_OPENROUTER_MODEL, FormatProviderConfig,
+    OPENROUTER_API_KEY_SECRET_NAME, OPENROUTER_MODEL_SECRET_NAME, discover_deepgram_api_key,
+    discover_deepgram_api_key_from_system, discover_format_provider,
+    discover_format_provider_from_system, refresh_deepgram_api_key_if_changed,
+    refresh_deepgram_api_key_if_changed_from_system,
 };
 
 #[derive(Debug, Error)]
@@ -42,6 +59,8 @@ pub enum PlatformError {
     DpapiError(String),
     #[error("registry_error: {0}")]
     RegistryError(String),
+    #[error("audio_error: {0}")]
+    AudioError(String),
     #[error("io_error")]
     Io(#[from] std::io::Error),
 }
@@ -147,6 +166,27 @@ impl ZoneMarker for NativePlatform {
     }
 }
 
+impl AudioBackend for NativePlatform {
+    fn list_capture_devices(&self) -> Result<Vec<AudioDeviceInfo>, PlatformError> {
+        self.inner.list_capture_devices()
+    }
+
+    fn open_render(
+        &self,
+        sample_rate: u32,
+        channels: u16,
+    ) -> Result<Box<dyn AudioRenderStream>, PlatformError> {
+        self.inner.open_render(sample_rate, channels)
+    }
+
+    fn open_capture(
+        &self,
+        preferred_mic_name: Option<&str>,
+    ) -> Result<Box<dyn AudioCaptureStream>, PlatformError> {
+        self.inner.open_capture(preferred_mic_name)
+    }
+}
+
 /// Portable in-memory mock platform used for fast Linux & headless unit tests.
 pub struct MemoryPlatform {
     secrets: Mutex<HashMap<String, String>>,
@@ -155,6 +195,7 @@ pub struct MemoryPlatform {
     notifications: Mutex<Vec<(ChatKey, String, String)>>,
     clipboard_payload: Mutex<ClipboardPayload>,
     zone_marked_paths: Mutex<Vec<PathBuf>>,
+    audio: MockAudioBackend,
     fail_migration: AtomicBool,
     fail_save: AtomicBool,
 }
@@ -168,6 +209,7 @@ impl Default for MemoryPlatform {
             notifications: Mutex::new(Vec::new()),
             clipboard_payload: Mutex::new(ClipboardPayload::Empty),
             zone_marked_paths: Mutex::new(Vec::new()),
+            audio: MockAudioBackend::new(),
             fail_migration: AtomicBool::new(false),
             fail_save: AtomicBool::new(false),
         }
@@ -175,6 +217,10 @@ impl Default for MemoryPlatform {
 }
 
 impl MemoryPlatform {
+    pub fn audio_mock(&self) -> &MockAudioBackend {
+        &self.audio
+    }
+
     pub fn notification_count(&self) -> usize {
         self.notifications.lock().map(|n| n.len()).unwrap_or(0)
     }
@@ -380,6 +426,27 @@ impl ZoneMarker for MemoryPlatform {
             .map_err(|_| PlatformError::OsUnavailable)?;
         guard.push(path.to_path_buf());
         Ok(true)
+    }
+}
+
+impl AudioBackend for MemoryPlatform {
+    fn list_capture_devices(&self) -> Result<Vec<AudioDeviceInfo>, PlatformError> {
+        self.audio.list_capture_devices()
+    }
+
+    fn open_render(
+        &self,
+        sample_rate: u32,
+        channels: u16,
+    ) -> Result<Box<dyn AudioRenderStream>, PlatformError> {
+        self.audio.open_render(sample_rate, channels)
+    }
+
+    fn open_capture(
+        &self,
+        preferred_mic_name: Option<&str>,
+    ) -> Result<Box<dyn AudioCaptureStream>, PlatformError> {
+        self.audio.open_capture(preferred_mic_name)
     }
 }
 

@@ -105,6 +105,8 @@ impl HubConnectionStatus {
 }
 
 use postbox_core::MediaKind;
+use postbox_core::dictation::DictationLanguage;
+use postbox_core::voice::{AudioDeviceInfo, PlaybackSpeed, TranscriptError};
 use postbox_media::avatar::SlackEmojiIndex;
 use postbox_media::drain::MediaItemStatus;
 use postbox_media::giphy::{GiphyPage, GiphyTarget};
@@ -196,6 +198,48 @@ pub enum SyncCommand {
     CancelGiphy {
         generation: u64,
     },
+    // --- Milestone 4 commands ---
+    TranscribeAudio {
+        chat: ChatKey,
+        msg_id: String,
+        path: PathBuf,
+        sha256: String,
+        mime_type: String,
+        from_me: bool,
+        contact_name: String,
+        language: DictationLanguage,
+    },
+    FormatTranscript {
+        chat: ChatKey,
+        msg_id: String,
+        sha256: String,
+        raw_text: String,
+        from_me: bool,
+        contact_name: String,
+        local_path: Option<PathBuf>,
+    },
+    VoicePlay {
+        chat: ChatKey,
+        msg_id: String,
+        path: PathBuf,
+        speed: PlaybackSpeed,
+        start_ms: u64,
+    },
+    VoicePause,
+    VoiceResume,
+    VoiceStop,
+    VoiceSeek {
+        pos_ms: u64,
+    },
+    VoiceSetSpeed(PlaybackSpeed),
+    VoiceRecordStart {
+        generation: u64,
+        origin_chat: ChatKey,
+        preferred_mic: Option<String>,
+    },
+    VoiceRecordFinish,
+    VoiceRecordCancel,
+    RefreshMicrophones,
     Shutdown,
 }
 
@@ -221,6 +265,7 @@ pub enum SyncEvent {
         msg_id: String,
         path: PathBuf,
         mime_type: String,
+        sha256: String,
     },
     MediaStatusChanged {
         chat: ChatKey,
@@ -280,6 +325,60 @@ pub enum SyncEvent {
         download_generation: u64,
         message: String,
     },
+    // --- Milestone 4 events ---
+    TranscriptReady {
+        chat: ChatKey,
+        msg_id: String,
+        sha256: String,
+        raw_text: String,
+        formatted_text: Option<String>,
+        language: String,
+    },
+    TranscriptFailed {
+        chat: ChatKey,
+        msg_id: String,
+        error: TranscriptError,
+    },
+    TranscriptFormatted {
+        chat: ChatKey,
+        msg_id: String,
+        sha256: String,
+        formatted_text: String,
+    },
+    VoicePlaybackProgress {
+        chat: ChatKey,
+        msg_id: String,
+        pos_ms: u64,
+        dur_ms: u64,
+        waveform: Vec<u8>,
+        playing: bool,
+    },
+    VoicePlaybackEnded {
+        chat: ChatKey,
+        msg_id: String,
+    },
+    VoicePlaybackFailed {
+        chat: ChatKey,
+        msg_id: String,
+        message: String,
+    },
+    VoiceRecordTick {
+        generation: u64,
+        elapsed_ms: u64,
+        bars: Vec<u8>,
+    },
+    VoiceRecordFinished {
+        generation: u64,
+        origin_chat: ChatKey,
+        ogg_bytes: Vec<u8>,
+        duration_secs: u32,
+        waveform: Vec<u8>,
+    },
+    VoiceRecordFailed {
+        generation: u64,
+        message: String,
+    },
+    MicrophonesUpdated(Vec<AudioDeviceInfo>),
     Notice(String),
 }
 

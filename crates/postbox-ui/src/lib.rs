@@ -1,5 +1,6 @@
 pub mod geometry;
 pub mod m3;
+pub mod m4;
 pub mod palette;
 pub mod sync_bridge;
 pub mod theme;
@@ -10,9 +11,12 @@ pub mod viewmodel;
 pub mod desktop;
 #[cfg(feature = "desktop")]
 mod desktop_m3;
+#[cfg(feature = "desktop")]
+mod desktop_m4;
 
 pub use geometry::RowGeometry;
 pub use m3::{M3State, MentionPopupState, ShortcodePopupState};
+pub use m4::M4State;
 pub use palette::{
     PaletteCommand, PaletteEntry, PaletteEntryKind, PaletteGroupKind, PaletteMode, PaletteSection,
 };

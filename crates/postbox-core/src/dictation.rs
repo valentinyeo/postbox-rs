@@ -20,6 +20,11 @@ impl DictationLanguage {
         }
     }
 
+    /// Single fallback endpoint used ONLY on `NoSpeech` for `audio/ogg` in `Automatic` mode.
+    pub const fn deepgram_multilingual_path() -> &'static str {
+        "/v1/listen?model=nova-3&smart_format=true&language=multi&tag=postbox"
+    }
+
     /// Automatic mode fails closed: only English or German tags are accepted.
     pub fn accepts_detected_tag(self, tag: Option<&str>) -> bool {
         match self {

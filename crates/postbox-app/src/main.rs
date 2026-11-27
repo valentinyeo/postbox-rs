@@ -464,10 +464,6 @@ fn main() {
     let last_exit = arm_exit_records(&data_dir, started_at);
     postbox_platform::install_unhandled_exception_filter(&data_dir, APP_VERSION);
     crash_upload::install_panic_upload_hook(&data_dir);
-    let crash_dir = data_dir.clone();
-    let _ = std::thread::Builder::new()
-        .name("postbox-crash-upload".to_owned())
-        .spawn(move || crash_upload::upload_pending_crash(&crash_dir));
 
     #[cfg(feature = "desktop")]
     {
@@ -488,6 +484,7 @@ fn main() {
                 launch_ctx.startup_link = link.map(|target| postbox_ui::toast_launch_url(&target));
                 launch_ctx.last_exit_record = last_exit;
                 launch_ctx.os_integration = !cfg.no_os_integration;
+                crash_upload::upload_pending_crash_blocking(&data_dir);
                 postbox_ui::desktop::run_desktop(launch_ctx);
             }
         }
@@ -496,6 +493,7 @@ fn main() {
     #[cfg(not(feature = "desktop"))]
     {
         let _ = last_exit;
+        crash_upload::upload_pending_crash_blocking(&data_dir);
         let launch_ctx = build_launch_context(&cfg, started_at, false);
         let mut vm = postbox_ui::PostboxViewModel::new_uninitialized(
             launch_ctx.store,

@@ -25,7 +25,7 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
 };
 use windows::Win32::Media::MediaFoundation::{
     IMFAttributes, IMFDXGIDeviceManager, IMFMediaType, IMFSample, IMFSourceReader,
@@ -118,9 +118,6 @@ unsafe fn resolve<T: Copy>(module: HMODULE, name: &str) -> Option<T> {
 
 unsafe fn load_mf_api() -> Option<MfApi> {
     unsafe {
-        // Media Foundation source readers are free-threaded; an MTA apartment is enough.
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-
         let plat = load_module("mfplat.dll")?;
         let readwrite = load_module("mfreadwrite.dll")?;
 
@@ -148,6 +145,8 @@ unsafe fn load_mf_api() -> Option<MfApi> {
 /// Starts Media Foundation once, on the first video request. `false` means the caller falls
 /// back to no video support (a session that never opens a video never gets here).
 fn ensure_started() -> bool {
+    // COM apartments belong to threads, unlike the process-wide MF entry points.
+    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     let resolved = MF_API.get_or_init(|| unsafe { load_mf_api() });
     resolved.is_some()
 }
@@ -205,6 +204,12 @@ impl D3dDevice {
             )
             .ok()?;
 
+            let device = device?;
+            let context = context?;
+            // ID3D11Multithread is exposed by the immediate context, not the device.
+            let multithread = context.cast::<ID3D11Multithread>().ok()?;
+            let _ = multithread.SetMultithreadProtected(true);
+
             let mut token = 0u32;
             let mut manager_raw: *mut core::ffi::c_void = std::ptr::null_mut();
             let hr = (api.create_dxgi_device_manager)(&mut token, &mut manager_raw);
@@ -214,7 +219,6 @@ impl D3dDevice {
             }
             let manager = IMFDXGIDeviceManager::from_raw(manager_raw);
 
-            let device = device?;
             let unknown = device.cast::<windows::core::IUnknown>().ok()?;
             if manager.ResetDevice(&unknown, token).is_err() {
                 return None;
@@ -223,7 +227,7 @@ impl D3dDevice {
             Some(Self {
                 manager,
                 _device: device,
-                _context: context?,
+                _context: context,
             })
         }
     }
@@ -282,18 +286,21 @@ fn make_attributes(
             }
         }
         attributes
-            .SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)
+            .SetUINT32(
+                &MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
+                u32::from(hardware.is_some()),
+            )
             .map_err(|e| PlatformError::VideoError(format!("set_hw_transforms: {e}")))?;
         Ok(attributes)
     }
 }
 
-fn open_reader(path: &Path) -> Result<ReaderInit, PlatformError> {
+fn open_reader_with_mode(path: &Path, allow_hardware: bool) -> Result<ReaderInit, PlatformError> {
     let api = mf_api()?;
     let url = wide_path(path);
 
-    // Preferred path: Intel Arc DXVA through the D3D11 device manager, then software.
-    let hardware = d3d_device();
+    // Software-only requests must not even create a D3D device.
+    let hardware = if allow_hardware { d3d_device() } else { None };
     for candidate in [hardware, None] {
         let attributes = make_attributes(api, candidate)?;
         unsafe {
@@ -500,8 +507,8 @@ pub struct MfVideoSession {
 }
 
 impl MfVideoSession {
-    fn open(path: &Path) -> Result<Self, PlatformError> {
-        let init = open_reader(path)?;
+    fn open(path: &Path, allow_hardware: bool) -> Result<Self, PlatformError> {
+        let init = open_reader_with_mode(path, allow_hardware)?;
         let api = mf_api()?;
         let reader = init.reader;
 
@@ -602,7 +609,7 @@ impl MfVideoSession {
             position_ms: 0,
             target_pts_ms: 0,
             closed: false,
-            _device: d3d_device(),
+            _device: if init.hardware { d3d_device() } else { None },
         })
     }
 
@@ -717,7 +724,8 @@ pub fn extract_thumbnail(
     max_h: u32,
 ) -> Result<Option<VideoFrame>, PlatformError> {
     let media_path = alias_path_for_mf(path);
-    let mut session = MfVideoSession::open(&media_path)?;
+    // Thumbnails run during startup, so keep them out of vendor DXVA drivers.
+    let mut session = MfVideoSession::open(&media_path, false)?;
 
     if session.metadata.duration_ms > 0 {
         let seek_to = THUMBNAIL_SEEK_MS.min(session.metadata.duration_ms.saturating_sub(1));
@@ -770,7 +778,9 @@ impl VideoBackend for super::WindowsPlatform {
 
     fn open_session(&self, path: &Path) -> Result<Box<dyn VideoPlaybackSession>, PlatformError> {
         let media_path = alias_path_for_mf(path);
-        Ok(Box::new(MfVideoSession::open(&media_path)?))
+        let allow_hardware = std::env::var_os("POSTBOX_SOFTWARE_VIDEO").as_deref()
+            != Some(std::ffi::OsStr::new("1"));
+        Ok(Box::new(MfVideoSession::open(&media_path, allow_hardware)?))
     }
 
     fn hardware_acceleration_available(&self) -> bool {
@@ -814,6 +824,50 @@ pub fn mp4_alias_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_foundation_initializes_com_on_each_worker_thread() {
+        use windows::Win32::System::Com::{
+            APTTYPE_CURRENT, APTTYPE_MTA, APTTYPEQUALIFIER_NONE, CoGetApartmentType,
+        };
+
+        for _ in 0..2 {
+            std::thread::spawn(|| {
+                assert!(ensure_started());
+                let mut apartment = APTTYPE_CURRENT;
+                let mut qualifier = APTTYPEQUALIFIER_NONE;
+                unsafe { CoGetApartmentType(&mut apartment, &mut qualifier) }.unwrap();
+                assert_eq!(apartment, APTTYPE_MTA);
+            })
+            .join()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn software_reader_attributes_disable_hardware_transforms() {
+        let api = mf_api().unwrap();
+        let attributes = make_attributes(api, None).unwrap();
+        unsafe {
+            assert_eq!(
+                attributes
+                    .GetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                attributes
+                    .GetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING)
+                    .unwrap(),
+                1
+            );
+            assert!(
+                attributes
+                    .GetUnknown::<windows::core::IUnknown>(&MF_SOURCE_READER_D3D_MANAGER)
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn rgb32_top_down_and_bottom_up_convert_to_rgba() {

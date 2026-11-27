@@ -4,9 +4,10 @@ use std::time::Duration;
 
 pub const DEFAULT_CRASH_URL: &str = "https://postbox-crashes.valentin-yeo.workers.dev/v1/crashes";
 const UPLOAD_THREAD: &str = "postbox-crash-upload";
+const STARTUP_UPLOAD_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub fn upload_pending_crash(data_dir: &Path) {
-    upload_pending_crash_with_timeout(data_dir, Duration::from_secs(5));
+pub fn upload_pending_crash_blocking(data_dir: &Path) {
+    upload_pending_crash_with_timeout(data_dir, STARTUP_UPLOAD_TIMEOUT);
 }
 
 fn upload_pending_crash_with_timeout(data_dir: &Path, timeout: Duration) {
@@ -187,10 +188,40 @@ mod tests {
     }
 
     #[test]
-    fn missing_report_is_a_noop() {
+    fn startup_upload_times_out_and_keeps_the_report() {
+        let dir = pending_dir();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/crashes", listener.local_addr().unwrap());
+        let (release, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+            drop(stream);
+        });
+
+        let started = std::time::Instant::now();
+        upload_to(&dir, &url, STARTUP_UPLOAD_TIMEOUT);
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        server.join().unwrap();
+
+        assert!(
+            elapsed >= STARTUP_UPLOAD_TIMEOUT,
+            "returned early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "timed out late: {elapsed:?}"
+        );
+        assert_eq!(read_pending_crash(&dir).as_deref(), Some(REPORT));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn blocking_startup_without_a_report_is_a_noop() {
         let dir = pending_dir();
         clear_pending_crash(&dir);
-        upload_to(&dir, "not a URL", Duration::from_millis(100));
+        upload_pending_crash_blocking(&dir);
         assert_eq!(read_pending_crash(&dir), None);
         let _ = std::fs::remove_dir_all(dir);
     }

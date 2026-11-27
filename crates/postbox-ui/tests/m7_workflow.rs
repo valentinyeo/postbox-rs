@@ -14,7 +14,10 @@ use postbox_platform::LinkOutcome;
 use postbox_platform::{MockUrlHandler, Notifier};
 use postbox_store::Store;
 use postbox_ui::control::{LiveTelemetry, handle as handle_control};
-use postbox_ui::{M7State, PostboxViewModel, StatusCard, UpdatePhase, deep_link_note_matches};
+use postbox_ui::{
+    M7State, PaletteCommand, PaletteEntry, PaletteEntryKind, PostboxViewModel, StatusCard,
+    UpdatePhase, deep_link_note_matches,
+};
 
 fn seed_store() -> Store {
     let store = Store::open_in_memory().unwrap();
@@ -257,28 +260,12 @@ fn the_update_command_reaches_the_palette_and_tracks_state() {
     );
 
     // Executing it sets the request flag exactly once.
-    let entry = vm
-        .palette_entries()
-        .iter()
-        .find(|entry| {
-            entry
-                .label
-                .to_ascii_lowercase()
-                .contains("check for updates")
-        })
-        .cloned()
-        .expect("the update command is listed");
-    vm.execute_palette_entry(&entry);
+    vm.execute_palette_entry(&update_entry(&vm));
     assert!(vm.take_update_check_request());
     assert!(!vm.take_update_check_request());
 
     // A newer manifest moves the state to "available".
-    let body = format!(
-        r#"{{"tag":"v0.2.0","sha256":"{}","asset":"postbox-windows-x64.zip","assets":[{{"name":"postbox-windows-x64.zip","browser_download_url":"https://example.invalid/a.zip","size":10}}]}}"#,
-        digest_hex(b"payload")
-    );
-    let manifest = UpdateManifest::parse(&body).unwrap();
-    let outcome = vm.check_for_updates(&manifest);
+    let outcome = vm.check_for_updates(&manifest_for("v0.2.0"));
     assert!(matches!(
         outcome,
         postbox_core::update::CheckOutcome::Available { .. }
@@ -286,6 +273,123 @@ fn the_update_command_reaches_the_palette_and_tracks_state() {
     // A newer release starts the background download; nothing blocks the UI.
     assert_eq!(vm.m7().update_phase, UpdatePhase::Downloading);
     assert_eq!(vm.update_command_label(), "Downloading the update...");
+}
+
+fn manifest_for(tag: &str) -> UpdateManifest {
+    let body = format!(
+        r#"{{"tag":"{tag}","sha256":"{}","asset":"postbox-windows-x64.zip","assets":[{{"name":"postbox-windows-x64.zip","browser_download_url":"https://example.invalid/a.zip","size":10}}]}}"#,
+        digest_hex(b"payload")
+    );
+    UpdateManifest::parse(&body).expect("manifest parses")
+}
+
+fn update_entry(vm: &PostboxViewModel) -> PaletteEntry {
+    vm.palette_entries()
+        .iter()
+        .find(|entry| {
+            matches!(
+                entry.kind,
+                PaletteEntryKind::Command(PaletteCommand::CheckForUpdates)
+            )
+        })
+        .cloned()
+        .expect("the update entry is listed")
+}
+
+fn restart_entry(vm: &PostboxViewModel) -> Option<PaletteEntry> {
+    vm.palette_entries()
+        .iter()
+        .find(|entry| {
+            matches!(
+                entry.kind,
+                PaletteEntryKind::Command(PaletteCommand::RestartToUpdate)
+            )
+        })
+        .cloned()
+}
+
+/// The `Ctrl+K` check entry: the running version plus the live updater state, in every phase.
+#[test]
+fn the_palette_check_entry_shows_the_version_and_every_update_phase() {
+    let mut vm = vm();
+    vm.open_palette();
+
+    // Idle, before anything is checked: the running version alone.
+    let idle = update_entry(&vm);
+    assert_eq!(idle.label, "Check for updates");
+    assert_eq!(idle.subtitle.as_deref(), Some("v0.1.0"));
+    assert!(restart_entry(&vm).is_none(), "nothing staged yet");
+
+    // Checking.
+    assert!(vm.m7_mut().begin_check(true));
+    vm.refresh_update_palette();
+    let checking = update_entry(&vm);
+    assert_eq!(checking.label, "Checking for updates...");
+    assert_eq!(
+        checking.subtitle.as_deref(),
+        Some("v0.1.0 \u{00B7} Checking...")
+    );
+
+    // Downloading v0.2.0.
+    let asset = manifest_for("v0.2.0")
+        .select_asset()
+        .expect("the release asset");
+    assert!(vm.m7_mut().offer(asset, true));
+    vm.refresh_update_palette();
+    let downloading = update_entry(&vm);
+    assert_eq!(downloading.label, "Downloading the update...");
+    assert_eq!(
+        downloading.subtitle.as_deref(),
+        Some("v0.1.0 \u{00B7} Downloading v0.2.0...")
+    );
+
+    // Ready to install, and the second entry names the staged release.
+    vm.m7_mut().mark_staged("v0.2.0", "- Notes", 1_000);
+    vm.refresh_update_palette();
+    let ready = update_entry(&vm);
+    assert_eq!(ready.label, "Check for updates now");
+    assert_eq!(
+        ready.subtitle.as_deref(),
+        Some("v0.1.0 \u{00B7} v0.2.0 ready to install")
+    );
+    let restart = restart_entry(&vm).expect("the restart entry is listed once an update is staged");
+    assert_eq!(restart.label, "Restart to install Postbox v0.2.0");
+    assert_eq!(restart.subtitle, None);
+}
+
+/// A manual check on the newest build leaves a notice the user can read and dismiss.
+#[test]
+fn a_manual_check_on_the_newest_build_says_up_to_date() {
+    let mut vm = vm();
+    vm.open_palette();
+    let outcome = vm.check_for_updates(&manifest_for("v0.1.0"));
+    assert!(matches!(
+        outcome,
+        postbox_core::update::CheckOutcome::UpToDate { .. }
+    ));
+    assert_eq!(vm.m7().update_phase, UpdatePhase::UpToDate);
+    assert_eq!(
+        vm.status_notice(),
+        Some("Postbox v0.1.0 is up to date"),
+        "the user sees feedback straight away"
+    );
+    let entry = update_entry(&vm);
+    assert_eq!(entry.label, "Check for updates");
+    assert_eq!(
+        entry.subtitle.as_deref(),
+        Some("v0.1.0 \u{00B7} Up to date")
+    );
+    assert!(restart_entry(&vm).is_none());
+
+    // A failed manual check reads as a retry, and says the build is untouched.
+    vm.m7_mut().mark_failed("digest mismatch", true);
+    vm.refresh_update_palette();
+    let failed = update_entry(&vm);
+    assert_eq!(failed.label, "Retry the update check");
+    assert_eq!(
+        failed.subtitle.as_deref(),
+        Some("v0.1.0 \u{00B7} Update check failed")
+    );
 }
 
 #[test]
@@ -465,7 +569,7 @@ fn a_staged_update_can_be_restarted_from_ctrl_k_and_esc_does_not_break_modals() 
     let restart = vm
         .palette_entries()
         .iter()
-        .find(|entry| entry.label == "Restart to install update")
+        .find(|entry| entry.label == "Restart to install Postbox v0.2.0")
         .cloned()
         .expect("the restart entry is listed");
     vm.execute_palette_entry(&restart);
@@ -493,7 +597,12 @@ fn the_status_card_and_update_state_start_empty() {
     let state = M7State::new();
     assert!(state.card.is_none());
     assert_eq!(state.update_phase, UpdatePhase::Idle);
-    assert_eq!(state.update_label(), "Check for updates now");
+    assert_eq!(state.update_label(), "Check for updates");
+    assert_eq!(
+        state.update_hint("0.1.0"),
+        "v0.1.0",
+        "no status before a check"
+    );
     let card = StatusCard::new("x", "t", "n", 0);
     assert!(!card.is_missing_chat());
     assert!(

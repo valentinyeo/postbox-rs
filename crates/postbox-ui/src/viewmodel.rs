@@ -2672,6 +2672,8 @@ impl PostboxViewModel {
     }
 
     pub(crate) fn rebuild_palette_entries(&mut self) {
+        let update_hint = self.m7.update_hint(&self.version);
+        let restart_label = self.m7.restart_label();
         let selected_chat = self.selected_chat();
         let slack_threads_enabled = selected_chat
             .filter(|c| c.key.provider == Provider::Slack)
@@ -2709,7 +2711,8 @@ impl PostboxViewModel {
             bulk_selected_count: self.bulk_selected.len(),
             marked_messages_count: self.marked_voice_messages_count(),
             update_label: self.m7.update_label(),
-            restart_label: self.m7.restart_label(),
+            update_hint: &update_hint,
+            restart_label: restart_label.as_deref(),
         };
         let commands = build_palette_items(&catalog_ctx);
 
@@ -3047,6 +3050,7 @@ impl PostboxViewModel {
                 self.m7.reshow_update_prompt();
                 self.status_notice = Some(self.m7.update_label().to_owned());
                 self.update_check_requested = true;
+                self.refresh_update_palette();
             }
             PaletteCommand::RestartToUpdate => {
                 // The desktop shell performs the swap and relaunch off this request.
@@ -3218,6 +3222,26 @@ impl PostboxViewModel {
         &self.m7
     }
 
+    /// Keeps the `Ctrl+K` update rows in step with the live updater state.
+    ///
+    /// The catalog is a snapshot, so a phase change while the palette is open has to ask for
+    /// a rebuild or the hint would keep showing the state from before the check.
+    pub fn refresh_update_palette(&mut self) {
+        if self.palette.open {
+            self.rebuild_palette_entries();
+        }
+    }
+
+    /// The running version and live updater state, as the `Ctrl+K` check entry shows it.
+    pub fn update_hint(&self) -> String {
+        self.m7.update_hint(&self.version)
+    }
+
+    /// The `Ctrl+K` restart entry, naming the staged release, when one is waiting.
+    pub fn restart_command_label(&self) -> Option<String> {
+        self.m7.restart_label()
+    }
+
     pub fn m7_mut(&mut self) -> &mut crate::m7::M7State {
         &mut self.m7
     }
@@ -3231,6 +3255,7 @@ impl PostboxViewModel {
             .unwrap_or_else(|| postbox_core::update::Version::new(0, 0, 0));
         let outcome = self.m7.apply_manifest(manifest, current);
         self.status_notice = self.m7.update_note.clone();
+        self.refresh_update_palette();
         outcome
     }
 

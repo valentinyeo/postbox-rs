@@ -342,9 +342,11 @@ pub struct PaletteCatalogContext<'a> {
     pub selected_message: Option<&'a Message>,
     pub bulk_selected_count: usize,
     pub marked_messages_count: usize,
-    /// Milestone 7: the update command reads as state ("Postbox is up to date") once a check
+    /// Milestone 7: the update command reads as state ("Checking for updates...") once a check
     /// has run.
     pub update_label: &'a str,
+    /// Milestone 7: the running version plus live updater state, shown under the check entry.
+    pub update_hint: &'a str,
     /// Milestone 7: the second entry that appears once a restart is waiting, as in
     /// `main.zig:15705`.
     pub restart_label: Option<&'a str>,
@@ -355,9 +357,18 @@ fn cmd_entry(
     shortcut: Option<&str>,
     cmd: PaletteCommand,
 ) -> PaletteEntry {
+    cmd_entry_with_subtitle(label, None, shortcut, cmd)
+}
+
+fn cmd_entry_with_subtitle(
+    label: impl Into<String>,
+    subtitle: Option<&str>,
+    shortcut: Option<&str>,
+    cmd: PaletteCommand,
+) -> PaletteEntry {
     PaletteEntry {
         label: label.into(),
-        subtitle: None,
+        subtitle: subtitle.map(str::to_owned),
         shortcut: shortcut.map(str::to_owned),
         group: PaletteGroupKind::Commands,
         kind: PaletteEntryKind::Command(cmd),
@@ -780,8 +791,9 @@ pub fn build_palette_items(ctx: &PaletteCatalogContext<'_>) -> Vec<PaletteEntry>
         None,
         PaletteCommand::AttachFile,
     ));
-    items.push(cmd_entry(
+    items.push(cmd_entry_with_subtitle(
         ctx.update_label,
+        Some(ctx.update_hint),
         None,
         PaletteCommand::CheckForUpdates,
     ));
@@ -1073,7 +1085,8 @@ mod tests {
             selected_message: None,
             bulk_selected_count: 0,
             marked_messages_count: 0,
-            update_label: "Check for updates now",
+            update_label: "Check for updates",
+            update_hint: "v0.1.0",
             restart_label: None,
         };
         let idle = build_palette_items(&ctx);
@@ -1085,7 +1098,7 @@ mod tests {
             "no restart entry before anything is staged"
         );
 
-        ctx.restart_label = Some("Restart to install update");
+        ctx.restart_label = Some("Restart to install Postbox v0.2.0");
         let staged = build_palette_items(&ctx);
         let restart = staged
             .iter()
@@ -1096,7 +1109,7 @@ mod tests {
                 )
             })
             .expect("the restart entry is listed");
-        assert_eq!(restart.label, "Restart to install update");
+        assert_eq!(restart.label, "Restart to install Postbox v0.2.0");
     }
 
     #[test]
@@ -1123,7 +1136,8 @@ mod tests {
             selected_message: None,
             bulk_selected_count: 0,
             marked_messages_count: 0,
-            update_label: "Check for updates now",
+            update_label: "Check for updates",
+            update_hint: "v0.1.0",
             restart_label: None,
         };
         let commands = build_palette_items(&ctx);

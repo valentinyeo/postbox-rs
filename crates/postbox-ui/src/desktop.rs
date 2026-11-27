@@ -3,7 +3,7 @@ use crate::geometry::{
     CHAT_COLUMN_MAX_WIDTH_PX, SIDEBAR_WIDTH_PX, TYPE_CHAT_NAME_PX, TYPE_LABEL_PX, TYPE_TIME_PX,
     VIEW_RAIL_WIDTH_PX,
 };
-use crate::palette::PaletteMode;
+use crate::palette::{PaletteEntryKind, PaletteMode};
 use crate::sync_bridge::{HubConnectionStatus, SyncBridge, SyncCommand, SyncEvent};
 use crate::theme::{ShadcnPalette, archived_row_color, archived_text_color};
 use crate::timeline::{OutboxBadge, ReadTickDisplay, TimelineItem, format_time_hm};
@@ -16,6 +16,7 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::input::{InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::label::Label;
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::{IndexPath, Theme, ThemeMode, VirtualListScrollHandle, v_virtual_list};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -2257,6 +2258,7 @@ impl PostboxShell {
         let shell_query = cx.entity();
         let shell_select = cx.entity();
         let shell_confirm = cx.entity();
+        let scale = self.vm.font_scale().percent();
 
         let mut cmd = Command::new(&self.palette_state)
             .filterable(false)
@@ -2288,7 +2290,14 @@ impl PostboxShell {
                 } else {
                     entry.label
                 };
-                group = group.item(CommandItem::new().label(label));
+                // Milestone 7: the update entry carries a second line, so the running version
+                // and the live updater state read inside `Ctrl+K` without opening anything.
+                group = group.item(match (&entry.kind, &entry.subtitle) {
+                    (PaletteEntryKind::Command(_), Some(subtitle)) => {
+                        palette_entry_row(label, subtitle, scale)
+                    }
+                    _ => CommandItem::new().label(label),
+                });
             }
             cmd = cmd.group(group);
         }
@@ -2438,6 +2447,55 @@ impl PostboxShell {
             )
             .into_any_element()
     }
+}
+
+/// One palette row: the command on top, its hint (version plus update state) underneath.
+///
+/// The row is named for both lines, so the palette search and a screen reader read the version
+/// and the update state, not just the command. The hint scales with the 60-160% font scale like
+/// every other surface.
+fn palette_entry_row(label: String, subtitle: &str, scale_percent: u16) -> CommandItem {
+    let hint: SharedString = subtitle.to_owned().into();
+    let hint_id = SharedString::from(palette_hint_id(&label));
+    let label_px = scaled_px(TYPE_CHAT_NAME_PX, scale_percent);
+    let hint_px = scaled_px(TYPE_LABEL_PX, scale_percent);
+    let accessible = format!("{label}. {subtitle}");
+    CommandItem::new().label(accessible).child(move |_, cx| {
+        let theme = Theme::global(cx);
+        div()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .child(
+                Label::new(label.clone())
+                    .font_family(FONT_SANS)
+                    .text_size(px(label_px))
+                    .text_color(theme.foreground),
+            )
+            .child(
+                Label::new(hint.clone())
+                    .id(hint_id.clone())
+                    .font_family(FONT_MONO)
+                    .text_size(px(hint_px))
+                    .text_color(theme.muted_foreground),
+            )
+    })
+}
+
+/// Stable element id for one palette hint, derived from its command label.
+fn palette_hint_id(label: &str) -> String {
+    let slug: String = label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-').to_owned();
+    format!("palette-hint-{slug}")
 }
 
 impl Focusable for PostboxShell {
@@ -3196,7 +3254,7 @@ mod desktop_tests {
     use super::*;
     use crate::sync_bridge::create_sync_bridge;
     use gpui_kit::base::Root;
-    use gpui_kit::test::{TestEventExt as _, TestWindowExt as _};
+    use gpui_kit::test::{TestEventExt as _, TestQueryExt as _, TestWindowExt as _};
     use gpui_kit::{Bounds, Point, WindowBounds};
     use gpui_kit::{TestAppContext, WindowHandle};
     use postbox_core::{Account, Chat, ChatKey, Message, ReadStatus};
@@ -5898,6 +5956,24 @@ mod desktop_tests {
     /// `run_until_parked()` can return before that thread's result reaches the shell. Polling
     /// the phase instead of sleeping a fixed time keeps the wait bounded and gives the same
     /// answer on a fast Linux disk and a slow Windows CI disk.
+    /// Text painted in the window's last frame, which is what a person actually sees.
+    fn painted_texts(window: &gpui_kit::Window) -> Vec<String> {
+        gpui_kit::base::test_support::texts(window)
+            .into_iter()
+            .filter(|text| text.visible())
+            .map(|text| text.text().to_owned())
+            .collect()
+    }
+
+    /// The `Ctrl+K` hint line under the update command, as painted.
+    fn assert_palette_hint(window: &gpui_kit::Window, expected: &str) {
+        let texts = painted_texts(window);
+        assert!(
+            texts.iter().any(|text| text == expected),
+            "expected {expected:?} in the palette, painted {texts:?}"
+        );
+    }
+
     fn settle_update_cycle(cx: &mut TestAppContext, shell: &Entity<PostboxShell>) {
         for _ in 0..600 {
             cx.run_until_parked();
@@ -5959,9 +6035,14 @@ mod desktop_tests {
             assert!(prompt.notes.contains("window"), "{}", prompt.notes);
             assert_eq!(this.vm.update_command_label(), "Check for updates now");
             assert_eq!(
-                this.vm.m7().restart_label(),
-                Some("Restart to install update"),
+                this.vm.restart_command_label().as_deref(),
+                Some("Restart to install Postbox v0.2.0"),
                 "Ctrl+K offers the restart while a staged update waits"
+            );
+            assert_eq!(
+                this.vm.update_hint(),
+                "v0.1.0 \u{00B7} v0.2.0 ready to install",
+                "the palette hint names the staged release"
             );
         });
         // Staged beside the live binary, never swapped without the click.
@@ -6326,6 +6407,160 @@ mod desktop_tests {
             1,
             "the staged bytes are reused instead of downloaded twice"
         );
+
+        let _ = std::fs::remove_dir_all(&install_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[gpui_kit::test]
+    fn ctrl_k_shows_the_running_version_update_state_and_manual_feedback(cx: &mut TestAppContext) {
+        let (install_dir, live) = install_fixture("update_palette");
+        let data_dir = unique_desktop_test_dir("update_palette_data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        // The published release is the build that is already running.
+        let archive = b"current release".to_vec();
+        let source = std::sync::Arc::new(FixedRelease {
+            manifest: release_manifest("v0.1.0", &archive),
+            archive: archive.clone(),
+            downloads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let launch_ctx = update_launch_ctx(&data_dir, source.clone());
+        let (handle, shell, _recorder) = open_update_shell(cx, launch_ctx, install_dir.clone());
+        cx.run_until_parked();
+
+        // Before any check the palette row carries the running version and nothing else.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-k", cx);
+            window.input("check for updates", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_palette_hint(window, "v0.1.0");
+        })
+        .unwrap();
+
+        // A manual check on the newest build says so, in the palette and in the card.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            shell.update(cx, |this, cx| this.start_update_cycle(cx, true));
+        })
+        .unwrap();
+        settle_update_cycle(cx, &shell);
+        cx.update(|cx| {
+            let this = shell.read(cx);
+            assert_eq!(this.vm.m7().update_phase, crate::m7::UpdatePhase::UpToDate);
+            assert_eq!(
+                this.vm.status_notice(),
+                Some("Postbox v0.1.0 is up to date"),
+                "a manual check always answers"
+            );
+            assert_eq!(
+                this.vm.update_hint(),
+                "v0.1.0 \u{00B7} Up to date",
+                "and the palette says it too"
+            );
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_palette_hint(window, "v0.1.0 \u{00B7} Up to date");
+            let card = window
+                .try_find("status-card-update-status")
+                .expect("the up-to-date card is offered");
+            assert!(card.visible(), "and it is on screen");
+            assert!(
+                painted_texts(window)
+                    .iter()
+                    .any(|text| text == "Postbox v0.1.0 is up to date"),
+                "the card spells the version out: {:?}",
+                painted_texts(window)
+            );
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&live).unwrap(),
+            b"installed build",
+            "an up-to-date check touches nothing on disk"
+        );
+        assert_eq!(
+            source.downloads.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "and downloads nothing"
+        );
+
+        // The card is dismissible and never blocks.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("status-card-close", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("status-card-update-status").is_none());
+        })
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(&install_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[gpui_kit::test]
+    fn ctrl_k_names_the_staged_version_when_a_restart_is_waiting(cx: &mut TestAppContext) {
+        let (install_dir, _live) = install_fixture("update_palette_staged");
+        let data_dir = unique_desktop_test_dir("update_palette_staged_data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let archive = b"newer release".to_vec();
+        let source = std::sync::Arc::new(FixedRelease {
+            manifest: release_manifest("v0.2.0", &archive),
+            archive: archive.clone(),
+            downloads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let launch_ctx = update_launch_ctx(&data_dir, source);
+        let (handle, shell, _recorder) = open_update_shell(cx, launch_ctx, install_dir.clone());
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            shell.update(cx, |this, cx| this.start_update_cycle(cx, false));
+        })
+        .unwrap();
+        settle_update_cycle(cx, &shell);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-k", cx);
+            window.input("restart to install", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .try_find_by_label("Restart to install Postbox v0.2.0")
+                    .is_some(),
+                "the restart row names the version it installs"
+            );
+        })
+        .unwrap();
+
+        // The check row keeps its own hint, naming the staged release.
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                this.vm.set_palette_query("check for updates");
+                cx.notify();
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_palette_hint(window, "v0.1.0 \u{00B7} v0.2.0 ready to install");
+        })
+        .unwrap();
 
         let _ = std::fs::remove_dir_all(&install_dir);
         let _ = std::fs::remove_dir_all(&data_dir);

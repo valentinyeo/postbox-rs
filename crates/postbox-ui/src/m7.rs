@@ -13,6 +13,18 @@ use postbox_platform::os_integration::{LinkOutcome, route_line};
 pub const CARD_DISMISS_AFTER_MS: u64 = 12_000;
 /// Longest note shown in the card, in characters.
 pub const MAX_CARD_NOTE_CHARS: usize = 160;
+/// Card id for updater feedback after a manual `Ctrl+K` check.
+pub const UPDATE_STATUS_CARD_ID: &str = "update-status";
+
+/// `v0.1.1` for both `0.1.1` and `v0.1.1`, so every surface reads the same tag.
+pub fn version_tag(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with('v') {
+        trimmed.to_owned()
+    } else {
+        format!("v{trimmed}")
+    }
+}
 
 /// A dismissible, non-blocking card in the top of the chat pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,7 +252,25 @@ impl M7State {
         } else {
             UpdatePhase::UpToDate
         };
-        self.update_note = manual.then(|| format!("Postbox {current} is the newest version."));
+        self.update_note = manual.then(|| self.up_to_date_notice(current));
+    }
+
+    /// `Postbox v0.1.1 is up to date`, the notice a manual check leaves behind.
+    pub fn up_to_date_notice(&self, current: &str) -> String {
+        format!("Postbox {} is up to date", version_tag(current))
+    }
+
+    /// A dismissible card for updater feedback, so a manual check leaves proof on screen.
+    ///
+    /// Manual checks only: a background cycle stays quiet, because the card would nag about
+    /// something the user did not ask for.
+    pub fn show_update_card(
+        &mut self,
+        title: impl Into<String>,
+        note: impl Into<String>,
+        now_ms: u64,
+    ) {
+        self.card = Some(StatusCard::new(UPDATE_STATUS_CARD_ID, title, note, now_ms));
     }
 
     /// A newer release was found. `true` when it still needs downloading and staging.
@@ -338,24 +368,50 @@ impl M7State {
         true
     }
 
-    /// Extra `Ctrl+K` entry once a restart is waiting.
-    pub fn restart_label(&self) -> Option<&'static str> {
-        self.update_prompt
-            .as_ref()
-            .map(|_| "Restart to install update")
+    /// Extra `Ctrl+K` entry once a restart is waiting, naming the staged release.
+    pub fn restart_label(&self) -> Option<String> {
+        let prompt = self.update_prompt.as_ref()?;
+        Some(format!(
+            "Restart to install Postbox {}",
+            version_tag(&prompt.tag)
+        ))
     }
 
     /// Text the `Ctrl+K` check entry shows. A staged update keeps this entry as the check,
     /// because [`M7State::restart_label`] adds the separate restart entry beside it.
     pub fn update_label(&self) -> &'static str {
         match self.update_phase {
-            UpdatePhase::Idle | UpdatePhase::Ready => "Check for updates now",
+            UpdatePhase::Idle | UpdatePhase::UpToDate => "Check for updates",
             UpdatePhase::Checking => "Checking for updates...",
             UpdatePhase::Downloading => "Downloading the update...",
+            UpdatePhase::Ready => "Check for updates now",
             UpdatePhase::Installing => "Installing update...",
-            UpdatePhase::UpToDate => "Postbox is up to date",
             UpdatePhase::Failed => "Retry the update check",
         }
+    }
+
+    /// Second line of the `Ctrl+K` check entry: the running version plus live updater state.
+    ///
+    /// `v0.1.1` alone before the first check, then `v0.1.1 \u{00B7} Up to date`,
+    /// `v0.1.1 \u{00B7} Downloading v0.1.2...` and so on.
+    pub fn update_hint(&self, current: &str) -> String {
+        let running = version_tag(current);
+        let status = match self.update_phase {
+            UpdatePhase::Idle => return running,
+            UpdatePhase::Checking => "Checking...".to_owned(),
+            UpdatePhase::Downloading => match &self.pending_asset {
+                Some(asset) => format!("Downloading {}...", version_tag(&asset.tag)),
+                None => "Downloading...".to_owned(),
+            },
+            UpdatePhase::Ready => match self.update_prompt.as_ref() {
+                Some(prompt) => format!("{} ready to install", version_tag(&prompt.tag)),
+                None => "Ready to install".to_owned(),
+            },
+            UpdatePhase::Installing => "Installing...".to_owned(),
+            UpdatePhase::UpToDate => "Up to date".to_owned(),
+            UpdatePhase::Failed => "Update check failed".to_owned(),
+        };
+        format!("{running} \u{00B7} {status}")
     }
 
     pub fn busy(&self) -> bool {
@@ -494,7 +550,8 @@ mod tests {
         assert!(matches!(outcome, CheckOutcome::UpToDate { .. }));
         assert_eq!(state.update_phase, UpdatePhase::UpToDate);
         assert!(state.pending_asset.is_none());
-        assert_eq!(state.update_label(), "Postbox is up to date");
+        assert_eq!(state.update_label(), "Check for updates");
+        assert_eq!(state.update_hint("0.1.0"), "v0.1.0 \u{00B7} Up to date");
         assert!(state.update_note.is_some());
     }
 
@@ -511,7 +568,14 @@ mod tests {
             "Check for updates now",
             "the check entry stays a check"
         );
-        assert_eq!(state.restart_label(), Some("Restart to install update"));
+        assert_eq!(
+            state.restart_label().as_deref(),
+            Some("Restart to install Postbox v0.2.0")
+        );
+        assert_eq!(
+            state.update_hint("0.1.0"),
+            "v0.1.0 \u{00B7} v0.2.0 ready to install"
+        );
         let prompt = state.visible_update_prompt().expect("the card is offered");
         assert_eq!(prompt.headline(), "Postbox v0.2.0 is ready");
         assert_eq!(prompt.notes, "- Toasts open the right chat");
@@ -616,6 +680,48 @@ mod tests {
         assert!(!state.should_report_last_crash());
         state.last_exit_record = Some(ExitRecord::panic("0.1.0", 10, 20, Some("boom"), None));
         assert!(state.should_report_last_crash());
+    }
+
+    #[test]
+    fn every_surface_spells_the_version_as_one_tag() {
+        // The build string has no `v`; the manifest tag already has one. Both read the same.
+        assert_eq!(version_tag("0.1.1"), "v0.1.1");
+        assert_eq!(version_tag("v0.1.1"), "v0.1.1");
+        assert_eq!(version_tag(" v0.1.1 "), "v0.1.1");
+
+        let mut state = M7State::new();
+        assert_eq!(state.update_hint("0.1.1"), "v0.1.1", "quiet before a check");
+        state.mark_staged("v0.1.2", "", 1_000);
+        assert_eq!(
+            state.restart_label().as_deref(),
+            Some("Restart to install Postbox v0.1.2")
+        );
+        assert_eq!(
+            state.update_hint("0.1.1"),
+            "v0.1.1 \u{00B7} v0.1.2 ready to install"
+        );
+    }
+
+    #[test]
+    fn a_manual_up_to_date_check_leaves_a_card_the_user_can_dismiss() {
+        let mut state = M7State::new();
+        state.mark_up_to_date("0.1.1", true);
+        assert_eq!(
+            state.update_note.as_deref(),
+            Some("Postbox v0.1.1 is up to date")
+        );
+        state.show_update_card("Postbox is up to date", "Postbox v0.1.1 is up to date", 10);
+        let card = state.card.as_ref().expect("the card is offered");
+        assert_eq!(card.id, UPDATE_STATUS_CARD_ID);
+        assert!(!card.is_missing_chat());
+        assert!(state.close_card());
+        assert!(state.card.is_none());
+
+        // A background cycle says nothing at all.
+        let mut quiet = M7State::new();
+        quiet.mark_up_to_date("0.1.1", false);
+        assert!(quiet.update_note.is_none());
+        assert!(quiet.card.is_none());
     }
 
     #[test]

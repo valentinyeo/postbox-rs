@@ -11,6 +11,7 @@ use crate::m7::{M7State, StatusCard};
 use crate::theme::ShadcnPalette;
 use crate::{FONT_MONO, FONT_SANS};
 use gpui_kit::base::TestSupportExt as _;
+use gpui_kit::component::label::Label;
 use gpui_kit::{
     AsyncWindowContext, Context, InteractiveElement as _, IntoElement, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, div, px,
@@ -357,6 +358,7 @@ impl PostboxShell {
             if let Some(note) = self.vm.m7().update_note.clone() {
                 self.vm.set_status_notice(note);
             }
+            self.vm.refresh_update_palette();
             cx.notify();
             return;
         }
@@ -370,6 +372,7 @@ impl PostboxShell {
         if !self.vm.m7_mut().begin_check(manual) {
             return;
         }
+        self.vm.refresh_update_palette();
         let install_dir = self.install_dir.clone();
         let version = self.vm.version().to_owned();
         let current = postbox_core::update::Version::parse(&version)
@@ -398,9 +401,16 @@ impl PostboxShell {
     /// Folds one cycle into shell state. Background failures stay silent.
     pub fn apply_update_cycle(&mut self, outcome: UpdateCycleOutcome, manual: bool) {
         let now_ms = crate::viewmodel::now_epoch_millis_public() as u64;
+        let mut card: Option<(String, String)> = None;
         match outcome {
             UpdateCycleOutcome::UpToDate { current } => {
                 self.vm.m7_mut().mark_up_to_date(&current, manual);
+                if manual {
+                    card = Some((
+                        "Postbox is up to date".to_owned(),
+                        self.vm.m7().up_to_date_notice(&current),
+                    ));
+                }
             }
             UpdateCycleOutcome::Staged { staged, notes } => {
                 let tag = staged.tag.clone();
@@ -412,14 +422,33 @@ impl PostboxShell {
                     postbox_platform::discard(&previous);
                 }
                 self.vm.m7_mut().mark_staged(&tag, &notes, now_ms);
+                if manual {
+                    card = Some((
+                        "Update ready to install".to_owned(),
+                        format!(
+                            "Postbox {} is ready. Restart from Ctrl+K to install it.",
+                            crate::m7::version_tag(&tag)
+                        ),
+                    ));
+                }
             }
             UpdateCycleOutcome::Failed { reason } => {
                 self.vm.m7_mut().mark_failed(&reason, manual);
+                if manual {
+                    card = Some((
+                        "Update check failed".to_owned(),
+                        format!("Update failed: {reason}. Your installed version is untouched."),
+                    ));
+                }
             }
+        }
+        if let Some((title, note)) = card {
+            self.vm.m7_mut().show_update_card(title, note, now_ms);
         }
         if let Some(note) = self.vm.m7().update_note.clone() {
             self.vm.set_status_notice(note);
         }
+        self.vm.refresh_update_palette();
     }
 
     /// The restart click: swap the staged binary in atomically, then relaunch.
@@ -689,18 +718,17 @@ impl PostboxShell {
                         .flex_col()
                         .gap_1()
                         .child(
-                            div()
+                            Label::new(card.title.clone())
                                 .font_family(FONT_SANS)
                                 .text_size(px(TYPE_LABEL_PX))
-                                .text_color(rgb(p.foreground))
-                                .child(card.title.clone()),
+                                .text_color(rgb(p.foreground)),
                         )
                         .child(
-                            div()
+                            Label::new(card.note.clone())
+                                .id(SharedString::from(format!("status-card-note-{}", card.id)))
                                 .font_family(FONT_SANS)
                                 .text_size(px(TYPE_TIME_PX))
-                                .text_color(rgb(p.muted_foreground))
-                                .child(card.note.clone()),
+                                .text_color(rgb(p.muted_foreground)),
                         ),
                 )
                 .child(

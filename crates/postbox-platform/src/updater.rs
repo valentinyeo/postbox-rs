@@ -509,7 +509,10 @@ mod tests {
             if should_fail {
                 return Err(PlatformError::OsUnavailable);
             }
-            assert!(!target.exists(), "the running exe must be moved aside first");
+            assert!(
+                !target.exists(),
+                "the running exe must be moved aside first"
+            );
             std::fs::rename(staged, target)?;
             Ok(())
         }

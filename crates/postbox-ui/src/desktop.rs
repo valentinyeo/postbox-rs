@@ -1065,6 +1065,27 @@ impl PostboxShell {
             }
         }
 
+        if let Some(chat) = self.vm.take_attachment_picker_request() {
+            match postbox_platform::pick_attachment_file() {
+                Ok(Some(path)) => {
+                    self.vm.stage_picked_attachment(&chat, path);
+                }
+                Ok(None) => {}
+                Err(_) => self.vm.set_status_notice("Could not open the file picker"),
+            }
+        }
+        if let Some(path) = self.vm.take_pending_external_video_path() {
+            let notice = if postbox_platform::open_external_video(&path).is_ok() {
+                "Opened video externally"
+            } else {
+                "Windows could not open the video"
+            };
+            self.vm.set_status_notice(notice);
+        }
+        if let Some(url) = self.vm.take_pending_external_url() {
+            cx.open_url(&url);
+        }
+
         self.refresh_visible_gpu_textures(window, cx);
         // `Ctrl+K > Play video inline` queues an open request; answer it here.
         if let Some(msg_id) = self.vm.take_pending_video_open() {

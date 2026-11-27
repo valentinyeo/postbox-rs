@@ -567,7 +567,10 @@ impl AtomicReplacer for ScriptedReplacer {
         if self.fail_calls.contains(&calls.len()) {
             return Err(PlatformError::OsUnavailable);
         }
-        assert!(!target.exists(), "the running exe must be moved aside first");
+        assert!(
+            !target.exists(),
+            "the running exe must be moved aside first"
+        );
         postbox_platform::NativeReplacer.replace(staged, target)
     }
 }
@@ -823,7 +826,10 @@ mod updater {
                 assert!(!live.exists());
                 assert_eq!(std::fs::read(&backup).unwrap(), b"installed build");
             } else {
-                assert!(matches!(err, UpdateError::SwapFailedRolledBack(_)), "{err:?}");
+                assert!(
+                    matches!(err, UpdateError::SwapFailedRolledBack(_)),
+                    "{err:?}"
+                );
                 assert_eq!(std::fs::read(&live).unwrap(), b"installed build");
                 assert!(!backup.exists());
             }

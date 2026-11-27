@@ -43,6 +43,27 @@ pub fn missing_chat_note(provider: Provider) -> &'static str {
     }
 }
 
+pub fn build(chat: &ChatKey, message: Option<&str>) -> String {
+    let mut url = format!("{SCHEME_PREFIX}{}", chat.provider.as_str());
+    for segment in [Some(chat.account.as_str()), Some(chat.id.as_str()), message]
+        .into_iter()
+        .flatten()
+    {
+        url.push('/');
+        for byte in segment.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                url.push(char::from(byte));
+            } else {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                url.push('%');
+                url.push(char::from(HEX[(byte >> 4) as usize]));
+                url.push(char::from(HEX[(byte & 15) as usize]));
+            }
+        }
+    }
+    url
+}
+
 pub fn parse(raw: &str) -> Result<DeepLinkTarget, DeepLinkError> {
     let trimmed = raw.trim();
     if !is_postbox_url(trimmed) {
@@ -130,6 +151,28 @@ fn hex_val(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builds_encoded_links_that_round_trip() {
+        for provider in [
+            Provider::Whatsapp,
+            Provider::Slack,
+            Provider::Telegram,
+            Provider::Signal,
+        ] {
+            let chat = ChatKey::new(provider, "account /?#%", "chat/é@host");
+            let url = build(&chat, Some("message/?#% é"));
+            assert!(!url.contains(' '));
+            assert_eq!(
+                parse(&url).unwrap(),
+                DeepLinkTarget {
+                    chat: chat.clone(),
+                    message: Some("message/?#% é".into()),
+                }
+            );
+            assert_eq!(parse(&build(&chat, None)).unwrap().message, None);
+        }
+    }
 
     #[test]
     fn parses_whatsapp_and_slack_permalink_deep_links() {

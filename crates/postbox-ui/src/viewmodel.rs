@@ -238,6 +238,9 @@ pub struct PostboxViewModel {
     pub(crate) title_notice: Option<String>,
     quit_requested: bool,
     sync_requested: bool,
+    pending_attachment_picker: Option<ChatKey>,
+    pending_external_video: Option<(ChatKey, String)>,
+    pending_external_url: Option<String>,
     pub(crate) scroll_to_latest_pending: bool,
     refresh_count: u64,
     pub(crate) local_send_seq: u64,
@@ -345,6 +348,9 @@ impl PostboxViewModel {
             title_notice: None,
             quit_requested: false,
             sync_requested: false,
+            pending_attachment_picker: None,
+            pending_external_video: None,
+            pending_external_url: None,
             scroll_to_latest_pending: false,
             refresh_count: 0,
             local_send_seq: 0,
@@ -512,6 +518,10 @@ impl PostboxViewModel {
                     self.m3.media_paths.insert(pair.clone(), path.clone());
                 }
                 if matches!(status, MediaItemStatus::Unavailable | MediaItemStatus::Gone) {
+                    if self.pending_external_video.as_ref() == Some(&pair) {
+                        self.pending_external_video = None;
+                        self.status_notice = Some("Could not download the video".into());
+                    }
                     if self.m4.pending_auto_advance.as_ref() == Some(&pair) {
                         self.m4.pending_auto_advance = None;
                     }
@@ -2998,7 +3008,26 @@ impl PostboxViewModel {
                 self.request_restart_live_sync();
             }
             PaletteCommand::ManageAccounts => {
-                self.status_notice = Some("Manage accounts on the hub".into());
+                let url = match &self.hub_status {
+                    HubConnectionStatus::Connected { url, .. }
+                    | HubConnectionStatus::Connecting { url }
+                    | HubConnectionStatus::Reconnecting { url, .. } => Some(url),
+                    HubConnectionStatus::NotConfigured { configured_url, .. } => {
+                        configured_url.as_ref()
+                    }
+                    HubConnectionStatus::Error { url, .. } => url.as_ref(),
+                };
+                self.pending_external_url = url
+                    .filter(|url| {
+                        (url.starts_with("https://") || url.starts_with("http://"))
+                            && !url.chars().any(char::is_control)
+                    })
+                    .cloned();
+                self.status_notice = Some(if self.pending_external_url.is_some() {
+                    "Opening Hub to manage accounts".into()
+                } else {
+                    "Set POSTBOX_HUB_URL or WAZIG_HUB_URL to manage accounts on the Hub".into()
+                });
             }
             PaletteCommand::Quit => {
                 self.quit_requested = true;
@@ -3055,10 +3084,23 @@ impl PostboxViewModel {
                 self.status_notice = Some("Restarting to install the update...".to_owned());
                 self.update_restart_requested = true;
             }
-            PaletteCommand::CopyMessageLink
-            | PaletteCommand::OpenVideoExternal
-            | PaletteCommand::AttachFile => {
-                self.status_notice = Some("Command queued".into());
+            PaletteCommand::CopyMessageLink => {
+                if let Some(msg) = self.selected_message() {
+                    self.m4.pending_clipboard_text =
+                        Some(postbox_core::deep_link::build(&msg.chat, Some(&msg.msg_id)));
+                    self.status_notice = Some("Message link copied".into());
+                } else {
+                    self.status_notice = Some("No message selected".into());
+                }
+            }
+            PaletteCommand::OpenVideoExternal => {
+                self.request_external_video();
+            }
+            PaletteCommand::AttachFile => {
+                self.pending_attachment_picker = self.selected_chat().map(|chat| chat.key.clone());
+                if self.pending_attachment_picker.is_none() {
+                    self.status_notice = Some("Select a chat first".into());
+                }
             }
             PaletteCommand::SearchChats
             | PaletteCommand::SortViews
@@ -3066,6 +3108,63 @@ impl PostboxViewModel {
             | PaletteCommand::ShowShortcuts => unreachable!(),
         }
         true
+    }
+
+    pub fn take_attachment_picker_request(&mut self) -> Option<ChatKey> {
+        self.pending_attachment_picker.take()
+    }
+
+    pub fn stage_picked_attachment(&mut self, chat: &ChatKey, path: PathBuf) -> bool {
+        if !self
+            .selected_chat()
+            .is_some_and(|selected| &selected.key == chat)
+        {
+            self.status_notice = Some("Chat changed; attachment not added".into());
+            return false;
+        }
+        if self.stage_dropped_files(&[path]) == 0 {
+            self.status_notice = Some("Could not attach the selected file".into());
+            return false;
+        }
+        self.set_focus(FocusTarget::Composer);
+        true
+    }
+
+    fn request_external_video(&mut self) {
+        let Some(msg) = self.selected_message().cloned() else {
+            self.status_notice = Some("Select a video message first".into());
+            return;
+        };
+        if !self.is_video_message_id(&msg.msg_id) {
+            self.status_notice = Some("Selected message is not a video".into());
+            return;
+        }
+        let pair = (msg.chat.clone(), msg.msg_id.clone());
+        self.pending_external_video = Some(pair.clone());
+        if !self
+            .media_path_for(&msg.chat, &msg.msg_id)
+            .is_some_and(|path| path.is_file())
+        {
+            self.m3.media_paths.remove(&pair);
+            if !matches!(
+                self.media_status_for(&msg.chat, &msg.msg_id),
+                MediaItemStatus::Downloading
+            ) {
+                self.request_explicit_media_download(&msg.msg_id);
+            }
+            self.status_notice = Some("Downloading video to open externally".into());
+        }
+    }
+
+    pub fn take_pending_external_video_path(&mut self) -> Option<PathBuf> {
+        let (chat, msg_id) = self.pending_external_video.as_ref()?;
+        let path = self.media_path_for(chat, msg_id)?.clone();
+        self.pending_external_video = None;
+        Some(path)
+    }
+
+    pub fn take_pending_external_url(&mut self) -> Option<String> {
+        self.pending_external_url.take()
     }
 
     // -------------------------------------------------------------------------
@@ -3642,6 +3741,230 @@ mod tests {
             .unwrap();
 
         store
+    }
+
+    #[test]
+    fn palette_attach_file_stages_images_and_documents_for_sending() {
+        let dir =
+            std::env::temp_dir().join(format!("postbox-picker-{}", generate_client_id().unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0")
+            .with_data_dir(dir.clone());
+        let chat = vm.selected_chat().unwrap().key.clone();
+        let png = postbox_media::paste::encode_png(2, 2, &[255; 16]).unwrap();
+        for (name, bytes) in [
+            ("image.png", png),
+            ("notes.txt", b"attachment contents".to_vec()),
+        ] {
+            let source = dir.join(name);
+            std::fs::write(&source, &bytes).unwrap();
+            vm.execute_palette_command(&PaletteCommand::AttachFile, None);
+            assert_eq!(vm.take_attachment_picker_request(), Some(chat.clone()));
+            assert!(vm.take_attachment_picker_request().is_none());
+            assert!(vm.stage_picked_attachment(&chat, source.clone()));
+            assert_eq!(vm.focus(), FocusTarget::Composer);
+            assert_eq!(vm.staged_attachments().len(), 1);
+            std::fs::remove_file(source).unwrap();
+            assert!(vm.submit_composer_message());
+            assert!(vm.staged_attachments().is_empty());
+            let outbox = vm.store().list_outbox_for_chat(&chat).unwrap();
+            let record = outbox
+                .iter()
+                .find(|record| record.wire_filename == name)
+                .unwrap();
+            assert_eq!(record.kind, postbox_core::outbox::OutboxKind::File);
+            assert_eq!(record.chat, chat);
+            assert_eq!(
+                std::fs::read(record.staged_file_path.as_ref().unwrap()).unwrap(),
+                bytes
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn palette_attach_file_handles_no_chat_cancellation_and_stale_target() {
+        let mut empty = PostboxViewModel::new(
+            Store::open_in_memory().unwrap(),
+            Keymap::postbox_defaults(),
+            "0.1.0",
+        );
+        empty.execute_palette_command(&PaletteCommand::AttachFile, None);
+        assert!(empty.take_attachment_picker_request().is_none());
+        assert_eq!(empty.status_notice(), Some("Select a chat first"));
+
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+        vm.execute_palette_command(&PaletteCommand::AttachFile, None);
+        let chat = vm.take_attachment_picker_request().unwrap();
+        // A cancelled picker never calls the staging callback.
+        assert!(vm.staged_attachments().is_empty());
+        assert!(vm.take_attachment_picker_request().is_none());
+        assert!(!vm.stage_picked_attachment(&chat, PathBuf::from("missing-file")));
+        assert_eq!(
+            vm.status_notice(),
+            Some("Could not attach the selected file")
+        );
+        vm.next_chat();
+        assert!(!vm.stage_picked_attachment(&chat, PathBuf::from("missing-file")));
+        assert_eq!(
+            vm.status_notice(),
+            Some("Chat changed; attachment not added")
+        );
+    }
+
+    #[test]
+    fn palette_open_video_external_opens_cached_file_once() {
+        let path = std::env::temp_dir().join(format!(
+            "postbox-video-{}.mp4",
+            generate_client_id().unwrap()
+        ));
+        std::fs::write(&path, b"video").unwrap();
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+        vm.select_message_index(0);
+        vm.messages[0].media_kind = Some(postbox_core::MediaKind::Video);
+        let msg = vm.messages[0].clone();
+        vm.m3
+            .media_paths
+            .insert((msg.chat, msg.msg_id), path.clone());
+        vm.take_emitted_sync_commands();
+        vm.execute_palette_command(&PaletteCommand::OpenVideoExternal, None);
+        assert_eq!(vm.take_pending_external_video_path(), Some(path.clone()));
+        assert!(vm.take_pending_external_video_path().is_none());
+        assert!(vm.take_emitted_sync_commands().is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn palette_open_video_external_downloads_and_waits_for_the_requested_message() {
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+        vm.select_message_index(0);
+        vm.messages[0].mime_type = Some("video/mp4".into());
+        let msg = vm.messages[0].clone();
+        vm.take_emitted_sync_commands();
+        vm.execute_palette_command(&PaletteCommand::OpenVideoExternal, None);
+        assert!(vm.take_pending_external_video_path().is_none());
+        assert!(
+            matches!(vm.take_emitted_sync_commands().as_slice(), [SyncCommand::DownloadMediaExplicit { chat, target }] if chat == &msg.chat && target.msg_id == msg.msg_id)
+        );
+        vm.execute_palette_command(&PaletteCommand::OpenVideoExternal, None);
+        assert!(vm.take_emitted_sync_commands().is_empty());
+        vm.next_chat();
+        vm.apply_sync_event(SyncEvent::MediaDownloaded {
+            chat: msg.chat.clone(),
+            msg_id: "another-video".into(),
+            path: PathBuf::from("other.mp4"),
+            mime_type: "video/mp4".into(),
+            sha256: "other".into(),
+        });
+        assert!(vm.take_pending_external_video_path().is_none());
+        vm.apply_sync_event(SyncEvent::MediaDownloaded {
+            chat: msg.chat,
+            msg_id: msg.msg_id,
+            path: PathBuf::from("requested.mp4"),
+            mime_type: "video/mp4".into(),
+            sha256: "requested".into(),
+        });
+        assert_eq!(
+            vm.take_pending_external_video_path(),
+            Some(PathBuf::from("requested.mp4"))
+        );
+        assert!(vm.take_pending_external_video_path().is_none());
+    }
+
+    #[test]
+    fn palette_open_video_external_rejects_nonvideo_and_clears_failed_download() {
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+        vm.select_message_index(0);
+        vm.execute_palette_command(&PaletteCommand::OpenVideoExternal, None);
+        assert!(vm.take_pending_external_video_path().is_none());
+        assert_eq!(vm.status_notice(), Some("Selected message is not a video"));
+        vm.messages[0].media_kind = Some(postbox_core::MediaKind::Video);
+        let msg = vm.messages[0].clone();
+        vm.execute_palette_command(&PaletteCommand::OpenVideoExternal, None);
+        vm.apply_sync_event(SyncEvent::MediaStatusChanged {
+            chat: msg.chat.clone(),
+            msg_id: msg.msg_id.clone(),
+            status: MediaItemStatus::Gone,
+        });
+        assert_eq!(vm.status_notice(), Some("Could not download the video"));
+        vm.apply_sync_event(SyncEvent::MediaStatusChanged {
+            chat: msg.chat,
+            msg_id: msg.msg_id,
+            status: MediaItemStatus::Ready(PathBuf::from("late.mp4")),
+        });
+        assert!(vm.take_pending_external_video_path().is_none());
+    }
+
+    #[test]
+    fn palette_copy_message_link_uses_the_text_clipboard_path_with_encoded_ids() {
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+        vm.select_message_index(0);
+        vm.messages[0].msg_id = "message /?#%é".into();
+        let msg = vm.messages[0].clone();
+        vm.execute_palette_command(&PaletteCommand::CopyMessageLink, None);
+        let link = vm.take_pending_clipboard_text().unwrap();
+        assert_eq!(
+            postbox_core::deep_link::parse(&link).unwrap(),
+            DeepLinkTarget {
+                chat: msg.chat,
+                message: Some(msg.msg_id),
+            }
+        );
+        assert!(vm.take_pending_clipboard_text().is_none());
+        assert_eq!(vm.status_notice(), Some("Message link copied"));
+        vm.selected_message_idx = None;
+        vm.execute_palette_command(&PaletteCommand::CopyMessageLink, None);
+        assert!(vm.take_pending_clipboard_text().is_none());
+        assert_eq!(vm.status_notice(), Some("No message selected"));
+    }
+
+    #[test]
+    fn palette_manage_accounts_opens_configured_hub_in_every_connection_state() {
+        let url = "https://hub.example/base";
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+        for status in [
+            HubConnectionStatus::Connected {
+                url: url.into(),
+                last_event_id: None,
+            },
+            HubConnectionStatus::Connecting { url: url.into() },
+            HubConnectionStatus::Reconnecting {
+                url: url.into(),
+                attempt: 1,
+                retry_in_secs: 1,
+                last_error: "offline".into(),
+            },
+            HubConnectionStatus::NotConfigured {
+                missing_url: false,
+                missing_token: true,
+                configured_url: Some(url.into()),
+                detail: None,
+            },
+            HubConnectionStatus::Error {
+                url: Some(url.into()),
+                message: "unauthorized".into(),
+            },
+        ] {
+            vm.set_hub_status(status);
+            vm.execute_palette_command(&PaletteCommand::ManageAccounts, None);
+            assert_eq!(vm.take_pending_external_url().as_deref(), Some(url));
+            assert!(vm.take_pending_external_url().is_none());
+        }
+        for status in [
+            HubConnectionStatus::default(),
+            HubConnectionStatus::Error {
+                url: None,
+                message: "No URL".into(),
+            },
+            HubConnectionStatus::Connecting {
+                url: "file:///unsafe.exe".into(),
+            },
+        ] {
+            vm.set_hub_status(status);
+            vm.execute_palette_command(&PaletteCommand::ManageAccounts, None);
+            assert!(vm.take_pending_external_url().is_none());
+            assert!(vm.status_notice().unwrap().contains("POSTBOX_HUB_URL"));
+        }
     }
 
     #[test]

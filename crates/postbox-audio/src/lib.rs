@@ -1,6 +1,7 @@
 //! Pure-Rust (zero `unsafe`) audio, Ogg Opus voice playback/recording, WSOLA time-stretching,
-//! Deepgram Nova-3 REST transcription, and optional ADHD transcript formatting.
+//! Deepgram Nova-3 REST transcription & live WebSocket dictation, and optional ADHD transcript formatting.
 
+pub mod dictation;
 pub mod format;
 pub mod ogg;
 pub mod player;
@@ -9,6 +10,15 @@ pub mod stretch;
 pub mod transcribe;
 pub mod voice_note;
 
+pub use dictation::{
+    CLOSE_STREAM_DRAIN_TIMEOUT, DEFAULT_DEEPGRAM_WS_BASE_URL, DICTATION_CAPTURE_POLL_INTERVAL,
+    DictationError, DictationMeter, LIVE_BYTES_PER_SECOND, LIVE_SAMPLE_RATE,
+    LIVE_TRANSCRIPT_CAPACITY, LiveDictationConfig, LiveDictationPhase, LiveDictationSession,
+    LiveDictationSnapshot, LiveTranscript, MAX_LIVE_AUDIO_BYTES, MAX_LIVE_WS_FRAME_BYTES,
+    MAX_LIVE_WS_MESSAGE_BYTES, SILENCE_RMS_THRESHOLD, SILENCE_WINDOW_MS, SilenceGate,
+    TIMESTAMP_TOLERANCE, WS_CONNECT_TIMEOUT, build_deepgram_ws_url, pcm16_has_speech,
+    wav_has_speech,
+};
 pub use format::{
     DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_OPENROUTER_BASE_URL, DominantLanguage,
     FORMAT_CACHE_HEADER_V2, FORMAT_CACHE_MAX_BYTES, FORMAT_REQUEST_RING_CAP, FormatCache,

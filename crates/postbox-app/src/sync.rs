@@ -1,5 +1,6 @@
 use crate::audio_service::{
-    AudioWorkerCmd, AudioWorkerHandle, persist_transcript_to_store, spawn_format_task,
+    AudioWorkerCmd, AudioWorkerHandle, LiveDictationController, persist_dictation_language_pref,
+    persist_microphone_pref, persist_transcript_to_store, spawn_format_task,
     spawn_transcription_task,
 };
 use postbox_audio::{DeepgramRestClient, TranscriptFormatter};
@@ -228,10 +229,12 @@ struct SyncEngine {
     format_provider: Option<FormatProviderConfig>,
     formatter: TranscriptFormatter,
     audio_worker: AudioWorkerHandle,
+    dictation_controller: LiveDictationController,
 }
 
 impl Drop for SyncEngine {
     fn drop(&mut self) {
+        self.dictation_controller.shutdown();
         self.audio_worker.send(AudioWorkerCmd::Shutdown);
     }
 }
@@ -280,7 +283,14 @@ impl SyncEngine {
             .map(Arc::new);
         let giphy_client = GiphyClient::new().ok();
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
-        let audio_worker = AudioWorkerHandle::spawn(audio_backend, worker.event_tx.clone());
+        let audio_worker =
+            AudioWorkerHandle::spawn(Arc::clone(&audio_backend), worker.event_tx.clone());
+        let deepgram_api_key = Arc::new(std::sync::Mutex::new(deepgram_api_key));
+        let dictation_controller = LiveDictationController::new(
+            audio_backend,
+            Arc::clone(&deepgram_api_key),
+            worker.event_tx.clone(),
+        );
         let now = Instant::now();
         Self {
             client: Arc::new(client),
@@ -314,11 +324,12 @@ impl SyncEngine {
             bg_burst_started_ms: 0,
             bg_burst_files_started: 0,
             bg_drain_pending: false,
-            deepgram_api_key: Arc::new(std::sync::Mutex::new(deepgram_api_key)),
+            deepgram_api_key,
             deepgram_client: DeepgramRestClient::new(),
             format_provider,
             formatter: TranscriptFormatter::new(),
             audio_worker,
+            dictation_controller,
         }
     }
 
@@ -1023,7 +1034,29 @@ impl SyncEngine {
             SyncCommand::RefreshMicrophones => {
                 self.audio_worker.send(AudioWorkerCmd::RefreshMicrophones)
             }
+            SyncCommand::DictationStart {
+                generation,
+                language,
+                preferred_mic,
+                ..
+            } => {
+                self.dictation_controller
+                    .start(generation, language, preferred_mic);
+            }
+            SyncCommand::DictationStop { generation } => {
+                self.dictation_controller.stop(generation);
+            }
+            SyncCommand::DictationCancel { generation } => {
+                self.dictation_controller.cancel(generation);
+            }
+            SyncCommand::SaveDictationLanguage(lang) => {
+                persist_dictation_language_pref(Some(&self.store), lang);
+            }
+            SyncCommand::SaveMicrophonePreference(mic) => {
+                persist_microphone_pref(Some(&self.store), mic.as_deref());
+            }
             SyncCommand::Shutdown => {
+                self.dictation_controller.shutdown();
                 self.audio_worker.send(AudioWorkerCmd::Shutdown);
             }
             SyncCommand::RestartLiveSync => {}

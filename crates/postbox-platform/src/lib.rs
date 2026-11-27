@@ -37,12 +37,15 @@ pub use hub_auth::{
 pub use voice_auth::{
     ANTHROPIC_API_KEY_SECRET_NAME, ANTHROPIC_WORKSPACE_ID_SECRET_NAME, ApiKeyOutcome,
     DEEPGRAM_API_KEY_SECRET_NAME, DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENROUTER_MODEL,
-    ENV_ANTHROPIC_API_KEY, ENV_ANTHROPIC_WORKSPACE_ID, ENV_DEEPGRAM_API_KEY,
-    ENV_OPENROUTER_API_KEY, ENV_OPENROUTER_MODEL, FormatProviderConfig,
-    OPENROUTER_API_KEY_SECRET_NAME, OPENROUTER_MODEL_SECRET_NAME, discover_deepgram_api_key,
+    DeepgramKeyAction, DeepgramKeyLoad, ENV_ANTHROPIC_API_KEY, ENV_ANTHROPIC_WORKSPACE_ID,
+    ENV_DEEPGRAM_API_KEY, ENV_OPENROUTER_API_KEY, ENV_OPENROUTER_MODEL, FormatProviderConfig,
+    OPENROUTER_API_KEY_SECRET_NAME, OPENROUTER_MODEL_SECRET_NAME, REG_DICTATION_LANGUAGE,
+    REG_MICROPHONE, decide_deepgram_key, discover_deepgram_api_key,
     discover_deepgram_api_key_from_system, discover_format_provider,
-    discover_format_provider_from_system, refresh_deepgram_api_key_if_changed,
-    refresh_deepgram_api_key_if_changed_from_system,
+    discover_format_provider_from_system, load_deepgram_key_detailed, load_dictation_language,
+    load_microphone_choice, refresh_deepgram_api_key_if_changed,
+    refresh_deepgram_api_key_if_changed_from_system, save_dictation_language,
+    save_microphone_choice,
 };
 
 #[derive(Debug, Error)]
@@ -108,6 +111,15 @@ pub trait EnvRegistry: Send + Sync {
     fn load_user_env(&self, name: &str) -> Result<Option<String>, PlatformError>;
 }
 
+/// Persisted application preferences under `HKCU\Software\Messages` on Windows
+/// (and in-memory maps on non-Windows / headless tests).
+pub trait OsRegistry: Send + Sync {
+    fn load_dword(&self, name: &str) -> Result<Option<u32>, PlatformError>;
+    fn save_dword(&self, name: &str, value: u32) -> Result<(), PlatformError>;
+    fn load_string(&self, name: &str) -> Result<Option<String>, PlatformError>;
+    fn save_string(&self, name: &str, value: &str) -> Result<(), PlatformError>;
+}
+
 /// OS desktop notification sink (Windows Toast XML on Windows).
 pub trait Notifier: Send + Sync {
     fn notify_message(&self, chat: &ChatKey, title: &str, body: &str) -> Result<(), PlatformError>;
@@ -145,6 +157,24 @@ impl SecretStore for NativePlatform {
 impl EnvRegistry for NativePlatform {
     fn load_user_env(&self, name: &str) -> Result<Option<String>, PlatformError> {
         self.inner.load_user_env(name)
+    }
+}
+
+impl OsRegistry for NativePlatform {
+    fn load_dword(&self, name: &str) -> Result<Option<u32>, PlatformError> {
+        self.inner.load_dword(name)
+    }
+
+    fn save_dword(&self, name: &str, value: u32) -> Result<(), PlatformError> {
+        self.inner.save_dword(name, value)
+    }
+
+    fn load_string(&self, name: &str) -> Result<Option<String>, PlatformError> {
+        self.inner.load_string(name)
+    }
+
+    fn save_string(&self, name: &str, value: &str) -> Result<(), PlatformError> {
+        self.inner.save_string(name, value)
     }
 }
 
@@ -192,6 +222,8 @@ pub struct MemoryPlatform {
     secrets: Mutex<HashMap<String, String>>,
     legacy_plaintext_secrets: Mutex<HashMap<String, String>>,
     user_env: Mutex<HashMap<String, String>>,
+    reg_dwords: Mutex<HashMap<String, u32>>,
+    reg_strings: Mutex<HashMap<String, String>>,
     notifications: Mutex<Vec<(ChatKey, String, String)>>,
     clipboard_payload: Mutex<ClipboardPayload>,
     zone_marked_paths: Mutex<Vec<PathBuf>>,
@@ -206,6 +238,8 @@ impl Default for MemoryPlatform {
             secrets: Mutex::new(HashMap::new()),
             legacy_plaintext_secrets: Mutex::new(HashMap::new()),
             user_env: Mutex::new(HashMap::new()),
+            reg_dwords: Mutex::new(HashMap::new()),
+            reg_strings: Mutex::new(HashMap::new()),
             notifications: Mutex::new(Vec::new()),
             clipboard_payload: Mutex::new(ClipboardPayload::Empty),
             zone_marked_paths: Mutex::new(Vec::new()),
@@ -388,12 +422,48 @@ impl EnvRegistry for MemoryPlatform {
         let Some(raw) = guard.get(name) else {
             return Ok(None);
         };
-        let trimmed = raw.trim_ascii();
+        let trimmed = raw.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
         if trimmed.is_empty() {
             Ok(None)
         } else {
             Ok(Some(trimmed.to_owned()))
         }
+    }
+}
+
+impl OsRegistry for MemoryPlatform {
+    fn load_dword(&self, name: &str) -> Result<Option<u32>, PlatformError> {
+        let guard = self
+            .reg_dwords
+            .lock()
+            .map_err(|_| PlatformError::OsUnavailable)?;
+        Ok(guard.get(name).copied())
+    }
+
+    fn save_dword(&self, name: &str, value: u32) -> Result<(), PlatformError> {
+        let mut guard = self
+            .reg_dwords
+            .lock()
+            .map_err(|_| PlatformError::OsUnavailable)?;
+        guard.insert(name.to_owned(), value);
+        Ok(())
+    }
+
+    fn load_string(&self, name: &str) -> Result<Option<String>, PlatformError> {
+        let guard = self
+            .reg_strings
+            .lock()
+            .map_err(|_| PlatformError::OsUnavailable)?;
+        Ok(guard.get(name).filter(|s| !s.is_empty()).cloned())
+    }
+
+    fn save_string(&self, name: &str, value: &str) -> Result<(), PlatformError> {
+        let mut guard = self
+            .reg_strings
+            .lock()
+            .map_err(|_| PlatformError::OsUnavailable)?;
+        guard.insert(name.to_owned(), value.to_owned());
+        Ok(())
     }
 }
 

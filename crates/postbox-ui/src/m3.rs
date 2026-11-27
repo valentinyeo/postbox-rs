@@ -452,9 +452,12 @@ impl PostboxViewModel {
         match &res {
             PasteStageResult::PropagateTextPaste => {}
             PasteStageResult::NoImage { notice }
-            | PasteStageResult::RejectedExtension { notice }
-            | PasteStageResult::Staged { notice, .. } => {
+            | PasteStageResult::RejectedExtension { notice } => {
                 self.set_status_notice(*notice);
+            }
+            PasteStageResult::Staged { notice, .. } => {
+                self.set_status_notice(*notice);
+                self.observe_dictation_context();
             }
         }
         res
@@ -480,12 +483,17 @@ impl PostboxViewModel {
         }
         if staged > 0 {
             self.set_status_notice("File attached - Enter sends, Esc discards");
+            self.observe_dictation_context();
         }
         staged
     }
 
     pub fn remove_staged_attachment(&mut self, index: usize) -> bool {
-        self.m3.staged_attachments.remove(index, true).is_some()
+        let removed = self.m3.staged_attachments.remove(index, true).is_some();
+        if removed {
+            self.observe_dictation_context();
+        }
+        removed
     }
 
     pub fn discard_staged_attachments(&mut self) -> bool {
@@ -494,6 +502,7 @@ impl PostboxViewModel {
         }
         self.m3.staged_attachments.discard_all();
         self.set_status_notice("Pasted image discarded");
+        self.observe_dictation_context();
         true
     }
 

@@ -1312,6 +1312,55 @@ pub fn voice_key(
     }
 }
 
+/// Outcome of evaluating a key-down event against live dictation shortcuts
+/// (`Ctrl+D` toggle, `Ctrl+Enter` finish+auto-send, `Esc` cancel+restore) with
+/// held key-repeat guards matching Zig `main.zig:21082-21121`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DictationKeyOutcome {
+    Ignore,
+    Toggle,
+    FinishAndSend,
+    Cancel,
+    ConsumeRepeat,
+}
+
+pub fn dictation_key(
+    key: &str,
+    control: bool,
+    shift: bool,
+    alt: bool,
+    repeated: bool,
+    dictating: bool,
+) -> DictationKeyOutcome {
+    if key.eq_ignore_ascii_case("d") && control && !shift && !alt {
+        return if repeated {
+            DictationKeyOutcome::ConsumeRepeat
+        } else {
+            DictationKeyOutcome::Toggle
+        };
+    }
+    if dictating
+        && control
+        && !shift
+        && !alt
+        && (key.eq_ignore_ascii_case("enter") || key.eq_ignore_ascii_case("return"))
+    {
+        return if repeated {
+            DictationKeyOutcome::ConsumeRepeat
+        } else {
+            DictationKeyOutcome::FinishAndSend
+        };
+    }
+    if dictating && !control && !shift && !alt && key.eq_ignore_ascii_case("escape") {
+        return if repeated {
+            DictationKeyOutcome::ConsumeRepeat
+        } else {
+            DictationKeyOutcome::Cancel
+        };
+    }
+    DictationKeyOutcome::Ignore
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1342,6 +1391,71 @@ mod tests {
         assert_eq!(
             voice_key("n", true, true, false, false),
             VoiceKeyOutcome::Ignore
+        );
+    }
+
+    #[test]
+    fn dictation_key_guards_repeats_dictating_state_and_modifiers() {
+        // Ctrl+D works whether dictating or not, and consumes held repeats
+        assert_eq!(
+            dictation_key("d", true, false, false, false, false),
+            DictationKeyOutcome::Toggle
+        );
+        assert_eq!(
+            dictation_key("D", true, false, false, false, true),
+            DictationKeyOutcome::Toggle
+        );
+        assert_eq!(
+            dictation_key("d", true, false, false, true, true),
+            DictationKeyOutcome::ConsumeRepeat
+        );
+        assert_eq!(
+            dictation_key("d", true, true, false, false, false),
+            DictationKeyOutcome::Ignore
+        );
+        assert_eq!(
+            dictation_key("d", true, false, true, false, false),
+            DictationKeyOutcome::Ignore
+        );
+
+        // Ctrl+Enter only triggers while dictating
+        assert_eq!(
+            dictation_key("enter", true, false, false, false, false),
+            DictationKeyOutcome::Ignore
+        );
+        assert_eq!(
+            dictation_key("enter", true, false, false, false, true),
+            DictationKeyOutcome::FinishAndSend
+        );
+        assert_eq!(
+            dictation_key("return", true, false, false, false, true),
+            DictationKeyOutcome::FinishAndSend
+        );
+        assert_eq!(
+            dictation_key("enter", true, false, false, true, true),
+            DictationKeyOutcome::ConsumeRepeat
+        );
+        assert_eq!(
+            dictation_key("enter", true, true, false, false, true),
+            DictationKeyOutcome::Ignore
+        );
+
+        // Esc only triggers while dictating with no modifiers
+        assert_eq!(
+            dictation_key("escape", false, false, false, false, false),
+            DictationKeyOutcome::Ignore
+        );
+        assert_eq!(
+            dictation_key("escape", false, false, false, false, true),
+            DictationKeyOutcome::Cancel
+        );
+        assert_eq!(
+            dictation_key("escape", false, false, false, true, true),
+            DictationKeyOutcome::ConsumeRepeat
+        );
+        assert_eq!(
+            dictation_key("escape", true, false, false, false, true),
+            DictationKeyOutcome::Ignore
         );
     }
 

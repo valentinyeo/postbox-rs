@@ -3,7 +3,8 @@
 //! transcription work identically whether Hub is connected or unconfigured.
 
 use postbox_audio::{
-    DeepgramRestClient, FormatCache, FormatCacheKey, PLAYBACK_POLL_INTERVAL, PlayerState,
+    DeepgramRestClient, DictationError, FormatCache, FormatCacheKey, LiveDictationConfig,
+    LiveDictationPhase, LiveDictationSession, PLAYBACK_POLL_INTERVAL, PlayerState,
     RECORDING_POLL_INTERVAL, RECORDING_TICK_INTERVAL, TranscriptFormatter, VoicePlayer,
     VoiceRecorder, write_formatted_txt_sidecar, write_transcript_sidecars,
 };
@@ -11,8 +12,9 @@ use postbox_core::ChatKey;
 use postbox_core::dictation::DictationLanguage;
 use postbox_core::voice::{PlaybackSpeed, TranscriptError};
 use postbox_platform::{
-    AudioBackend, FormatProviderConfig, NativePlatform,
-    refresh_deepgram_api_key_if_changed_from_system,
+    ApiKeyOutcome, AudioBackend, FormatProviderConfig, NativePlatform,
+    discover_deepgram_api_key_from_system, refresh_deepgram_api_key_if_changed_from_system,
+    save_dictation_language, save_microphone_choice,
 };
 use postbox_store::Store;
 use postbox_ui::{SyncCommand, SyncEvent, SyncWorkerHandle};
@@ -448,8 +450,270 @@ pub fn spawn_format_task(
     });
 }
 
-/// Standalone audio + transcription worker spawned when Hub is unconfigured/offline so
-/// voice playback, recording, microphone listing, and transcription still work seamlessly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveMgrCmd {
+    Stop,
+    Cancel,
+}
+
+/// Manages active M5 `LiveDictationSession` lifecycle (shared by both online `SyncEngine` and
+/// offline audio worker), streaming `SyncEvent::Dictation*` and performing a single `401`/
+/// `ApiFailed` key-refresh retry via `refresh_deepgram_api_key_if_changed_from_system`.
+pub struct LiveDictationController {
+    backend: Arc<dyn AudioBackend>,
+    deepgram_api_key: Arc<Mutex<Option<String>>>,
+    event_tx: async_channel::Sender<SyncEvent>,
+    active: Option<(u64, tokio::sync::mpsc::UnboundedSender<LiveMgrCmd>)>,
+}
+
+impl LiveDictationController {
+    pub fn new(
+        backend: Arc<dyn AudioBackend>,
+        deepgram_api_key: Arc<Mutex<Option<String>>>,
+        event_tx: async_channel::Sender<SyncEvent>,
+    ) -> Self {
+        Self {
+            backend,
+            deepgram_api_key,
+            event_tx,
+            active: None,
+        }
+    }
+
+    pub fn start(
+        &mut self,
+        generation: u64,
+        language: DictationLanguage,
+        preferred_mic: Option<String>,
+    ) {
+        self.shutdown();
+
+        let initial_key = {
+            let mut guard = self.deepgram_api_key.lock().ok();
+            let existing = guard
+                .as_deref()
+                .and_then(|opt| opt.clone())
+                .filter(|k| !k.trim().is_empty());
+            if let Some(k) = existing {
+                Some(k)
+            } else {
+                let plat = NativePlatform::default();
+                if let ApiKeyOutcome::Ready(found) =
+                    discover_deepgram_api_key_from_system(&plat, &plat)
+                {
+                    if let Some(g) = guard.as_deref_mut() {
+                        *g = Some(found.clone());
+                    }
+                    Some(found)
+                } else {
+                    None
+                }
+            }
+        };
+
+        let Some(initial_key) = initial_key else {
+            let _ = self.event_tx.try_send(SyncEvent::DictationFailed {
+                generation,
+                message: DictationError::MissingKey.user_message().to_owned(),
+            });
+            return;
+        };
+
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.active = Some((generation, cmd_tx));
+
+        let backend = Arc::clone(&self.backend);
+        let key_slot = Arc::clone(&self.deepgram_api_key);
+        let event_tx = self.event_tx.clone();
+
+        tokio::spawn(async move {
+            run_live_dictation_bridge(
+                backend,
+                key_slot,
+                event_tx,
+                generation,
+                language,
+                preferred_mic,
+                initial_key,
+                cmd_rx,
+            )
+            .await;
+        });
+    }
+
+    pub fn stop(&self, generation: u64) {
+        if let Some((active_gen, tx)) = &self.active
+            && (*active_gen == generation || generation == 0)
+        {
+            let _ = tx.send(LiveMgrCmd::Stop);
+        }
+    }
+
+    pub fn cancel(&mut self, generation: u64) {
+        if let Some((active_gen, tx)) = self.active.take() {
+            if active_gen == generation || generation == 0 {
+                let _ = tx.send(LiveMgrCmd::Cancel);
+            } else {
+                self.active = Some((active_gen, tx));
+            }
+        }
+    }
+
+    pub fn shutdown(&mut self) {
+        if let Some((_, tx)) = self.active.take() {
+            let _ = tx.send(LiveMgrCmd::Cancel);
+        }
+    }
+}
+
+impl Drop for LiveDictationController {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_live_dictation_bridge(
+    backend: Arc<dyn AudioBackend>,
+    key_slot: Arc<Mutex<Option<String>>>,
+    event_tx: async_channel::Sender<SyncEvent>,
+    generation: u64,
+    language: DictationLanguage,
+    preferred_mic: Option<String>,
+    initial_key: String,
+    mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<LiveMgrCmd>,
+) {
+    let mut active_key = initial_key;
+    let mut retried_key_once = false;
+
+    loop {
+        let mut cfg = LiveDictationConfig::new(active_key.clone(), language);
+        cfg.preferred_mic_name = preferred_mic.clone();
+
+        let session = match LiveDictationSession::start(Arc::clone(&backend), cfg) {
+            Ok(s) => s,
+            Err(err) => {
+                let _ = event_tx.try_send(SyncEvent::DictationFailed {
+                    generation,
+                    message: err.user_message().to_owned(),
+                });
+                return;
+            }
+        };
+
+        let mut rx = session.subscribe();
+        let mut saw_connected = false;
+        let mut saw_draining = false;
+        let mut last_revision = 0u64;
+        let mut last_level = 0u8;
+
+        let terminal = loop {
+            let snap = rx.borrow().clone();
+            if snap.phase == LiveDictationPhase::Recording && !saw_connected {
+                saw_connected = true;
+                let _ = event_tx.try_send(SyncEvent::DictationConnected { generation });
+            }
+            if snap.revision > last_revision && snap.phase == LiveDictationPhase::Recording {
+                last_revision = snap.revision;
+                let _ = event_tx.try_send(SyncEvent::DictationInterim {
+                    generation,
+                    revision: snap.revision,
+                    text: snap.text.clone(),
+                });
+            }
+            if snap.phase == LiveDictationPhase::Recording && snap.meter_level != last_level {
+                last_level = snap.meter_level;
+                let _ = event_tx.try_send(SyncEvent::DictationLevel {
+                    generation,
+                    level: snap.meter_level,
+                });
+            }
+            if snap.phase == LiveDictationPhase::Transcribing && !saw_draining {
+                saw_draining = true;
+                let _ = event_tx.try_send(SyncEvent::DictationDraining { generation });
+            }
+            if snap.phase.is_terminal() {
+                break snap;
+            }
+
+            tokio::select! {
+                biased;
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(LiveMgrCmd::Stop) => session.request_stop(),
+                        Some(LiveMgrCmd::Cancel) | None => {
+                            session.cancel();
+                            return;
+                        }
+                    }
+                }
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        break rx.borrow().clone();
+                    }
+                }
+            }
+        };
+
+        match terminal.phase {
+            LiveDictationPhase::Ready => {
+                let _ = event_tx.try_send(SyncEvent::DictationFinal {
+                    generation,
+                    text: terminal.text,
+                });
+                return;
+            }
+            LiveDictationPhase::Cancelled => return,
+            LiveDictationPhase::Failed => {
+                let err = terminal.error.unwrap_or(DictationError::TranscriptionFailed);
+                if err == DictationError::ApiFailed && !saw_connected && !retried_key_once {
+                    retried_key_once = true;
+                    let plat = NativePlatform::default();
+                    if let Some(refreshed) =
+                        refresh_deepgram_api_key_if_changed_from_system(&active_key, &plat, &plat)
+                    {
+                        if let Ok(mut guard) = key_slot.lock() {
+                            *guard = Some(refreshed.clone());
+                        }
+                        active_key = refreshed;
+                        continue;
+                    }
+                }
+                let _ = event_tx.try_send(SyncEvent::DictationFailed {
+                    generation,
+                    message: err.user_message().to_owned(),
+                });
+                return;
+            }
+            LiveDictationPhase::Idle
+            | LiveDictationPhase::Recording
+            | LiveDictationPhase::Transcribing => return,
+        }
+    }
+}
+
+/// Persists `DictationLanguage` to both `NativePlatform` (`HKCU\Software\Messages` on Windows)
+/// and local SQLite `Store`.
+pub fn persist_dictation_language_pref(store: Option<&Store>, lang: DictationLanguage) {
+    let platform = NativePlatform::default();
+    let _ = save_dictation_language(&platform, lang);
+    if let Some(s) = store {
+        let _ = s.save_dictation_language(lang);
+    }
+}
+
+/// Persists `Microphone` choice to both `NativePlatform` (`HKCU\Software\Messages` on Windows)
+/// and local SQLite `Store`.
+pub fn persist_microphone_pref(store: Option<&Store>, mic: Option<&str>) {
+    let platform = NativePlatform::default();
+    let _ = save_microphone_choice(&platform, mic);
+    if let Some(s) = store {
+        let _ = s.save_microphone_preference(mic);
+    }
+}
+
+/// Standalone audio + transcription + live dictation worker spawned when Hub is unconfigured/offline
+/// so voice playback, recording, microphone listing, transcription, and live dictation work seamlessly.
 pub fn spawn_offline_audio_worker(
     store_loc: crate::sync::StoreLocation,
     data_dir: PathBuf,
@@ -469,9 +733,15 @@ pub fn spawn_offline_audio_worker(
             };
             rt.block_on(async move {
                 let store = store_loc.open().ok();
-                let audio_handle = AudioWorkerHandle::spawn(backend, worker.event_tx.clone());
+                let audio_handle =
+                    AudioWorkerHandle::spawn(Arc::clone(&backend), worker.event_tx.clone());
                 let dg_client = DeepgramRestClient::new();
                 let deepgram_api_key = Arc::new(Mutex::new(deepgram_api_key));
+                let mut dictation = LiveDictationController::new(
+                    backend,
+                    Arc::clone(&deepgram_api_key),
+                    worker.event_tx.clone(),
+                );
                 let formatter = TranscriptFormatter::new();
 
                 while let Ok(cmd) = worker.cmd_rx.recv().await {
@@ -515,6 +785,26 @@ pub fn spawn_offline_audio_worker(
                         }
                         SyncCommand::RefreshMicrophones => {
                             audio_handle.send(AudioWorkerCmd::RefreshMicrophones)
+                        }
+                        SyncCommand::DictationStart {
+                            generation,
+                            language,
+                            preferred_mic,
+                            ..
+                        } => {
+                            dictation.start(generation, language, preferred_mic);
+                        }
+                        SyncCommand::DictationStop { generation } => {
+                            dictation.stop(generation);
+                        }
+                        SyncCommand::DictationCancel { generation } => {
+                            dictation.cancel(generation);
+                        }
+                        SyncCommand::SaveDictationLanguage(lang) => {
+                            persist_dictation_language_pref(store.as_ref(), lang);
+                        }
+                        SyncCommand::SaveMicrophonePreference(mic) => {
+                            persist_microphone_pref(store.as_ref(), mic.as_deref());
                         }
                         SyncCommand::TranscribeAudio {
                             chat,
@@ -575,6 +865,7 @@ pub fn spawn_offline_audio_worker(
                             );
                         }
                         SyncCommand::Shutdown => {
+                            dictation.shutdown();
                             audio_handle.send(AudioWorkerCmd::Shutdown);
                             break;
                         }

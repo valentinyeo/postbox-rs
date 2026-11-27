@@ -113,6 +113,9 @@ gpui_kit::actions!(
         ToggleTranscript,
         FinishVoiceRecord,
         CancelVoiceRecord,
+        ToggleDictation,
+        FinishDictation,
+        CancelDictation,
         CopyMessageText,
         SmartCopy,
         MoveViewUp,
@@ -194,6 +197,9 @@ fn gpui_action_for(action: PbAction) -> Option<Box<dyn GpuiAction>> {
         PbAction::ToggleTranscript => Some(Box::new(ToggleTranscript)),
         PbAction::FinishVoiceRecord => Some(Box::new(FinishVoiceRecord)),
         PbAction::CancelVoiceRecord => Some(Box::new(CancelVoiceRecord)),
+        PbAction::ToggleDictation => Some(Box::new(ToggleDictation)),
+        PbAction::FinishDictation => Some(Box::new(FinishDictation)),
+        PbAction::CancelDictation => Some(Box::new(CancelDictation)),
         PbAction::CopyMessageText => Some(Box::new(CopyMessageText)),
         PbAction::SmartCopy => Some(Box::new(SmartCopy)),
         PbAction::MoveViewUp => Some(Box::new(MoveViewUp)),
@@ -251,6 +257,7 @@ pub fn bind_postbox_keys(cx: &mut App, keymap: &Keymap) {
             postbox_keymap::KeyContext::EmojiPicker => Some("PostboxEmojiPicker > Input"),
             postbox_keymap::KeyContext::GiphyPicker => Some("PostboxGiphyPicker > Input"),
             postbox_keymap::KeyContext::VoiceRecording => Some("PostboxVoiceRecording > Input"),
+            postbox_keymap::KeyContext::Dictating => Some("PostboxDictating > Input"),
             postbox_keymap::KeyContext::ThreadPanel
                 if matches!(entry.stroke.as_str(), "escape" | "tab") =>
             {
@@ -386,6 +393,8 @@ pub struct PostboxShell {
     pub(crate) gpu_textures: GpuTextureLru,
     pub(crate) gif_tick: usize,
     pub(crate) gif_timer_task: Option<Task<()>>,
+    pub(crate) dictation_timer_task: Option<Task<()>>,
+    applying_dictation_sync: bool,
     pub(crate) reaction_retry_task: Option<Task<()>>,
     pub(crate) reaction_retry_deadline_ms: Option<u64>,
     sync_cmd_tx: Option<async_channel::Sender<SyncCommand>>,
@@ -519,12 +528,21 @@ impl PostboxShell {
             |this: &mut Self, state: &Entity<TextareaState>, event: &InputEvent, window, cx| {
                 match event {
                     InputEvent::Change => {
-                        let value = state.read(cx).value().to_string();
+                        if this.applying_dictation_sync {
+                            return;
+                        }
+                        let (value, sel) = {
+                            let st = state.read(cx);
+                            (st.value().to_string(), st.selected_range())
+                        };
+                        this.vm.set_composer_selection(sel);
                         this.vm.set_composer_text(value);
                         // Sync back immediately if closed `:shortcode:` auto-replaced!
                         let updated = this.vm.composer_text().to_owned();
                         if state.read(cx).value().as_ref() != updated.as_str() {
+                            this.applying_dictation_sync = true;
                             state.update(cx, |input, cx| input.set_value(updated, window, cx));
+                            this.applying_dictation_sync = false;
                         }
                         this.sync_sidebar_cache();
                         cx.notify();
@@ -543,7 +561,9 @@ impl PostboxShell {
                         cx.notify();
                     }
                     InputEvent::Blur => {
-                        if !this.vm.voice_record_state().is_active() {
+                        if !this.vm.voice_record_state().is_active()
+                            && !this.vm.is_dictation_active()
+                        {
                             this.vm.set_composer_focused(false);
                         }
                         cx.notify();
@@ -559,7 +579,14 @@ impl PostboxShell {
             |this: &mut Self, state: &Entity<TextareaState>, event: &InputEvent, window, cx| {
                 match event {
                     InputEvent::Change => {
-                        let value = state.read(cx).value().to_string();
+                        if this.applying_dictation_sync {
+                            return;
+                        }
+                        let (value, sel) = {
+                            let st = state.read(cx);
+                            (st.value().to_string(), st.selected_range())
+                        };
+                        this.vm.set_thread_selection(sel);
                         this.vm.set_thread_composer_text(value);
                         cx.notify();
                     }
@@ -581,12 +608,14 @@ impl PostboxShell {
         let activation_sub = cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() {
                 this.gif_timer_task = None;
+                this.dictation_timer_task = None;
                 if this.vm.on_window_blur() {
                     this.sync_sidebar_cache();
                 }
                 cx.notify();
             } else {
                 this.sync_gif_animation_timer(window, cx);
+                this.sync_dictation_meter_timer(window, cx);
             }
         });
 
@@ -646,6 +675,8 @@ impl PostboxShell {
             gpu_textures: GpuTextureLru::default(),
             gif_tick: 0,
             gif_timer_task: None,
+            dictation_timer_task: None,
+            applying_dictation_sync: false,
             reaction_retry_task: None,
             reaction_retry_deadline_ms: None,
             sync_cmd_tx,
@@ -829,15 +860,20 @@ impl PostboxShell {
             });
         }
 
-        // Sync main composer text if chat switched
+        // Sync main & thread composer text and pending UTF-8 selection (e.g., dictation interim/final/Esc restore).
+        self.applying_dictation_sync = true;
         let wanted_composer = self.vm.composer_text().to_owned();
         if self.composer.read(cx).value().as_ref() != wanted_composer.as_str() {
             self.composer.update(cx, |input, cx| {
                 input.set_value(wanted_composer, window, cx);
             });
         }
+        if let Some(sel) = self.vm.take_pending_composer_selection() {
+            self.composer.update(cx, |input, cx| {
+                input.set_selected_range(sel, cx);
+            });
+        }
 
-        // Sync thread composer text
         let wanted_thread_composer = self
             .vm
             .thread_panel()
@@ -848,6 +884,12 @@ impl PostboxShell {
                 input.set_value(wanted_thread_composer, window, cx);
             });
         }
+        if let Some(sel) = self.vm.take_pending_thread_selection() {
+            self.thread_composer.update(cx, |input, cx| {
+                input.set_selected_range(sel, cx);
+            });
+        }
+        self.applying_dictation_sync = false;
 
         if let Some(picker) = self.vm.emoji_picker() {
             let wanted = picker.query.as_str();
@@ -869,6 +911,7 @@ impl PostboxShell {
         }
 
         self.refresh_visible_gpu_textures(window, cx);
+        self.sync_dictation_meter_timer(window, cx);
         self.sync_reaction_retry_timer(window, cx);
         self.sync_focus(window, cx);
 
@@ -913,12 +956,20 @@ impl PostboxShell {
         self.sync_after_vm_change(window, cx);
     }
 
+    fn sync_selections_to_vm(&mut self, cx: &App) {
+        let main_sel = self.composer.read(cx).selected_range();
+        let thread_sel = self.thread_composer.read(cx).selected_range();
+        self.vm.set_composer_selection(main_sel);
+        self.vm.set_thread_selection(thread_sel);
+    }
+
     fn execute_palette_index(
         &mut self,
         index: IndexPath,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sync_selections_to_vm(cx);
         self.vm
             .execute_palette_section_row(index.section, index.row);
         if self.vm.palette_open() {
@@ -1968,17 +2019,31 @@ impl PostboxShell {
             );
         }
 
+        if let Some(pill) = self.render_dictation_mic_pill(true, p, cx) {
+            footer = footer.child(pill);
+        }
+
         footer = footer.child(
             Textarea::new(&self.thread_composer)
                 .aria_label("Thread reply composer")
                 .bordered(true),
         );
 
+        let thread_key_ctx = if self
+            .vm
+            .live_dictation()
+            .is_some_and(|d| d.in_thread && d.phase.is_active())
+        {
+            "PostboxThreadPanel PostboxDictating"
+        } else {
+            "PostboxThreadPanel"
+        };
+
         Some(
             div()
                 .id("thread-panel")
                 .test_support()
-                .key_context("PostboxThreadPanel")
+                .key_context(thread_key_ctx)
                 .w(px(420.0))
                 .max_w(px(620.0))
                 .h_full()
@@ -2348,11 +2413,18 @@ impl Render for PostboxShell {
                 match (
                     self.vm.composer_text().is_empty(),
                     self.vm.has_composer_popup(),
+                    self.vm
+                        .live_dictation()
+                        .is_some_and(|d| !d.in_thread && d.phase.is_active()),
                 ) {
-                    (true, true) => "PostboxComposerEmpty PostboxShortcodePopup",
-                    (true, false) => "PostboxComposerEmpty",
-                    (false, true) => "PostboxComposer PostboxShortcodePopup",
-                    (false, false) => "PostboxComposer",
+                    (true, true, true) => "PostboxComposerEmpty PostboxShortcodePopup PostboxDictating",
+                    (true, true, false) => "PostboxComposerEmpty PostboxShortcodePopup",
+                    (true, false, true) => "PostboxComposerEmpty PostboxDictating",
+                    (true, false, false) => "PostboxComposerEmpty",
+                    (false, true, true) => "PostboxComposer PostboxShortcodePopup PostboxDictating",
+                    (false, true, false) => "PostboxComposer PostboxShortcodePopup",
+                    (false, false, true) => "PostboxComposer PostboxDictating",
+                    (false, false, false) => "PostboxComposer",
                 },
             )
             .w_full()
@@ -2389,6 +2461,10 @@ impl Render for PostboxShell {
 
         if let Some(rec_strip) = self.render_voice_recording_strip(&p, cx) {
             composer_section = composer_section.child(rec_strip);
+        }
+
+        if let Some(mic_pill) = self.render_dictation_mic_pill(false, &p, cx) {
+            composer_section = composer_section.child(mic_pill);
         }
 
         composer_section = composer_section
@@ -2480,11 +2556,55 @@ impl Render for PostboxShell {
                     postbox_keymap::VoiceKeyOutcome::Ignore => {}
                     postbox_keymap::VoiceKeyOutcome::ConsumeRepeat => {
                         cx.stop_propagation();
+                        return;
                     }
                     postbox_keymap::VoiceKeyOutcome::StartOrFinish => {
                         cx.stop_propagation();
                         if this.vm.toggle_voice_recording(window.is_window_active()) {
                             this.sync_after_vm_change(window, cx);
+                        }
+                        return;
+                    }
+                }
+
+                let modal_open = this.vm.palette_open()
+                    || this.vm.shortcuts_open()
+                    || this.vm.lightbox().is_some()
+                    || this.vm.emoji_picker().is_some()
+                    || this.vm.giphy_picker().is_open()
+                    || this.vm.has_composer_popup();
+                if !modal_open {
+                    match postbox_keymap::dictation_key(
+                        &event.keystroke.key,
+                        event.keystroke.modifiers.control,
+                        event.keystroke.modifiers.shift,
+                        event.keystroke.modifiers.alt,
+                        event.is_held,
+                        this.vm.is_dictation_active(),
+                    ) {
+                        postbox_keymap::DictationKeyOutcome::Ignore => {}
+                        postbox_keymap::DictationKeyOutcome::ConsumeRepeat => {
+                            cx.stop_propagation();
+                        }
+                        postbox_keymap::DictationKeyOutcome::Toggle => {
+                            cx.stop_propagation();
+                            this.sync_selections_to_vm(cx);
+                            if this.vm.toggle_dictation(window.is_window_active()) {
+                                this.sync_after_vm_change(window, cx);
+                            }
+                        }
+                        postbox_keymap::DictationKeyOutcome::FinishAndSend => {
+                            cx.stop_propagation();
+                            this.sync_selections_to_vm(cx);
+                            if this.vm.finish_dictation_and_auto_send() {
+                                this.sync_after_vm_change(window, cx);
+                            }
+                        }
+                        postbox_keymap::DictationKeyOutcome::Cancel => {
+                            cx.stop_propagation();
+                            if this.vm.cancel_dictation() {
+                                this.sync_after_vm_change(window, cx);
+                            }
                         }
                     }
                 }
@@ -2702,6 +2822,17 @@ impl Render for PostboxShell {
             }))
             .on_action(cx.listener(|this, _: &CancelVoiceRecord, window, cx| {
                 this.dispatch_vm_action(PbAction::CancelVoiceRecord, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleDictation, window, cx| {
+                this.sync_selections_to_vm(cx);
+                this.dispatch_vm_action(PbAction::ToggleDictation, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FinishDictation, window, cx| {
+                this.sync_selections_to_vm(cx);
+                this.dispatch_vm_action(PbAction::FinishDictation, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CancelDictation, window, cx| {
+                this.dispatch_vm_action(PbAction::CancelDictation, window, cx);
             }))
             .on_action(cx.listener(|this, _: &CopyMessageText, window, cx| {
                 this.dispatch_vm_action(PbAction::CopyMessageText, window, cx);

@@ -52,10 +52,12 @@ pub struct DecodedVoiceNote {
 }
 
 /// Linear-interpolation resampler converting arbitrary capture format (f32 or PCM16, N channels,
-/// arbitrary sample rate) to 48 kHz mono `i16`, matching `voice_note.zig:197-241`.
+/// arbitrary sample rate) to mono `i16` at a configurable output sample rate (48 kHz for Opus
+/// voice notes, 16 kHz for live Deepgram dictation).
 #[derive(Debug, Clone)]
 pub struct Resampler {
     in_rate: u32,
+    out_rate: u32,
     channels: usize,
     is_float: bool,
     bits_per_sample: u16,
@@ -65,8 +67,13 @@ pub struct Resampler {
 
 impl Resampler {
     pub fn new(format: CaptureFormat) -> Self {
+        Self::with_output_rate(format, OPUS_SAMPLE_RATE)
+    }
+
+    pub fn with_output_rate(format: CaptureFormat, out_rate: u32) -> Self {
         Self {
             in_rate: format.sample_rate.max(1),
+            out_rate: out_rate.max(1),
             channels: usize::from(format.channels.max(1)),
             is_float: format.is_float,
             bits_per_sample: format.bits_per_sample,
@@ -85,7 +92,24 @@ impl Resampler {
         if frames == 0 {
             return;
         }
-        let step = f64::from(self.in_rate) / f64::from(OPUS_SAMPLE_RATE);
+        if self.in_rate == self.out_rate
+            && self.channels == 1
+            && !self.is_float
+            && self.bits_per_sample == 16
+        {
+            out.reserve(frames);
+            for frame in 0..frames {
+                let off = frame * 2;
+                let sample = i16::from_le_bytes(data[off..off + 2].try_into().unwrap());
+                out.push(sample);
+            }
+            let last_off = (frames - 1) * 2;
+            let last = i16::from_le_bytes(data[last_off..last_off + 2].try_into().unwrap());
+            self.previous = (f64::from(last) / 32768.0).clamp(-1.0, 1.0) as f32;
+            self.position = 0.0;
+            return;
+        }
+        let step = f64::from(self.in_rate) / f64::from(self.out_rate);
         while self.position < frames as f64 {
             let whole = self.position.floor() as usize;
             let frac = (self.position - whole as f64) as f32;

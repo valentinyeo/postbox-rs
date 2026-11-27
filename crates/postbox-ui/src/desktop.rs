@@ -3140,11 +3140,7 @@ mod desktop_tests {
             assert!(shell.read(cx).dictation_timer_task.is_some());
             assert!(window.try_find("dictation-mic-pill").is_some());
             for i in 0..8 {
-                assert!(
-                    window
-                        .try_find(format!("dictation-wave-bar-{i}").as_str())
-                        .is_some()
-                );
+                assert!(window.try_find(format!("dictation-wave-bar-{i}")).is_some());
             }
         })
         .unwrap();

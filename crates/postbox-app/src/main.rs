@@ -367,8 +367,10 @@ fn resolve_startup_role(cfg: &StartupConfig, data_dir: &std::path::Path) -> Star
 
     #[cfg(all(windows, feature = "desktop"))]
     {
-        use postbox_platform::os_integration::{LinkPipe, SingleInstance, UrlHandler, startup};
+        use postbox_platform::os_integration::startup;
 
+        // The Windows path takes the data directory from the OS integration layer instead.
+        let _ = data_dir;
         let registry = postbox_platform::win::os::WindowsUrlHandler::new();
         let instance = postbox_platform::win::os::WindowsSingleInstance::new();
         let pipe = postbox_platform::win::os::WindowsLinkPipe::new();

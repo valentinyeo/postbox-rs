@@ -31,6 +31,15 @@ use sync::{StoreLocation, spawn_sync_engine};
 
 static MEM_DB_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// The version this binary reports and stamps into releases.
+///
+/// CI sets `POSTBOX_VERSION` so a main-push build carries the release version it is
+/// about to publish; every other build falls back to the crate version in `Cargo.toml`.
+pub(crate) const APP_VERSION: &str = match option_env!("POSTBOX_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct StartupConfig {
     db_path: Option<PathBuf>,
@@ -332,7 +341,7 @@ fn build_launch_context(
     PostboxLaunchContext {
         store,
         keymap,
-        version: env!("CARGO_PKG_VERSION").to_owned(),
+        version: APP_VERSION.to_owned(),
         started_at,
         hub_status,
         sync_bridge,
@@ -443,7 +452,7 @@ fn arm_exit_records(
 ) -> Option<postbox_core::crash::ExitRecord> {
     let store = ExitRecordStore::new(data_dir);
     let previous = store.last().ok().flatten();
-    install_panic_hook(store, env!("CARGO_PKG_VERSION"), started_at);
+    install_panic_hook(store, APP_VERSION, started_at);
     previous
 }
 
@@ -462,6 +471,12 @@ fn main() {
                 println!("Postbox is already running; handed the request over.");
             }
             StartupRole::Primary { link } => {
+                if let Ok(exe) = std::env::current_exe()
+                    && let Some(install_dir) = exe.parent()
+                    && let Some(exe_name) = exe.file_name().and_then(|name| name.to_str())
+                {
+                    postbox_platform::cleanup_backup(install_dir, exe_name);
+                }
                 let mut launch_ctx = build_launch_context(&cfg, started_at, true);
                 launch_ctx.startup_link = link.map(|target| postbox_ui::toast_launch_url(&target));
                 launch_ctx.last_exit_record = last_exit;
@@ -506,6 +521,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn app_version_parses_as_an_updater_version() {
+        assert!(
+            postbox_core::update::Version::parse(APP_VERSION).is_some(),
+            "APP_VERSION must be a release version the updater accepts, got {APP_VERSION}"
+        );
+    }
+
+    #[test]
     fn startup_config_parses_cli_flags() {
         let cfg = StartupConfig::from_args(vec![
             "postbox".into(),
@@ -537,7 +560,7 @@ mod tests {
             .with_hub_status(ctx.hub_status);
         assert_eq!(
             vm.window_title(),
-            format!("Combined inbox - Postbox v{}", env!("CARGO_PKG_VERSION"))
+            format!("Combined inbox - Postbox v{}", APP_VERSION)
         );
     }
 }

@@ -5,6 +5,7 @@ pub mod exit_records;
 pub mod giphy_auth;
 pub mod hub_auth;
 pub mod os_integration;
+pub mod shell;
 pub mod update_source;
 pub mod updater;
 pub mod video;
@@ -52,11 +53,12 @@ pub use os_integration::{
     StartupRole, UPDATE_RELAUNCH_ARG, UPDATE_RELAUNCH_WAIT, UrlHandler, link_from_args, route_line,
     startup, startup_relaunch,
 };
+pub use shell::{open_external_video, pick_attachment_file};
 pub use update_source::{MockReleaseSource, ReleaseSource, manifest_from_file};
 pub use updater::{
     ArchiveExtractor, AtomicReplacer, InstallReport, NativeReplacer, PlainFileExtractor,
-    ProcessRelauncher, Relauncher, StagedUpdate, UpdateError, commit, discard, install, stage,
-    stage_release, swap_with_rollback, verify_download,
+    ProcessRelauncher, Relauncher, StagedUpdate, UpdateError, cleanup_backup, commit, discard,
+    install, stage, stage_release, swap_with_rollback, verify_download,
 };
 pub use video::{
     MockVideoBackend, MockVideoConfig, MockVideoSession, THUMBNAIL_SEEK_MS, VideoAudioChunk,

@@ -29,7 +29,7 @@ impl GithubReleaseSource {
             .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
             .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS))
             .timeout(Duration::from_millis(REQUEST_TIMEOUT_MS))
-            .user_agent(concat!("postbox/", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("postbox/{}", crate::APP_VERSION))
             .build()
             .map_err(|err| UpdateError::Io(format!("cannot build the HTTP client: {err}")))?;
         Ok(Self {

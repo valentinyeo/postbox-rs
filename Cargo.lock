@@ -5406,6 +5406,7 @@ dependencies = [
  "postbox-platform",
  "postbox-store",
  "postbox-ui",
+ "reqwest",
  "tokio",
 ]
 
@@ -5448,7 +5449,7 @@ name = "postbox-ctl"
 version = "0.1.0"
 dependencies = [
  "postbox-core",
- "serde_json",
+ "postbox-platform",
 ]
 
 [[package]]
@@ -5502,6 +5503,7 @@ name = "postbox-platform"
 version = "0.1.0"
 dependencies = [
  "postbox-core",
+ "serde_json",
  "thiserror 2.0.21",
  "windows 0.62.2",
 ]
@@ -6067,6 +6069,7 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

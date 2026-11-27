@@ -13,7 +13,7 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_BINARY, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
     RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegCloseKey,
-    RegCreateKeyExW, RegDeleteValueW, RegGetValueW, RegSetValueExW,
+    RegCreateKeyExW, RegDeleteKeyW, RegDeleteValueW, RegGetValueW, RegSetValueExW,
 };
 use windows::core::PCWSTR;
 
@@ -406,6 +406,22 @@ pub fn reg_set_string(subkey: &str, name: &str, value: &str) -> Result<(), Platf
         )));
     }
     Ok(())
+}
+
+/// Deletes a whole `HKCU\<subkey>` tree, used by the unregister path.
+pub fn reg_delete_tree(subkey: &str) -> Result<(), PlatformError> {
+    let wide_subkey = to_wide_null(subkey);
+    // SAFETY: `wide_subkey` is a NUL-terminated UTF-16 path under `HKEY_CURRENT_USER`; the
+    // call only deletes that key tree.
+    let status = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, PCWSTR(wide_subkey.as_ptr())) };
+    if status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND {
+        Ok(())
+    } else {
+        Err(PlatformError::RegistryError(format!(
+            "RegDeleteKeyW failed: {}",
+            status.0
+        )))
+    }
 }
 
 pub fn load_messages_dword(name: &str) -> Result<Option<u32>, PlatformError> {

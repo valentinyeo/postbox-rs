@@ -1,8 +1,10 @@
+pub mod control;
 pub mod geometry;
 pub mod m3;
 pub mod m4;
 pub mod m5;
 pub mod m6;
+pub mod m7;
 pub mod palette;
 pub mod sync_bridge;
 pub mod theme;
@@ -19,7 +21,10 @@ mod desktop_m4;
 mod desktop_m5;
 #[cfg(feature = "desktop")]
 mod desktop_m6;
+#[cfg(feature = "desktop")]
+pub mod desktop_m7;
 
+pub use control::{LiveTelemetry, handle as handle_control, resolve_chat, status_report};
 pub use geometry::RowGeometry;
 pub use m3::{M3State, MentionPopupState, ShortcodePopupState};
 pub use m4::M4State;
@@ -31,6 +36,17 @@ pub use m6::{
     M6State, MAX_VIDEO_FRAME_BYTES, VIDEO_PLAYER_TICK_MS, VideoEscapeOutcome, VideoPlayRequest,
     VideoPlayerUiState, VideoThumbReady, VideoThumbState, av_sync_position_ms,
 };
+/// `true` when `note` is the "chat not found" copy for `provider`.
+pub fn deep_link_note_matches(provider: postbox_core::Provider, note: &str) -> bool {
+    postbox_core::deep_link::missing_chat_note(provider) == note
+}
+
+/// `postbox://` URL for a link target, used to hand a startup URL to the shell.
+pub fn toast_launch_url(target: &postbox_core::deep_link::DeepLinkTarget) -> String {
+    postbox_core::toast::launch_url(&target.chat, target.message.as_deref())
+}
+
+pub use m7::{CARD_DISMISS_AFTER_MS, LinkAction, M7State, StatusCard, UpdatePhase};
 pub use palette::{
     PaletteCommand, PaletteEntry, PaletteEntryKind, PaletteGroupKind, PaletteMode, PaletteSection,
 };

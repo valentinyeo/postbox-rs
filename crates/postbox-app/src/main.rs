@@ -5,11 +5,14 @@
 
 mod audio_service;
 mod sync;
+mod update_source;
 
 use audio_service::spawn_offline_audio_worker;
 use postbox_hub::Endpoint;
 use postbox_keymap::Keymap;
 use postbox_media::VideoThumbnailCache;
+use postbox_platform::exit_records::{ExitRecordStore, install_panic_hook};
+use postbox_platform::os_integration::{StartupRole, link_from_args};
 use postbox_platform::{
     ApiKeyOutcome, AudioBackend, GiphyKeyOutcome, HubDiscoveryOutcome, NativePlatform, OsRegistry,
     REG_DICTATION_LANGUAGE, VideoBackend, discover_deepgram_api_key_from_system,
@@ -31,8 +34,12 @@ struct StartupConfig {
     db_path: Option<PathBuf>,
     keymap_path: Option<PathBuf>,
     hub_url: Option<String>,
+    /// `postbox://` URL handed to this launch by the protocol handler.
+    link: Option<String>,
     in_memory: bool,
     allow_loopback: bool,
+    /// Skips registry registration, the single-instance guard and the pipes (tests, CI).
+    no_os_integration: bool,
 }
 
 impl StartupConfig {
@@ -61,7 +68,14 @@ impl StartupConfig {
                         cfg.hub_url = Some(url);
                     }
                 }
-                _ => {}
+                "--no-os-integration" => cfg.no_os_integration = true,
+                other => {
+                    // The protocol handler passes the URL as a bare argument, so a stray
+                    // `postbox://` anywhere on the command line counts as the link.
+                    if cfg.link.is_none() && postbox_core::deep_link::is_postbox_url(other) {
+                        cfg.link = Some(other.to_owned());
+                    }
+                }
             }
         }
         cfg
@@ -318,21 +332,120 @@ fn build_launch_context(
         video_backend: Some(video_backend),
         audio_backend: Some(Arc::new(NativePlatform::default())),
         video_thumb_cache: Some(video_thumb_cache),
+        // Filled in by `main` once the startup handshake has run.
+        startup_link: None,
+        last_exit_record: None,
+        os_integration: false,
+        release_source: update_source::GithubReleaseSource::new()
+            .ok()
+            .map(|source| Arc::new(source) as Arc<dyn postbox_platform::ReleaseSource>),
     }
+}
+
+/// Registers `postbox://`, hands a second launch's URL to the running instance and reports
+/// whether this process should open a window.
+///
+/// On a host without the Windows pieces this is a no-op that always says "open a window", so
+/// the Linux build and the headless CI check behave exactly as before.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+fn resolve_startup_role(cfg: &StartupConfig, data_dir: &std::path::Path) -> StartupRole {
+    if cfg.no_os_integration {
+        return StartupRole::Primary {
+            link: cfg
+                .link
+                .as_deref()
+                .and_then(|raw| postbox_core::deep_link::parse(raw).ok()),
+        };
+    }
+    let user = postbox_core::os_integration::current_user();
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("postbox.exe"));
+    let exe_path = exe.display().to_string();
+    let link = cfg
+        .link
+        .clone()
+        .or_else(|| link_from_args(std::env::args()));
+
+    #[cfg(all(windows, feature = "desktop"))]
+    {
+        use postbox_platform::os_integration::{LinkPipe, SingleInstance, UrlHandler, startup};
+
+        let registry = postbox_platform::win::os::WindowsUrlHandler::new();
+        let instance = postbox_platform::win::os::WindowsSingleInstance::new();
+        let pipe = postbox_platform::win::os::WindowsLinkPipe::new();
+        match startup(
+            &exe_path,
+            &user,
+            link.as_deref(),
+            &registry,
+            &instance,
+            &pipe,
+        ) {
+            Ok(role) => {
+                // The mutex must outlive `main`; leak it so it is released by process exit.
+                std::mem::forget(instance);
+                role
+            }
+            Err(err) => {
+                eprintln!("postbox: OS registration failed ({err}); starting anyway");
+                StartupRole::Primary {
+                    link: link
+                        .as_deref()
+                        .and_then(|raw| postbox_core::deep_link::parse(raw).ok()),
+                }
+            }
+        }
+    }
+    #[cfg(not(all(windows, feature = "desktop")))]
+    {
+        // Linux and test hosts have no registry or named pipe: parse the URL and open a window.
+        let _ = (&exe_path, &user, data_dir);
+        StartupRole::Primary {
+            link: link
+                .as_deref()
+                .and_then(|raw| postbox_core::deep_link::parse(raw).ok()),
+        }
+    }
+}
+
+/// Arms the crash hook and returns the last run's record, if any.
+fn arm_exit_records(
+    data_dir: &std::path::Path,
+    started_at: Instant,
+) -> Option<postbox_core::crash::ExitRecord> {
+    let store = ExitRecordStore::new(data_dir);
+    let previous = store.last().ok().flatten();
+    install_panic_hook(store, env!("CARGO_PKG_VERSION"), started_at);
+    previous
 }
 
 fn main() {
     let started_at = Instant::now();
     let cfg = StartupConfig::from_args(std::env::args());
+    let data_dir = default_data_dir();
 
     #[cfg(feature = "desktop")]
     {
-        let launch_ctx = build_launch_context(&cfg, started_at, true);
-        postbox_ui::desktop::run_desktop(launch_ctx);
+        let last_exit = arm_exit_records(&data_dir, started_at);
+        let role = resolve_startup_role(&cfg, &data_dir);
+        match role {
+            // Another Postbox already owns the single-instance lock and has the URL.
+            StartupRole::Forwarded { .. } => {
+                println!("Postbox is already running; handed the request over.");
+                return;
+            }
+            StartupRole::Primary { link } => {
+                let mut launch_ctx = build_launch_context(&cfg, started_at, true);
+                launch_ctx.startup_link = link.map(|target| postbox_ui::toast_launch_url(&target));
+                launch_ctx.last_exit_record = last_exit;
+                launch_ctx.os_integration = !cfg.no_os_integration;
+                postbox_ui::desktop::run_desktop(launch_ctx);
+            }
+        }
     }
 
     #[cfg(not(feature = "desktop"))]
     {
+        let _ = arm_exit_records(&data_dir, started_at);
         let launch_ctx = build_launch_context(&cfg, started_at, false);
         let mut vm = postbox_ui::PostboxViewModel::new_uninitialized(
             launch_ctx.store,

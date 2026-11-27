@@ -1234,6 +1234,10 @@ mod desktop_tests {
             video_backend: Some(Arc::new(mock.clone())),
             audio_backend: Some(audio.clone()),
             video_thumb_cache: Some(VideoThumbnailCache::new(data_dir.join("hub-media"))),
+            startup_link: None,
+            last_exit_record: None,
+            os_integration: false,
+            release_source: None,
         };
 
         let keymap = launch_ctx.keymap.clone();

@@ -1,9 +1,15 @@
 pub mod audio;
 pub mod clipboard;
+pub mod control_pipe;
+pub mod exit_records;
 pub mod giphy_auth;
 pub mod hub_auth;
+pub mod os_integration;
+pub mod update_source;
+pub mod updater;
 pub mod video;
 pub mod voice_auth;
+pub mod window_state;
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
@@ -26,6 +32,8 @@ pub use clipboard::{
     MAX_CLIPBOARD_PIXELS, ZONE_IDENTIFIER_CONTENT, ZoneMarker, external_image_extension_allowed,
     is_reparse_point_or_symlink, mark_downloaded_file_zone, open_external_image,
 };
+pub use control_pipe::{ServerHandle, Transport, round_trip, serve};
+pub use exit_records::{ExitRecordStore, install_panic_hook, now_unix_ms};
 pub use giphy_auth::{
     ENV_GIPHY_API_KEY, GIPHY_API_KEY_SECRET_NAME, GiphyKeyOutcome, MAX_GIPHY_KEY_BYTES,
     discover_giphy_api_key, discover_giphy_api_key_from_system,
@@ -34,6 +42,15 @@ pub use hub_auth::{
     CredentialSource, DiscoveredHubConfig, ENV_POSTBOX_HUB_TOKEN, ENV_POSTBOX_HUB_URL,
     ENV_WAZIG_HUB_TOKEN, ENV_WAZIG_HUB_URL, HUB_TOKEN_SECRET_NAME, HubDiscoveryOutcome,
     discover_hub_credentials, discover_hub_credentials_from_system, valid_hub_token,
+};
+pub use os_integration::{
+    LinkOutcome, LinkPipe, MockLinkPipe, MockSingleInstance, MockUrlHandler, SingleInstance,
+    StartupRole, UrlHandler, link_from_args, route_line, startup,
+};
+pub use update_source::{MockReleaseSource, ReleaseSource, manifest_from_file};
+pub use updater::{
+    ArchiveExtractor, AtomicReplacer, InstallReport, NativeReplacer, PlainFileExtractor,
+    ProcessRelauncher, Relauncher, UpdateError, install, swap_with_rollback, verify_download,
 };
 pub use video::{
     MockVideoBackend, MockVideoConfig, MockVideoSession, THUMBNAIL_SEEK_MS, VideoAudioChunk,
@@ -53,6 +70,7 @@ pub use voice_auth::{
     refresh_deepgram_api_key_if_changed_from_system, save_dictation_language,
     save_microphone_choice,
 };
+pub use window_state::{MonitorRect, WINDOW_STATE_VALUE, WindowState};
 
 #[derive(Debug, Error)]
 pub enum PlatformError {

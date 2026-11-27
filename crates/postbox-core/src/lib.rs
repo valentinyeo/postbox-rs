@@ -1,11 +1,15 @@
 pub mod archive;
 pub mod control;
+pub mod crash;
 pub mod deep_link;
 pub mod dictation;
 pub mod drafts;
+pub mod os_integration;
 pub mod outbox;
 pub mod read;
 pub mod threads;
+pub mod toast;
+pub mod update;
 pub mod views;
 pub mod voice;
 

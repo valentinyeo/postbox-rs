@@ -2,9 +2,13 @@
 
 pub mod clipboard;
 pub mod dpapi;
+pub mod ipc;
 pub mod memory;
+pub mod os;
 pub mod registry;
 pub mod shell;
+pub mod toast;
+pub mod updater;
 pub mod video;
 pub mod wasapi;
 
@@ -76,14 +80,8 @@ impl OsRegistry for WindowsPlatform {
 }
 
 impl Notifier for WindowsPlatform {
-    fn notify_message(
-        &self,
-        _chat: &ChatKey,
-        _title: &str,
-        _body: &str,
-    ) -> Result<(), PlatformError> {
-        // WinRT Toast XML implementation lands in Milestone 7.
-        Ok(())
+    fn notify_message(&self, chat: &ChatKey, title: &str, body: &str) -> Result<(), PlatformError> {
+        toast::show_message_toast(chat, title, body).map(|_| ())
     }
 }
 

@@ -11,6 +11,7 @@ members = [
     "crates/postbox-ui",
     "crates/postbox-app",
     "crates/postbox-ctl",
+    "crates/postbox-e2e",
 ]
 
 [workspace.package]

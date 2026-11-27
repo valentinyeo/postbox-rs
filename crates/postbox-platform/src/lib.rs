@@ -34,6 +34,9 @@ pub use clipboard::{
     is_reparse_point_or_symlink, mark_downloaded_file_zone, open_external_image,
 };
 pub use control_pipe::{ServerHandle, Transport, round_trip, serve};
+
+/// The endpoint a control client or server binds: a named pipe on Windows, a socket elsewhere.
+pub use control_pipe::Transport as ControlTransport;
 pub use exit_records::{ExitRecordStore, install_panic_hook, now_unix_ms};
 pub use giphy_auth::{
     ENV_GIPHY_API_KEY, GIPHY_API_KEY_SECRET_NAME, GiphyKeyOutcome, MAX_GIPHY_KEY_BYTES,

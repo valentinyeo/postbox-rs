@@ -26,6 +26,11 @@ commands:
   archive <id>
   unarchive <id>
   archive-many <id...> [--unarchive]
+
+options:
+  --pipe <path>                   endpoint override (a named pipe name or a socket path)
+  --timeout <ms>                  how long to wait for the app (default 2000)
+  --dry-run                       print the request line and send nothing
 ";
 
 /// Parsed command line.
@@ -34,12 +39,15 @@ pub struct Cli {
     pub pipe: Option<String>,
     pub timeout_ms: u64,
     pub request: ControlRequest,
+    /// Prints the request line instead of sending it, so the parser is drivable with no app.
+    pub dry_run: bool,
 }
 
 /// Parses `argv` (without the program name).
 pub fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut pipe = None;
     let mut timeout_ms = 2_000u64;
+    let mut dry_run = false;
     let mut positional: Vec<String> = Vec::new();
     let mut options = Options::default();
 
@@ -83,6 +91,7 @@ pub fn parse_args(args: &[String]) -> Result<Cli, String> {
                         .map_err(|_| format!("--limit needs a number, got {raw}"))?,
                 );
             }
+            "--dry-run" => dry_run = true,
             "--archived" => options.archived = true,
             "--all" => options.all = true,
             "--unarchive" => options.unarchive = true,
@@ -99,6 +108,7 @@ pub fn parse_args(args: &[String]) -> Result<Cli, String> {
         pipe,
         timeout_ms,
         request,
+        dry_run,
     })
 }
 
@@ -283,6 +293,11 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    if cli.dry_run {
+        println!("{}", encode_request(&cli.request));
+        return;
+    }
 
     let transport = match &cli.pipe {
         Some(raw) => Transport::parse(raw),

@@ -1,6 +1,6 @@
 //! Windows Registry helpers for `HKCU\Environment` and `HKCU\Software\Messages`.
 //!
-//! Mirrors `/home/antigravity/valentinyeo/postbox/src/winhttp.zig:58-167`:
+//! Mirrors `winhttp.zig:58-167`:
 //! - `HKCU\Environment`: reads `REG_SZ` and `REG_EXPAND_SZ` with automatic `%VAR%` expansion via `RegGetValueW`.
 //! - `HKCU\Software\Messages`: stores DPAPI-encrypted `REG_BINARY` values and safely migrates
 //!   legacy plaintext `REG_SZ` values (failing closed on `MigrationFailed`).
@@ -45,8 +45,8 @@ fn decode_utf16_bytes(bytes: &[u8]) -> Result<String, PlatformError> {
         ));
     }
     let mut units = Vec::with_capacity(bytes.len() / 2);
-    for chunk in bytes.chunks_exact(2) {
-        let code = u16::from_le_bytes([chunk[0], chunk[1]]);
+    for &chunk in bytes.as_chunks::<2>().0 {
+        let code = u16::from_le_bytes(chunk);
         if code == 0 {
             break;
         }

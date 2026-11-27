@@ -300,7 +300,7 @@ mod tests {
                 {"jid":"signal:group:fam1","provider":"signal","kind":"group","name":"Family"},
                 {"jid":"telegram:channel:news1","provider":"telegram","kind":"Channel","name":"News"},
                 {"jid":"telegram:sg1","provider":"telegram","Kind":"SUPERGROUP","name":"Rust"},
-                {"jid":"telegram:me","provider":"telegram","saved":true,"name":"Valentin"}
+                {"jid":"telegram:me","provider":"telegram","saved":true,"name":"Alice"}
             ]"#,
             "hub",
         )

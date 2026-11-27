@@ -54,6 +54,7 @@ pub enum Action {
     KeepArchivedSelected,
     SelectAllChats,
     Refresh,
+    RestartLiveSync,
     Quit,
     NextChat,
     PrevChat,
@@ -231,6 +232,12 @@ impl Keymap {
                 "Select all visible chats when composer is empty",
             ),
             b(KeyContext::ChatList, "r", Action::Refresh, "Refresh"),
+            b(
+                KeyContext::ChatList,
+                "s",
+                Action::RestartLiveSync,
+                "Restart live sync",
+            ),
             b(KeyContext::ChatList, "q", Action::Quit, "Quit Postbox"),
             b(
                 KeyContext::Workspace,

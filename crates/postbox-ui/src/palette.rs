@@ -1,3 +1,4 @@
+use crate::sync_bridge::HubConnectionStatus;
 use postbox_core::dictation::DictationLanguage;
 use postbox_core::{Account, Chat, ChatKey, FontScale, Message, Provider, ThemeChoice};
 use postbox_store::SearchHit;
@@ -18,6 +19,7 @@ pub enum PaletteCommand {
     ToggleSlackThreadsForAccount,
     ShowShortcuts,
     VersionInfo,
+    HubStatusInfo,
     Dictate,
     RecordVoiceNote,
     SetDictationLanguage(DictationLanguage),
@@ -320,6 +322,7 @@ pub fn chat_name_quality(label: &str, query: &str) -> i32 {
 
 pub struct PaletteCatalogContext<'a> {
     pub version: &'a str,
+    pub hub_status: &'a HubConnectionStatus,
     pub theme: ThemeChoice,
     pub font_scale: FontScale,
     pub dictation_language: DictationLanguage,
@@ -390,6 +393,11 @@ pub fn build_palette_items(ctx: &PaletteCatalogContext<'_>) -> Vec<PaletteEntry>
         format!("You are on v{} - this is the newest version", ctx.version),
         None,
         PaletteCommand::VersionInfo,
+    ));
+    items.push(cmd_entry(
+        ctx.hub_status.palette_label(),
+        None,
+        PaletteCommand::HubStatusInfo,
     ));
     items.push(cmd_entry(
         "Dictate",
@@ -1007,8 +1015,13 @@ mod tests {
 
     #[test]
     fn non_empty_query_ranks_chats_above_messages_above_commands() {
+        let hub_status = HubConnectionStatus::Connected {
+            url: "https://hub.example".into(),
+            last_event_id: Some(1),
+        };
         let ctx = PaletteCatalogContext {
             version: "0.1.0",
+            hub_status: &hub_status,
             theme: ThemeChoice::ZincDark,
             font_scale: FontScale::default(),
             dictation_language: DictationLanguage::Automatic,

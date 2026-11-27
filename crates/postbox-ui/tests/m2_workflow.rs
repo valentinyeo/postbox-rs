@@ -47,6 +47,7 @@ fn mk_msg(chat: &ChatKey, id: &str, from_me: bool, ts: &str, body: &str) -> Mess
         media_kind: None,
         mime_type: None,
         filename: None,
+        file_size: None,
         reactions: vec![],
         read_status: if from_me {
             ReadStatus::Read

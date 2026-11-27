@@ -1,3 +1,5 @@
+pub mod clipboard;
+pub mod giphy_auth;
 pub mod hub_auth;
 
 #[cfg(windows)]
@@ -6,10 +8,20 @@ pub mod win;
 
 use postbox_core::ChatKey;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
+pub use clipboard::{
+    ALLOWED_EXTERNAL_IMAGE_EXTENSIONS, ClipboardBackend, ClipboardPayload, MAX_CLIPBOARD_BYTES,
+    MAX_CLIPBOARD_PIXELS, ZONE_IDENTIFIER_CONTENT, ZoneMarker, external_image_extension_allowed,
+    is_reparse_point_or_symlink, mark_downloaded_file_zone, open_external_image,
+};
+pub use giphy_auth::{
+    ENV_GIPHY_API_KEY, GIPHY_API_KEY_SECRET_NAME, GiphyKeyOutcome, MAX_GIPHY_KEY_BYTES,
+    discover_giphy_api_key, discover_giphy_api_key_from_system,
+};
 pub use hub_auth::{
     CredentialSource, DiscoveredHubConfig, ENV_POSTBOX_HUB_TOKEN, ENV_POSTBOX_HUB_URL,
     ENV_WAZIG_HUB_TOKEN, ENV_WAZIG_HUB_URL, HUB_TOKEN_SECRET_NAME, HubDiscoveryOutcome,
@@ -24,6 +36,8 @@ pub enum PlatformError {
     OsUnavailable,
     #[error("invalid_secret")]
     InvalidSecret,
+    #[error("invalid_path")]
+    InvalidPath,
     #[error("dpapi_error: {0}")]
     DpapiError(String),
     #[error("registry_error: {0}")]
@@ -121,20 +135,61 @@ impl Notifier for NativePlatform {
     }
 }
 
+impl ClipboardBackend for NativePlatform {
+    fn read_paste_payload(&self) -> Result<ClipboardPayload, PlatformError> {
+        self.inner.read_paste_payload()
+    }
+}
+
+impl ZoneMarker for NativePlatform {
+    fn mark_downloaded_file(&self, path: &Path) -> Result<bool, PlatformError> {
+        self.inner.mark_downloaded_file(path)
+    }
+}
+
 /// Portable in-memory mock platform used for fast Linux & headless unit tests.
-#[derive(Default)]
 pub struct MemoryPlatform {
     secrets: Mutex<HashMap<String, String>>,
     legacy_plaintext_secrets: Mutex<HashMap<String, String>>,
     user_env: Mutex<HashMap<String, String>>,
     notifications: Mutex<Vec<(ChatKey, String, String)>>,
+    clipboard_payload: Mutex<ClipboardPayload>,
+    zone_marked_paths: Mutex<Vec<PathBuf>>,
     fail_migration: AtomicBool,
     fail_save: AtomicBool,
+}
+
+impl Default for MemoryPlatform {
+    fn default() -> Self {
+        Self {
+            secrets: Mutex::new(HashMap::new()),
+            legacy_plaintext_secrets: Mutex::new(HashMap::new()),
+            user_env: Mutex::new(HashMap::new()),
+            notifications: Mutex::new(Vec::new()),
+            clipboard_payload: Mutex::new(ClipboardPayload::Empty),
+            zone_marked_paths: Mutex::new(Vec::new()),
+            fail_migration: AtomicBool::new(false),
+            fail_save: AtomicBool::new(false),
+        }
+    }
 }
 
 impl MemoryPlatform {
     pub fn notification_count(&self) -> usize {
         self.notifications.lock().map(|n| n.len()).unwrap_or(0)
+    }
+
+    pub fn set_clipboard_payload(&self, payload: ClipboardPayload) {
+        if let Ok(mut guard) = self.clipboard_payload.lock() {
+            *guard = payload;
+        }
+    }
+
+    pub fn zone_marked_paths(&self) -> Vec<PathBuf> {
+        self.zone_marked_paths
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     pub fn set_user_env(&self, name: impl Into<String>, value: impl Into<String>) {
@@ -304,6 +359,27 @@ impl Notifier for MemoryPlatform {
             .map_err(|_| PlatformError::OsUnavailable)?;
         guard.push((chat.clone(), title.to_owned(), body.to_owned()));
         Ok(())
+    }
+}
+
+impl ClipboardBackend for MemoryPlatform {
+    fn read_paste_payload(&self) -> Result<ClipboardPayload, PlatformError> {
+        let guard = self
+            .clipboard_payload
+            .lock()
+            .map_err(|_| PlatformError::OsUnavailable)?;
+        Ok(guard.clone())
+    }
+}
+
+impl ZoneMarker for MemoryPlatform {
+    fn mark_downloaded_file(&self, path: &Path) -> Result<bool, PlatformError> {
+        let mut guard = self
+            .zone_marked_paths
+            .lock()
+            .map_err(|_| PlatformError::OsUnavailable)?;
+        guard.push(path.to_path_buf());
+        Ok(true)
     }
 }
 

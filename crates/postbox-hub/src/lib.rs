@@ -7,7 +7,8 @@ pub mod sync;
 pub mod types;
 
 pub use client::{
-    DEFAULT_MEDIA_POLL_INTERVAL, DEFAULT_MEDIA_POLL_MAX_WAIT, EventStream, HubClient,
+    DEFAULT_MEDIA_POLL_INTERVAL, DEFAULT_MEDIA_POLL_MAX_WAIT, EventStream, HUB_MEDIA_TIMEOUT,
+    HubClient,
 };
 pub use error::{
     HubError, SignalSendFailure, TelegramSendFailure, classify_signal_send_failure,
@@ -35,7 +36,7 @@ pub use sync::{
 };
 pub use types::{
     ArchiveBatchItemResult, ArchiveOutcome, Endpoint, HubChat, HubMessage, HubRequest,
-    HubSyncSignal, MediaFetchState, SendFileRequest, SendReply, SseEvent,
+    HubSyncSignal, MediaFetchDetailed, MediaFetchState, SendFileRequest, SendReply, SseEvent,
 };
 
 #[cfg(test)]

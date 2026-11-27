@@ -1,4 +1,5 @@
 use crate::geometry::RowGeometry;
+use crate::m3::M3State;
 use crate::palette::{
     PaletteCatalogContext, PaletteCommand, PaletteEntry, PaletteEntryKind, PaletteFilterInput,
     PaletteMode, PaletteSection, PaletteState, build_palette_items, filter_palette,
@@ -24,8 +25,11 @@ use postbox_keymap::{
     Action, CtrlBadgeState, InboxChord, Keymap, LatestChord, LatestChordOutcome,
     ctrl_a_selects_chats,
 };
+use postbox_media::drain::MediaItemStatus;
+use postbox_media::emoji::EmojiCatalog;
 use postbox_store::{MessageCursor, Store, StoreError};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_CHATS_QUERY: usize = 500;
@@ -44,6 +48,8 @@ pub struct PostboxLaunchContext {
     pub started_at: Instant,
     pub hub_status: HubConnectionStatus,
     pub sync_bridge: Option<SyncBridge>,
+    pub data_dir: PathBuf,
+    pub giphy_key_available: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +61,9 @@ pub enum FocusTarget {
     ThreadBroadcast,
     Palette,
     ShortcutsOverlay,
+    EmojiPicker,
+    Lightbox,
+    GiphyPicker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,10 +134,26 @@ fn new_client_id(seq: &mut u64) -> String {
     format!("{now:016x}{:016x}", *seq)
 }
 
+pub(crate) fn now_epoch_secs_public() -> i64 {
+    now_epoch_secs()
+}
+
+pub(crate) fn now_epoch_millis_public() -> i64 {
+    now_epoch_millis()
+}
+
+pub(crate) fn format_utc_rfc3339_public(epoch_secs: i64) -> String {
+    format_utc_rfc3339(epoch_secs)
+}
+
+pub(crate) fn new_client_id_public(seq: &mut u64) -> String {
+    new_client_id(seq)
+}
+
 /// Pure headless view-model/controller driving Postbox UI state from `Store` and `Keymap`.
 /// Compiles and executes without GPU on both Linux and Windows.
 pub struct PostboxViewModel {
-    store: Store,
+    pub(crate) store: Store,
     keymap: Keymap,
     version: String,
 
@@ -162,7 +187,7 @@ pub struct PostboxViewModel {
     bulk_selected: BTreeSet<ChatKey>,
     drafts: BTreeMap<ChatKey, Draft>,
 
-    messages: Vec<Message>,
+    pub(crate) messages: Vec<Message>,
     loaded_message_limit: usize,
     outbox_for_chat: Vec<OutboxRecord>,
     timeline_items: Vec<TimelineItem>,
@@ -185,9 +210,10 @@ pub struct PostboxViewModel {
     title_notice: Option<String>,
     quit_requested: bool,
     sync_requested: bool,
-    scroll_to_latest_pending: bool,
+    pub(crate) scroll_to_latest_pending: bool,
     refresh_count: u64,
-    local_send_seq: u64,
+    pub(crate) local_send_seq: u64,
+    pub(crate) m3: M3State,
 }
 
 impl PostboxViewModel {
@@ -208,6 +234,11 @@ impl PostboxViewModel {
         let mut show_archived_by_view = BTreeMap::new();
         if settings.show_archived {
             show_archived_by_view.insert("all".to_owned(), true);
+        }
+        let mut m3 = M3State::default();
+        if let Ok(saved_recents) = store.load_emoji_recents() {
+            let joined = saved_recents.join(",");
+            m3.emoji_recents = EmojiCatalog::global().parse_recents(&joined);
         }
 
         Self {
@@ -262,15 +293,23 @@ impl PostboxViewModel {
             scroll_to_latest_pending: false,
             refresh_count: 0,
             local_send_seq: 0,
+            m3,
         }
+    }
+
+    /// Activates `CombinedInbox` and loads accounts, chats, messages, and initial M3
+    /// auto-download/avatar/unfurl triggers. Call AFTER `with_hub_status`, `with_data_dir`,
+    /// `with_giphy_key_available`, and `attach_sync_sender` when starting from `new_uninitialized`.
+    pub fn initialize(&mut self) {
+        self.active_view = Some(ViewTab::CombinedInbox);
+        self.refresh_all();
     }
 
     /// Creates a fully initialized ViewModel with `CombinedInbox` active, accounts ordered,
     /// chats loaded, and initial chat messages populated (`user_viewed` remains `false`).
     pub fn new(store: Store, keymap: Keymap, version: impl Into<String>) -> Self {
         let mut vm = Self::new_uninitialized(store, keymap, version);
-        vm.active_view = Some(ViewTab::CombinedInbox);
-        vm.refresh_all();
+        vm.initialize();
         vm
     }
 
@@ -287,7 +326,7 @@ impl PostboxViewModel {
         std::mem::take(&mut self.emitted_sync_commands)
     }
 
-    fn emit_sync_command(&mut self, cmd: SyncCommand) {
+    pub(crate) fn emit_sync_command(&mut self, cmd: SyncCommand) {
         if let Some(tx) = &self.sync_cmd_tx {
             let _ = tx.try_send(cmd.clone());
         }
@@ -378,6 +417,166 @@ impl PostboxViewModel {
                 }
                 if self.thread_panel.as_ref().is_some_and(|p| p.chat == chat) {
                     self.refresh_thread_panel_messages();
+                }
+                0
+            }
+            SyncEvent::MediaDownloaded {
+                chat, msg_id, path, ..
+            } => {
+                let pair = (chat.clone(), msg_id.clone());
+                self.m3.media_paths.insert(pair.clone(), path.clone());
+                self.m3
+                    .media_statuses
+                    .insert(pair, MediaItemStatus::Ready(path.clone()));
+                if let Some(lb) = &mut self.m3.lightbox
+                    && lb.chat == chat
+                {
+                    lb.update_local_path(&msg_id, path);
+                }
+                0
+            }
+            SyncEvent::MediaStatusChanged {
+                chat,
+                msg_id,
+                status,
+            } => {
+                let pair = (chat.clone(), msg_id.clone());
+                if let MediaItemStatus::Ready(ref path) = status {
+                    self.m3.media_paths.insert(pair.clone(), path.clone());
+                }
+                if matches!(status, MediaItemStatus::Unavailable | MediaItemStatus::Gone)
+                    && let Some(lb) = &mut self.m3.lightbox
+                    && lb.chat == chat
+                {
+                    let _ = lb.mark_failed_and_check_external(&msg_id);
+                }
+                self.m3.media_statuses.insert(pair, status);
+                0
+            }
+            SyncEvent::AvatarReady { chat, path } => {
+                self.m3.avatar_paths.insert(chat, path);
+                0
+            }
+            SyncEvent::WorkspaceIconReady { team, path } => {
+                self.m3.workspace_icon_paths.insert(team, path);
+                0
+            }
+            SyncEvent::SlackEmojiIndexReady { team, index } => {
+                let mut to_fetch = Vec::new();
+                for msg in &self.messages {
+                    if msg.chat.provider == Provider::Slack && msg.chat.account == team {
+                        for name in index.referenced_custom_names(&msg.body) {
+                            if let Some(postbox_media::avatar::ResolvedSlackEmoji::Custom {
+                                name: resolved_name,
+                                url,
+                            }) = index.resolve(&name)
+                                && self
+                                    .m3
+                                    .slack_emoji_media_requested
+                                    .insert((team.clone(), resolved_name.clone()))
+                            {
+                                to_fetch.push((resolved_name, url));
+                            }
+                        }
+                    }
+                }
+                self.m3.slack_emoji_indices.insert(team.clone(), index);
+                for (name, url) in to_fetch {
+                    self.emit_sync_command(SyncCommand::FetchSlackEmojiMedia {
+                        team: team.clone(),
+                        name,
+                        url,
+                    });
+                }
+                0
+            }
+            SyncEvent::SlackEmojiMediaReady { team, name, path } => {
+                self.m3.slack_emoji_paths.insert((team, name), path);
+                0
+            }
+            SyncEvent::ReactionSettled {
+                chat,
+                msg_id,
+                emoji,
+                ok,
+                http_status,
+            } => {
+                self.settle_reaction_event(
+                    &chat,
+                    &msg_id,
+                    &emoji,
+                    ok,
+                    http_status,
+                    now_epoch_millis() as u64,
+                );
+                0
+            }
+            SyncEvent::UnfurlReady { target, card } => {
+                self.m3
+                    .unfurl_in_flight
+                    .remove(&(target.provider, target.id.clone()));
+                if let Some(c) = card {
+                    self.m3.unfurl_ring.insert(c);
+                }
+                0
+            }
+            SyncEvent::GiphyResults {
+                generation,
+                target,
+                page,
+                error,
+            } => {
+                if let Some(p) = page {
+                    self.m3.giphy_picker.accept(generation, &target, p);
+                } else if let Some(msg) = error
+                    && self.m3.giphy_picker.fail(generation, &target, msg.clone())
+                {
+                    self.status_notice = Some(msg);
+                }
+                0
+            }
+            SyncEvent::GiphyPreviewReady {
+                generation,
+                index,
+                path,
+            } => {
+                if self.m3.giphy_picker.generation == generation
+                    && self.m3.giphy_picker.status == postbox_media::giphy::GiphyStatus::Ready
+                {
+                    self.m3.giphy_preview_paths.insert(index, path);
+                }
+                0
+            }
+            SyncEvent::GiphyDownloadReady {
+                generation,
+                download_generation,
+                target,
+                index,
+                gif_id,
+                bytes,
+            } => {
+                self.apply_giphy_download_ready(
+                    generation,
+                    download_generation,
+                    &target,
+                    index,
+                    &gif_id,
+                    &bytes,
+                );
+                0
+            }
+            SyncEvent::GiphyError {
+                generation,
+                index,
+                download_generation,
+                message,
+            } => {
+                if self
+                    .m3
+                    .giphy_picker
+                    .fail_download(generation, index, download_generation)
+                {
+                    self.status_notice = Some(message);
                 }
                 0
             }
@@ -525,7 +724,25 @@ impl PostboxViewModel {
         &self.composer_text
     }
 
-    pub fn set_composer_text(&mut self, text: impl Into<String>) {
+    pub(crate) fn set_focus_raw(&mut self, focus: FocusTarget) {
+        self.focus = focus;
+    }
+
+    pub(crate) fn set_status_notice(&mut self, notice: impl Into<String>) {
+        self.status_notice = Some(notice.into());
+    }
+
+    pub(crate) fn rebuild_timeline_public(&mut self) {
+        self.rebuild_timeline();
+    }
+
+    pub(crate) fn refresh_thread_panel_if_chat(&mut self, chat: &ChatKey) {
+        if self.thread_panel.as_ref().is_some_and(|p| &p.chat == chat) {
+            self.refresh_thread_panel_messages();
+        }
+    }
+
+    pub(crate) fn set_composer_text_no_popup_recursion(&mut self, text: impl Into<String>) {
         let mut next = text.into();
         if next.as_bytes().contains(&0) {
             next = next.replace('\0', "");
@@ -539,6 +756,18 @@ impl PostboxViewModel {
         }
         self.composer_text = next;
         self.persist_active_draft();
+    }
+
+    pub fn set_composer_text(&mut self, text: impl Into<String>) {
+        self.set_composer_text_no_popup_recursion(text);
+        let caret = self.composer_text.len();
+        self.update_composer_popups_at_caret(caret);
+    }
+
+    pub fn set_composer_text_with_caret(&mut self, text: impl Into<String>, caret_byte: usize) {
+        self.set_composer_text_no_popup_recursion(text);
+        let clamped = caret_byte.min(self.composer_text.len());
+        self.update_composer_popups_at_caret(clamped);
     }
 
     /// Origin-scoped async text append (`drafts.zig:89-100`): appends text to `origin_chat`
@@ -772,6 +1001,17 @@ impl PostboxViewModel {
     pub fn refresh_accounts(&mut self) {
         let live_accounts = self.store.list_accounts().unwrap_or_default();
         self.accounts = merge_order(&self.view_order, &live_accounts);
+        let slack_teams: Vec<String> = self
+            .accounts
+            .iter()
+            .filter(|a| a.provider == Provider::Slack)
+            .map(|a| a.account_id.clone())
+            .collect();
+        for team in slack_teams {
+            if self.m3.workspace_icon_requested.insert(team.clone()) {
+                self.emit_sync_command(SyncCommand::FetchWorkspaceIcon { team });
+            }
+        }
     }
 
     pub fn refresh_chats(&mut self) {
@@ -798,6 +1038,19 @@ impl PostboxViewModel {
         }
 
         self.chats = chats;
+
+        let avatar_targets: Vec<ChatKey> = self
+            .chats
+            .iter()
+            .take(24)
+            .filter(|c| postbox_media::avatar::chat_avatar_enabled(c.key.provider))
+            .map(|c| c.key.clone())
+            .collect();
+        for chat_key in avatar_targets {
+            if self.m3.avatar_requested.insert(chat_key.clone()) {
+                self.emit_sync_command(SyncCommand::FetchAvatar { chat: chat_key });
+            }
+        }
 
         let view_key = view.view_key();
         let remembered = self
@@ -826,6 +1079,16 @@ impl PostboxViewModel {
             self.reply_to_msg_id = None;
             self.marked_messages.clear();
             self.close_thread_panel();
+            self.close_lightbox();
+            self.close_composer_popup();
+            if let Some(new_key) = new_idx
+                .and_then(|i| self.chats.get(i))
+                .map(|c| c.key.clone())
+            {
+                self.m3.staged_attachments.guard_chat_match(&new_key);
+            } else {
+                self.m3.staged_attachments.discard_all();
+            }
             self.load_active_draft();
         }
         self.refresh_messages();
@@ -881,7 +1144,9 @@ impl PostboxViewModel {
             .and_then(|id| self.messages.iter().position(|m| m.msg_id == id))
             .or_else(|| self.messages.len().checked_sub(1));
 
+        self.reapply_pending_reactions(&chat.key);
         self.rebuild_timeline();
+        self.trigger_open_chat_media_and_metadata();
     }
 
     fn rebuild_timeline(&mut self) {
@@ -1006,6 +1271,9 @@ impl PostboxViewModel {
         self.reply_to_msg_id = None;
         self.marked_messages.clear();
         self.close_thread_panel();
+        self.close_lightbox();
+        self.close_composer_popup();
+        self.m3.staged_attachments.guard_chat_match(&key);
         self.load_active_draft();
         self.refresh_messages();
         self.maybe_mark_selected_chat_read();
@@ -1574,7 +1842,7 @@ impl PostboxViewModel {
             .store
             .list_messages(&chat_key, MAX_HISTORY_MESSAGES, None)
             .unwrap_or_default();
-        let thread_msgs: Vec<Message> = all_msgs
+        let mut thread_msgs: Vec<Message> = all_msgs
             .iter()
             .filter(|m| {
                 let parent = m.reply_to_id.as_deref().unwrap_or("");
@@ -1583,6 +1851,17 @@ impl PostboxViewModel {
             })
             .cloned()
             .collect();
+        for pending in self.m3.pending_reactions.entries() {
+            if pending.chat == chat_key
+                && let Some(msg) = thread_msgs.iter_mut().find(|m| m.msg_id == pending.msg_id)
+            {
+                msg.reactions = postbox_media::emoji::apply_optimistic_reaction(
+                    &msg.reactions,
+                    &pending.emoji,
+                    pending.preserve_chip,
+                );
+            }
+        }
         let outbox = self
             .store
             .list_outbox_for_chat(&chat_key)
@@ -1753,6 +2032,7 @@ impl PostboxViewModel {
             media_kind: None,
             mime_type: None,
             filename: None,
+            file_size: None,
             reactions: Vec::new(),
             read_status: ReadStatus::Sending,
             deleted: false,
@@ -1789,22 +2069,40 @@ impl PostboxViewModel {
         true
     }
 
-    /// Submits the current composer text into the durable outbox and appends an optimistic
-    /// outgoing message to SQLite so the timeline updates immediately.
+    /// Submits the current composer text (and/or staged attachments) into the durable outbox and
+    /// appends optimistic outgoing message(s) to SQLite so the timeline updates immediately.
     pub fn submit_composer_message(&mut self) -> bool {
-        let trimmed = self.composer_text.trim().to_owned();
-        if trimmed.is_empty() {
-            return false;
-        }
         let Some(chat_key) = self.selected_chat().map(|c| c.key.clone()) else {
             return false;
         };
+        let trimmed = self.composer_text.trim().to_owned();
         let reply_to = self.reply_to_msg_id.clone();
+
+        if !self.m3.staged_attachments.is_empty() {
+            if !self.m3.staged_attachments.guard_chat_match(&chat_key) {
+                self.set_status_notice("Pasted image discarded");
+            } else {
+                if !self.submit_staged_attachments_to_outbox(&chat_key, &trimmed, reply_to) {
+                    return false;
+                }
+                self.composer_text.clear();
+                self.reply_to_msg_id = None;
+                self.close_composer_popup();
+                self.drafts.remove(&chat_key);
+                let _ = self.store.delete_draft(&chat_key);
+                return true;
+            }
+        }
+
+        if trimmed.is_empty() {
+            return false;
+        }
         if !self.enqueue_and_optimistic_send(&chat_key, &trimmed, reply_to, false) {
             return false;
         }
         self.composer_text.clear();
         self.reply_to_msg_id = None;
+        self.close_composer_popup();
         self.drafts.remove(&chat_key);
         let _ = self.store.delete_draft(&chat_key);
         true
@@ -1834,6 +2132,7 @@ impl PostboxViewModel {
             media_kind: None,
             mime_type: None,
             filename: None,
+            file_size: None,
             reactions: Vec::new(),
             read_status: ReadStatus::Sending,
             deleted: false,
@@ -1879,13 +2178,37 @@ impl PostboxViewModel {
         self.shortcuts_open
     }
 
-    pub fn toggle_shortcuts(&mut self) {
-        self.shortcuts_open = !self.shortcuts_open;
-        if self.shortcuts_open {
+    /// Closes all mutually exclusive modal overlays so at most one modal can ever be open and
+    /// `self.focus` always matches the active mounted overlay.
+    pub(crate) fn dismiss_all_modals(&mut self) {
+        if self.palette.open {
+            let was_search = self.palette.mode == PaletteMode::SearchChats;
             self.palette.open = false;
-            self.focus = FocusTarget::ShortcutsOverlay;
+            self.palette.query.clear();
+            self.palette.selected_index = 0;
+            if was_search && !self.search_filter.is_empty() {
+                self.search_filter.clear();
+                self.refresh_chats();
+            }
+        }
+        self.shortcuts_open = false;
+        self.m3.lightbox = None;
+        self.m3.emoji_picker = None;
+        if self.m3.giphy_picker.is_open() {
+            let gen_id = self.m3.giphy_picker.generation;
+            self.m3.giphy_picker.cancel();
+            self.m3.giphy_preview_paths.clear();
+            self.emit_sync_command(SyncCommand::CancelGiphy { generation: gen_id });
+        }
+    }
+
+    pub fn toggle_shortcuts(&mut self) {
+        if self.shortcuts_open {
+            self.close_shortcuts();
         } else {
-            self.focus = FocusTarget::ChatList;
+            self.dismiss_all_modals();
+            self.shortcuts_open = true;
+            self.focus = FocusTarget::ShortcutsOverlay;
         }
     }
 
@@ -1945,7 +2268,7 @@ impl PostboxViewModel {
     }
 
     fn open_palette_with_mode(&mut self, mode: PaletteMode) {
-        self.shortcuts_open = false;
+        self.dismiss_all_modals();
         self.palette.open = true;
         self.palette.mode = mode;
         self.palette.query.clear();
@@ -2207,7 +2530,7 @@ impl PostboxViewModel {
                 return true;
             }
             PaletteCommand::ShowShortcuts => {
-                self.palette.open = false;
+                self.dismiss_all_modals();
                 self.shortcuts_open = true;
                 self.focus = FocusTarget::ShortcutsOverlay;
                 return true;
@@ -2364,19 +2687,36 @@ impl PostboxViewModel {
             PaletteCommand::Quit => {
                 self.quit_requested = true;
             }
-            PaletteCommand::PickMention
-            | PaletteCommand::ReactToSelected
-            | PaletteCommand::CopyMessageText
+            PaletteCommand::PickMention => {
+                if !self.accept_composer_popup() {
+                    self.status_notice = Some("No active mention to pick".into());
+                }
+            }
+            PaletteCommand::ReactToSelected => {
+                self.open_reaction_picker();
+            }
+            PaletteCommand::InsertEmoji => {
+                self.open_insert_emoji_picker();
+            }
+            PaletteCommand::SendGif => {
+                self.open_giphy_picker();
+            }
+            PaletteCommand::QuickReact(emoji_opt) => {
+                if let Some(msg) = self.selected_message().cloned() {
+                    let emoji = emoji_opt.unwrap_or("");
+                    self.react_to_message_with_chip(&msg.chat, &msg.msg_id, emoji, false);
+                }
+            }
+            PaletteCommand::OpenImageExternal => {
+                self.open_selected_image_externally();
+            }
+            PaletteCommand::CopyMessageText
             | PaletteCommand::CopyMessageLink
             | PaletteCommand::CopyTranscript
             | PaletteCommand::CopyAllTranscripts
             | PaletteCommand::PlayPauseVoice
             | PaletteCommand::ToggleTranscript
-            | PaletteCommand::InsertEmoji
-            | PaletteCommand::SendGif
-            | PaletteCommand::QuickReact(_)
             | PaletteCommand::OpenVideoExternal
-            | PaletteCommand::OpenImageExternal
             | PaletteCommand::AttachFile
             | PaletteCommand::CheckForUpdates => {
                 self.status_notice = Some("Command queued".into());
@@ -2403,6 +2743,9 @@ impl PostboxViewModel {
         let allowed = !modifiers_active
             && !self.palette.open
             && !self.shortcuts_open
+            && self.m3.lightbox.is_none()
+            && self.m3.emoji_picker.is_none()
+            && !self.m3.giphy_picker.is_open()
             && matches!(self.focus, FocusTarget::ChatList | FocusTarget::MessageList);
         if self.inbox_chord.on_key(key, now_ms, allowed, repeated) {
             self.switch_to_combined_inbox();
@@ -2441,6 +2784,21 @@ impl PostboxViewModel {
 
     /// Exact Postbox `Esc` cascade (`main.zig:21364-21513`).
     pub fn handle_escape(&mut self) {
+        if self.m3.lightbox.is_some() {
+            self.close_lightbox();
+            return;
+        }
+        if self.m3.emoji_picker.is_some() {
+            self.close_emoji_picker();
+            return;
+        }
+        if self.m3.giphy_picker.is_open() {
+            self.close_giphy_picker();
+            return;
+        }
+        if self.close_composer_popup() {
+            return;
+        }
         if self.shortcuts_open {
             self.close_shortcuts();
             return;
@@ -2478,6 +2836,10 @@ impl PostboxViewModel {
         }
         if self.reply_to_msg_id.is_some() {
             self.reply_to_msg_id = None;
+            self.status_notice = Some("Reply cancelled".into());
+            return;
+        }
+        if self.discard_staged_attachments() {
             return;
         }
         if !self.search_filter.is_empty() {
@@ -2490,7 +2852,7 @@ impl PostboxViewModel {
         }
     }
 
-    pub fn handle_action(&mut self, action: Action, _now_ms: u64) {
+    pub fn handle_action(&mut self, action: Action, now_ms: u64) {
         match action {
             Action::OpenPalette => self.open_palette(),
             Action::ShowShortcutsHelp => self.toggle_shortcuts(),
@@ -2522,12 +2884,79 @@ impl PostboxViewModel {
             Action::PageUpMessages => self.page_up_messages(),
             Action::PageDownMessages => self.page_down_messages(),
             Action::JumpLatest => self.jump_to_latest(),
+            Action::ReactToMessage => {
+                self.open_reaction_picker();
+            }
             Action::ReplyToMessage => self.start_reply_selected(),
             Action::OpenThread => {
                 self.open_thread_for_selected();
             }
             Action::ResendFailedMessage => {
                 self.retry_selected_failed_message();
+            }
+            Action::OpenImageLightbox => {
+                self.open_selected_image_lightbox(now_ms);
+            }
+            Action::CloseLightbox => self.close_lightbox(),
+            Action::PrevLightboxImage => {
+                self.lightbox_prev();
+            }
+            Action::NextLightboxImage => {
+                self.lightbox_next();
+            }
+            Action::EmojiMoveUp => {
+                if self.m3.giphy_picker.is_open() {
+                    self.move_giphy_picker(-1, 0);
+                } else {
+                    self.move_emoji_picker(-1, 0);
+                }
+            }
+            Action::EmojiMoveDown => {
+                if self.m3.giphy_picker.is_open() {
+                    self.move_giphy_picker(1, 0);
+                } else {
+                    self.move_emoji_picker(1, 0);
+                }
+            }
+            Action::EmojiMoveLeft => {
+                if self.m3.giphy_picker.is_open() {
+                    self.move_giphy_picker(0, -1);
+                } else {
+                    self.move_emoji_picker(0, -1);
+                }
+            }
+            Action::EmojiMoveRight => {
+                if self.m3.giphy_picker.is_open() {
+                    self.move_giphy_picker(0, 1);
+                } else {
+                    self.move_emoji_picker(0, 1);
+                }
+            }
+            Action::EmojiActivate => {
+                if self.m3.giphy_picker.is_open() {
+                    self.activate_giphy_enter();
+                } else {
+                    self.activate_emoji_picker();
+                }
+            }
+            Action::CloseEmojiPicker => {
+                if self.m3.giphy_picker.is_open() {
+                    self.close_giphy_picker();
+                } else {
+                    self.close_emoji_picker();
+                }
+            }
+            Action::ShortcodePrev => {
+                self.composer_popup_prev();
+            }
+            Action::ShortcodeNext => {
+                self.composer_popup_next();
+            }
+            Action::ShortcodeAccept => {
+                self.accept_composer_popup();
+            }
+            Action::CloseShortcodePopup => {
+                self.close_composer_popup();
             }
             Action::CloseThreadPanel => self.close_thread_panel(),
             Action::CycleThreadFocus => self.cycle_thread_focus(),
@@ -2538,7 +2967,11 @@ impl PostboxViewModel {
             Action::OpenLinksAndMedia => self.open_links_palette(),
             Action::FocusComposer => self.set_focus(FocusTarget::Composer),
             Action::SendMessage => {
-                self.submit_composer_message();
+                if self.has_composer_popup() {
+                    self.accept_composer_popup();
+                } else {
+                    self.submit_composer_message();
+                }
             }
             Action::FontSmaller => self.font_smaller(),
             Action::FontLarger => self.font_larger(),
@@ -2642,6 +3075,7 @@ mod tests {
                 media_kind: None,
                 mime_type: None,
                 filename: None,
+                file_size: None,
                 reactions: vec![],
                 read_status: ReadStatus::Read,
                 deleted: false,
@@ -2661,6 +3095,7 @@ mod tests {
                 media_kind: None,
                 mime_type: None,
                 filename: None,
+                file_size: None,
                 reactions: vec![],
                 read_status: ReadStatus::Read,
                 deleted: false,

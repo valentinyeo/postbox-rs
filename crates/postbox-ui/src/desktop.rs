@@ -1,3 +1,4 @@
+use crate::desktop_m3::{GpuTextureLru, avatar_tex_key, workspace_icon_tex_key};
 use crate::geometry::{
     CHAT_COLUMN_MAX_WIDTH_PX, SIDEBAR_WIDTH_PX, TYPE_CHAT_NAME_PX, TYPE_LABEL_PX, TYPE_TIME_PX,
     VIEW_RAIL_WIDTH_PX,
@@ -13,22 +14,26 @@ use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::base::actions::Cancel;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::{IndexPath, Theme, ThemeMode, VirtualListScrollHandle, v_virtual_list};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Action as GpuiAction, AnyElement, App, AppContext as _, AsyncWindowContext, Bounds, Context,
-    Entity, FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement, KeyBinding,
-    KeyBindingContextPredicate, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
-    MouseButton, ParentElement as _, Pixels, Point, Render, ScrollStrategy, SharedString, Size,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, TitlebarOptions, WeakEntity,
-    Window, WindowBounds, WindowOptions, div, hsla, px, rgb, size,
+    Entity, ExternalPaths, FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement,
+    KeyBinding, KeyBindingContextPredicate, KeyDownEvent, Keystroke, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, ObjectFit, ParentElement as _, Pixels,
+    Point, Render, ScrollStrategy, SharedString, Size, StatefulInteractiveElement as _,
+    Styled as _, StyledImage as _, Subscription, Task, TitlebarOptions, WeakEntity, Window,
+    WindowBounds, WindowOptions, div, hsla, img, px, rgb, size,
 };
 use postbox_core::threads::replies_line;
 use postbox_core::{FontScale, Provider, ThemeChoice};
 use postbox_keymap::{Action as PbAction, Keymap, f1_shortcut_groups};
+use postbox_media::paste::PasteStageResult;
+use postbox_media::unfurl::omit_unfurled_url_from_body;
+use postbox_platform::{ClipboardBackend, NativePlatform};
 use std::borrow::Cow;
 use std::rc::Rc;
 use std::time::Instant;
@@ -77,9 +82,25 @@ gpui_kit::actions!(
         PageUpMessages,
         PageDownMessages,
         JumpLatest,
+        ReactToMessage,
         ReplyToMessage,
         OpenThread,
         ResendFailedMessage,
+        OpenImageLightbox,
+        PasteImage,
+        CloseLightbox,
+        PrevLightboxImage,
+        NextLightboxImage,
+        EmojiMoveUp,
+        EmojiMoveDown,
+        EmojiMoveLeft,
+        EmojiMoveRight,
+        EmojiActivate,
+        CloseEmojiPicker,
+        ShortcodePrev,
+        ShortcodeNext,
+        ShortcodeAccept,
+        CloseShortcodePopup,
         CloseThreadPanel,
         CycleThreadFocus,
         ToggleThreadBroadcast,
@@ -136,9 +157,25 @@ fn gpui_action_for(action: PbAction) -> Option<Box<dyn GpuiAction>> {
         PbAction::PageUpMessages => Some(Box::new(PageUpMessages)),
         PbAction::PageDownMessages => Some(Box::new(PageDownMessages)),
         PbAction::JumpLatest => Some(Box::new(JumpLatest)),
+        PbAction::ReactToMessage => Some(Box::new(ReactToMessage)),
         PbAction::ReplyToMessage => Some(Box::new(ReplyToMessage)),
         PbAction::OpenThread => Some(Box::new(OpenThread)),
         PbAction::ResendFailedMessage => Some(Box::new(ResendFailedMessage)),
+        PbAction::OpenImageLightbox => Some(Box::new(OpenImageLightbox)),
+        PbAction::PasteImage => Some(Box::new(PasteImage)),
+        PbAction::CloseLightbox => Some(Box::new(CloseLightbox)),
+        PbAction::PrevLightboxImage => Some(Box::new(PrevLightboxImage)),
+        PbAction::NextLightboxImage => Some(Box::new(NextLightboxImage)),
+        PbAction::EmojiMoveUp => Some(Box::new(EmojiMoveUp)),
+        PbAction::EmojiMoveDown => Some(Box::new(EmojiMoveDown)),
+        PbAction::EmojiMoveLeft => Some(Box::new(EmojiMoveLeft)),
+        PbAction::EmojiMoveRight => Some(Box::new(EmojiMoveRight)),
+        PbAction::EmojiActivate => Some(Box::new(EmojiActivate)),
+        PbAction::CloseEmojiPicker => Some(Box::new(CloseEmojiPicker)),
+        PbAction::ShortcodePrev => Some(Box::new(ShortcodePrev)),
+        PbAction::ShortcodeNext => Some(Box::new(ShortcodeNext)),
+        PbAction::ShortcodeAccept => Some(Box::new(ShortcodeAccept)),
+        PbAction::CloseShortcodePopup => Some(Box::new(CloseShortcodePopup)),
         PbAction::CloseThreadPanel => Some(Box::new(CloseThreadPanel)),
         PbAction::CycleThreadFocus => Some(Box::new(CycleThreadFocus)),
         PbAction::ToggleThreadBroadcast => Some(Box::new(ToggleThreadBroadcast)),
@@ -195,6 +232,12 @@ pub fn bind_postbox_keys(cx: &mut App, keymap: &Keymap) {
 
         let extra_descendant_ctx: Option<&'static str> = match entry.context {
             postbox_keymap::KeyContext::ComposerEmpty => Some("PostboxComposerEmpty > Input"),
+            postbox_keymap::KeyContext::Composer if entry.action == PbAction::PasteImage => {
+                Some("PostboxComposer > Input")
+            }
+            postbox_keymap::KeyContext::ShortcodePopup => Some("PostboxShortcodePopup > Input"),
+            postbox_keymap::KeyContext::EmojiPicker => Some("PostboxEmojiPicker > Input"),
+            postbox_keymap::KeyContext::GiphyPicker => Some("PostboxGiphyPicker > Input"),
             postbox_keymap::KeyContext::ThreadPanel
                 if matches!(entry.stroke.as_str(), "escape" | "tab") =>
             {
@@ -303,24 +346,34 @@ fn slot_kbd_badge(slot: u8) -> Kbd {
 }
 
 pub struct PostboxShell {
-    vm: PostboxViewModel,
+    pub(crate) vm: PostboxViewModel,
     started_at: Instant,
     init_elapsed_ms: u128,
     root_focus: FocusHandle,
     sidebar_focus: FocusHandle,
     message_list_focus: FocusHandle,
     thread_broadcast_focus: FocusHandle,
+    lightbox_focus: FocusHandle,
+    emoji_picker_focus: FocusHandle,
+    giphy_picker_focus: FocusHandle,
     sidebar_scroll: VirtualListScrollHandle,
     sidebar_item_sizes: Rc<Vec<Size<Pixels>>>,
-    sidebar_rows_cache: Vec<SidebarChatRow>,
+    pub(crate) sidebar_rows_cache: Vec<SidebarChatRow>,
     timeline_state: Entity<MessageScrollerState>,
     thread_timeline_state: Entity<MessageScrollerState>,
     composer: Entity<TextareaState>,
     thread_composer: Entity<TextareaState>,
+    emoji_search_input: Entity<InputState>,
+    giphy_search_input: Entity<InputState>,
     palette_state: Entity<CommandState>,
     last_window_title: String,
     last_applied_theme: ThemeChoice,
     last_applied_scale: FontScale,
+    pub(crate) gpu_textures: GpuTextureLru,
+    pub(crate) gif_tick: usize,
+    pub(crate) gif_timer_task: Option<Task<()>>,
+    pub(crate) reaction_retry_task: Option<Task<()>>,
+    pub(crate) reaction_retry_deadline_ms: Option<u64>,
     sync_cmd_tx: Option<async_channel::Sender<SyncCommand>>,
     _sync_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -337,11 +390,14 @@ impl Drop for PostboxShell {
 impl PostboxShell {
     pub fn new(ctx: PostboxLaunchContext, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let started_at = ctx.started_at;
-        let mut vm = PostboxViewModel::new(ctx.store, ctx.keymap, ctx.version)
-            .with_hub_status(ctx.hub_status);
+        let mut vm = PostboxViewModel::new_uninitialized(ctx.store, ctx.keymap, ctx.version)
+            .with_hub_status(ctx.hub_status)
+            .with_data_dir(ctx.data_dir)
+            .with_giphy_key_available(ctx.giphy_key_available);
         if let Some(bridge) = &ctx.sync_bridge {
             vm.attach_sync_sender(bridge.cmd_tx.clone());
         }
+        vm.initialize();
         Self::from_view_model_with_bridge(vm, ctx.sync_bridge, started_at, window, cx)
     }
 
@@ -376,6 +432,9 @@ impl PostboxShell {
         let sidebar_focus = cx.focus_handle();
         let message_list_focus = cx.focus_handle();
         let thread_broadcast_focus = cx.focus_handle();
+        let lightbox_focus = cx.focus_handle();
+        let emoji_picker_focus = cx.focus_handle();
+        let giphy_picker_focus = cx.focus_handle();
         sidebar_focus.focus(window, cx);
 
         let timeline_state = cx.new(|cx| MessageScrollerState::new(initial_timeline_len, cx));
@@ -392,7 +451,50 @@ impl PostboxShell {
                 .submit_on_enter(true)
                 .placeholder("Reply in thread...")
         });
+        let emoji_search_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("React: search emoji (thumbs, heart, laugh...)")
+        });
+        let giphy_search_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search GIPHY"));
         let palette_state = cx.new(|cx| CommandState::new(window, cx));
+
+        let emoji_search_sub = cx.subscribe_in(
+            &emoji_search_input,
+            window,
+            |this: &mut Self, state: &Entity<InputState>, event: &InputEvent, window, cx| {
+                match event {
+                    InputEvent::Change => {
+                        let q = state.read(cx).value().to_string();
+                        this.vm.set_emoji_picker_query(q);
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        this.vm.activate_emoji_picker();
+                        this.sync_after_vm_change(window, cx);
+                    }
+                    _ => {}
+                }
+            },
+        );
+
+        let giphy_search_sub = cx.subscribe_in(
+            &giphy_search_input,
+            window,
+            |this: &mut Self, state: &Entity<InputState>, event: &InputEvent, window, cx| {
+                match event {
+                    InputEvent::Change => {
+                        let q = state.read(cx).value().to_string();
+                        this.vm.set_giphy_query(q);
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        this.vm.activate_giphy_enter();
+                        this.sync_after_vm_change(window, cx);
+                    }
+                    _ => {}
+                }
+            },
+        );
 
         let composer_sub = cx.subscribe_in(
             &composer,
@@ -402,11 +504,19 @@ impl PostboxShell {
                     InputEvent::Change => {
                         let value = state.read(cx).value().to_string();
                         this.vm.set_composer_text(value);
+                        // Sync back immediately if closed `:shortcode:` auto-replaced!
+                        let updated = this.vm.composer_text().to_owned();
+                        if state.read(cx).value().as_ref() != updated.as_str() {
+                            state.update(cx, |input, cx| input.set_value(updated, window, cx));
+                        }
                         this.sync_sidebar_cache();
                         cx.notify();
                     }
                     InputEvent::PressEnter { shift, .. } if !shift => {
-                        if this.vm.submit_composer_message() {
+                        if this.vm.has_composer_popup() {
+                            this.vm.accept_composer_popup();
+                            this.sync_after_vm_change(window, cx);
+                        } else if this.vm.submit_composer_message() {
                             state.update(cx, |input, cx| input.clean(window, cx));
                             this.sync_after_vm_change(window, cx);
                         }
@@ -450,9 +560,14 @@ impl PostboxShell {
         );
 
         let activation_sub = cx.observe_window_activation(window, |this, window, cx| {
-            if !window.is_window_active() && this.vm.on_window_blur() {
-                this.sync_sidebar_cache();
+            if !window.is_window_active() {
+                this.gif_timer_task = None;
+                if this.vm.on_window_blur() {
+                    this.sync_sidebar_cache();
+                }
                 cx.notify();
+            } else {
+                this.sync_gif_animation_timer(window, cx);
             }
         });
 
@@ -484,7 +599,7 @@ impl PostboxShell {
         window.set_window_title(&initial_title);
         let init_elapsed_ms = started_at.elapsed().as_millis();
 
-        Self {
+        let mut shell = Self {
             vm,
             started_at,
             init_elapsed_ms,
@@ -492,6 +607,9 @@ impl PostboxShell {
             sidebar_focus,
             message_list_focus,
             thread_broadcast_focus,
+            lightbox_focus,
+            emoji_picker_focus,
+            giphy_picker_focus,
             sidebar_scroll: VirtualListScrollHandle::new(),
             sidebar_item_sizes,
             sidebar_rows_cache,
@@ -499,14 +617,71 @@ impl PostboxShell {
             thread_timeline_state,
             composer,
             thread_composer,
+            emoji_search_input,
+            giphy_search_input,
             palette_state,
             last_window_title: initial_title,
             last_applied_theme: initial_theme,
             last_applied_scale: initial_scale,
+            gpu_textures: GpuTextureLru::default(),
+            gif_tick: 0,
+            gif_timer_task: None,
+            reaction_retry_task: None,
+            reaction_retry_deadline_ms: None,
             sync_cmd_tx,
             _sync_task: sync_task,
-            _subscriptions: vec![composer_sub, thread_composer_sub, activation_sub],
+            _subscriptions: vec![
+                composer_sub,
+                thread_composer_sub,
+                emoji_search_sub,
+                giphy_search_sub,
+                activation_sub,
+            ],
+        };
+        shell.refresh_visible_gpu_textures(window, cx);
+        shell.sync_reaction_retry_timer(window, cx);
+        shell
+    }
+
+    /// Arms a single on-demand one-shot GPUI timer ONLY when a reaction has a scheduled retry
+    /// (`3s / 10s / 30s`). Drops the task (`0.0%` idle CPU) when no retries are scheduled.
+    pub(crate) fn sync_reaction_retry_timer(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(deadline_ms) = self.vm.next_reaction_retry_at_ms() else {
+            self.reaction_retry_task = None;
+            self.reaction_retry_deadline_ms = None;
+            return;
+        };
+        if self.reaction_retry_task.is_some()
+            && self.reaction_retry_deadline_ms == Some(deadline_ms)
+        {
+            return;
         }
+        let now_ms = crate::viewmodel::now_epoch_millis_public() as u64;
+        let delay_ms = deadline_ms.saturating_sub(now_ms);
+        self.reaction_retry_deadline_ms = Some(deadline_ms);
+        let task = cx.spawn_in(
+            window,
+            async move |this: WeakEntity<PostboxShell>, cx: &mut AsyncWindowContext| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(delay_ms))
+                    .await;
+                let _ = this.update_in(cx, |shell, window, cx| {
+                    shell.reaction_retry_task = None;
+                    shell.reaction_retry_deadline_ms = None;
+                    // `.max(deadline_ms)` prevents 1ms wall-clock jitter AND makes fake-clock
+                    // `cx.background_executor().advance_clock(...)` tests deterministic.
+                    let fire_ms =
+                        (crate::viewmodel::now_epoch_millis_public() as u64).max(deadline_ms);
+                    shell.vm.retry_due_reactions(fire_ms);
+                    shell.sync_after_vm_change(window, cx);
+                });
+            },
+        );
+        self.reaction_retry_task = Some(task);
     }
 
     pub fn view_model(&self) -> &PostboxViewModel {
@@ -517,8 +692,12 @@ impl PostboxShell {
         self.init_elapsed_ms
     }
 
-    fn now_ms(&self) -> u64 {
+    pub(crate) fn now_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis() as u64
+    }
+
+    pub fn gpu_vram_bytes(&self) -> usize {
+        self.gpu_textures.total_vram_bytes()
     }
 
     fn apply_sync_events(
@@ -563,10 +742,17 @@ impl PostboxShell {
                 .palette_state
                 .update(cx, |state, cx| state.focus(window, cx)),
             FocusTarget::ShortcutsOverlay => self.root_focus.focus(window, cx),
+            FocusTarget::Lightbox => self.lightbox_focus.focus(window, cx),
+            FocusTarget::EmojiPicker => self
+                .emoji_search_input
+                .update(cx, |input, cx| input.focus(window, cx)),
+            FocusTarget::GiphyPicker => self
+                .giphy_search_input
+                .update(cx, |input, cx| input.focus(window, cx)),
         }
     }
 
-    fn sync_after_vm_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn sync_after_vm_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let theme = self.vm.theme();
         let scale = self.vm.font_scale();
         let scale_changed = scale != self.last_applied_scale;
@@ -633,6 +819,27 @@ impl PostboxShell {
             });
         }
 
+        if let Some(picker) = self.vm.emoji_picker() {
+            let wanted = picker.query.as_str();
+            if self.emoji_search_input.read(cx).value().as_ref() != wanted {
+                let wanted_owned = wanted.to_owned();
+                self.emoji_search_input.update(cx, |input, cx| {
+                    input.set_value(wanted_owned, window, cx);
+                });
+            }
+        }
+        if self.vm.giphy_picker().is_open() {
+            let wanted = self.vm.giphy_picker().query.as_str();
+            if self.giphy_search_input.read(cx).value().as_ref() != wanted {
+                let wanted_owned = wanted.to_owned();
+                self.giphy_search_input.update(cx, |input, cx| {
+                    input.set_value(wanted_owned, window, cx);
+                });
+            }
+        }
+
+        self.refresh_visible_gpu_textures(window, cx);
+        self.sync_reaction_retry_timer(window, cx);
         self.sync_focus(window, cx);
 
         let title = self.vm.window_title();
@@ -642,6 +849,7 @@ impl PostboxShell {
         }
 
         if self.vm.quit_requested() {
+            self.gpu_textures.clear_all(window, cx);
             cx.quit();
         }
 
@@ -828,32 +1036,96 @@ impl PostboxShell {
         for (idx, account) in accounts.into_iter().enumerate() {
             let key = account.view_key();
             let is_active = key == active_view_key;
-            let badge = provider_badge(account.provider);
             let element_id = SharedString::from(format!("view-tab-{}", idx + 2));
-            rail = rail.child(
-                div()
-                    .id(element_id)
-                    .test_support()
-                    .w(px(34.0))
-                    .h(px(34.0))
-                    .rounded_md()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(TYPE_LABEL_PX))
-                    .bg(rgb(if is_active { p.primary } else { p.secondary }))
-                    .text_color(rgb(if is_active {
-                        p.primary_foreground
+
+            let decoded_ws_icon = if account.provider == Provider::Slack {
+                self.vm
+                    .workspace_icon_path_for(&account.account_id)
+                    .and_then(|path| {
+                        self.gpu_textures
+                            .peek(&workspace_icon_tex_key(&account.account_id, path))
+                            .and_then(|e| e.frame_at(0))
+                    })
+            } else {
+                None
+            };
+
+            if let Some(frame) = decoded_ws_icon {
+                rail = rail.child(
+                    div()
+                        .id(element_id)
+                        .test_support()
+                        .w(px(34.0))
+                        .h(px(34.0))
+                        .rounded_md()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(rgb(if is_active { p.ring } else { p.border }))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.vm.switch_to_view_key(&key);
+                            this.sync_after_vm_change(window, cx);
+                        }))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("view-tab-icon-{}", idx + 2)))
+                                .test_support()
+                                .w(px(34.0))
+                                .h(px(34.0))
+                                .child(
+                                    img(frame)
+                                        .w(px(34.0))
+                                        .h(px(34.0))
+                                        .object_fit(ObjectFit::Cover)
+                                        .rounded_md(),
+                                ),
+                        ),
+                );
+            } else {
+                let (bg_hex, fg_hex, label) = if account.provider == Provider::Slack {
+                    let palette_hex = postbox_media::avatar::SENDER_PALETTE_HEX
+                        [postbox_media::avatar::sender_color_index(
+                            &account.account_id,
+                            &account.label,
+                        )];
+                    let initial = postbox_media::avatar::avatar_initial(&account.label);
+                    if is_active {
+                        (p.primary, p.primary_foreground, initial)
                     } else {
-                        p.foreground
-                    }))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.vm.switch_to_view_key(&key);
-                        this.sync_after_vm_change(window, cx);
-                    }))
-                    .child(badge),
-            );
+                        (palette_hex, 0xFFFFFF, initial)
+                    }
+                } else {
+                    (
+                        if is_active { p.primary } else { p.secondary },
+                        if is_active {
+                            p.primary_foreground
+                        } else {
+                            p.foreground
+                        },
+                        provider_badge(account.provider).to_owned(),
+                    )
+                };
+                rail = rail.child(
+                    div()
+                        .id(element_id)
+                        .test_support()
+                        .w(px(34.0))
+                        .h(px(34.0))
+                        .rounded_md()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(TYPE_LABEL_PX))
+                        .bg(rgb(bg_hex))
+                        .text_color(rgb(fg_hex))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.vm.switch_to_view_key(&key);
+                            this.sync_after_vm_change(window, cx);
+                        }))
+                        .child(label),
+                );
+            }
         }
 
         rail.into_any_element()
@@ -970,6 +1242,48 @@ impl PostboxShell {
             );
         }
 
+        let avatar_px = (geom.height - geom.padding * 2.0).clamp(28.0, 42.0);
+        let avatar_el = if let Some(path) = self.vm.avatar_path_for(&row.chat.key)
+            && let Some(entry) = self.gpu_textures.peek(&avatar_tex_key(&row.chat.key, path))
+            && let Some(frame) = entry.frame_at(0)
+        {
+            div()
+                .id(SharedString::from(format!("chat-avatar-img-{ix}")))
+                .test_support()
+                .w(px(avatar_px))
+                .h(px(avatar_px))
+                .flex_shrink_0()
+                .rounded_full()
+                .overflow_hidden()
+                .child(
+                    img(frame)
+                        .w(px(avatar_px))
+                        .h(px(avatar_px))
+                        .object_fit(ObjectFit::Cover)
+                        .rounded_full(),
+                )
+                .into_any_element()
+        } else {
+            let color_hex = postbox_media::avatar::SENDER_PALETTE_HEX
+                [postbox_media::avatar::sender_color_index(&row.chat.key.id, &row.chat.title)];
+            let initial = postbox_media::avatar::avatar_initial(&row.chat.title);
+            div()
+                .id(SharedString::from(format!("chat-avatar-fallback-{ix}")))
+                .test_support()
+                .w(px(avatar_px))
+                .h(px(avatar_px))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(rgb(color_hex))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px((avatar_px * 0.44).clamp(11.0, 16.0)))
+                .text_color(rgb(0xFFFFFF))
+                .child(initial)
+                .into_any_element()
+        };
+
         div()
             .id(SharedString::from(format!("chat-row-{ix}")))
             .test_support()
@@ -978,8 +1292,9 @@ impl PostboxShell {
             .px_3()
             .py(px(geom.padding))
             .flex()
-            .flex_col()
-            .justify_center()
+            .flex_row()
+            .items_center()
+            .gap_2p5()
             .bg(rgb(row_bg))
             .border_b_1()
             .border_color(rgb(if row.bulk_selected { p.ring } else { p.border }))
@@ -989,8 +1304,17 @@ impl PostboxShell {
                 this.vm.set_focus(FocusTarget::ChatList);
                 this.sync_after_vm_change(window, cx);
             }))
-            .child(top_line)
-            .child(bottom_line)
+            .child(avatar_el)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .child(top_line)
+                    .child(bottom_line),
+            )
             .into_any_element()
     }
 
@@ -1061,7 +1385,11 @@ impl PostboxShell {
                     p.border
                 };
 
+                let msg_id_dbl = message.msg_id.clone();
+                let shell_dbl = shell.clone();
                 let mut bubble = div()
+                    .id(SharedString::from(format!("{id_prefix}-bubble-{ix}")))
+                    .test_support()
                     .max_w(px(620.0))
                     .px_3()
                     .py_2()
@@ -1071,7 +1399,19 @@ impl PostboxShell {
                     .border_color(rgb(border_col))
                     .flex()
                     .flex_col()
-                    .gap_1();
+                    .gap_1()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        move |event: &MouseDownEvent, window, cx| {
+                            if event.click_count == 2 {
+                                shell_dbl.update(cx, |this, cx| {
+                                    if this.vm.double_click_message_bubble(&msg_id_dbl) {
+                                        this.sync_after_vm_change(window, cx);
+                                    }
+                                });
+                            }
+                        },
+                    );
 
                 if !grouped_with_prev && !message.from_me {
                     bubble = bubble.child(
@@ -1100,11 +1440,23 @@ impl PostboxShell {
                     );
                 }
 
+                let unfurl_match = self.vm.unfurl_card_for_message(message);
                 let body_text = if message.deleted {
                     "Message deleted".to_owned()
                 } else {
-                    message.body.clone()
+                    let base = self.vm.render_message_text_with_slack_emoji(message);
+                    if let Some((_, ref cls)) = unfurl_match {
+                        omit_unfurled_url_from_body(&base, cls)
+                    } else {
+                        base
+                    }
                 };
+
+                if let Some(media_el) =
+                    self.render_inline_media_element(message, &p, ix, id_prefix, &shell)
+                {
+                    bubble = bubble.child(media_el);
+                }
 
                 let mut meta_row = div()
                     .flex()
@@ -1130,14 +1482,20 @@ impl PostboxShell {
                     );
                 }
 
-                bubble = bubble
-                    .child(
-                        div()
-                            .text_size(px(body_px))
-                            .text_color(rgb(bubble_fg))
-                            .child(body_text),
-                    )
-                    .child(meta_row);
+                if !body_text.is_empty() {
+                    bubble = bubble.child(self.render_message_body_element(
+                        message, body_text, body_px, bubble_fg, ix, id_prefix,
+                    ));
+                }
+                if let Some((card, _)) = unfurl_match {
+                    bubble = bubble.child(self.render_unfurl_card(card, &p, ix, id_prefix, &shell));
+                }
+                bubble = bubble.child(meta_row);
+
+                if let Some(chips) = self.render_reaction_chips(message, &p, ix, id_prefix, &shell)
+                {
+                    bubble = bubble.child(chips);
+                }
 
                 if let Some(badge) = outbox_status {
                     match badge {
@@ -1164,7 +1522,11 @@ impl PostboxShell {
                                     .text_size(px(label_px))
                                     .text_color(rgb(p.destructive))
                                     .cursor_pointer()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
                                     .on_click(move |_, window, cx| {
+                                        cx.stop_propagation();
                                         shell_retry.update(cx, |this, cx| {
                                             this.vm.retry_failed_message(&retry_id);
                                             this.sync_after_vm_change(window, cx);
@@ -1194,7 +1556,11 @@ impl PostboxShell {
                             .text_size(px(label_px))
                             .text_color(rgb(p.foreground))
                             .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
                             .on_click(move |_, window, cx| {
+                                cx.stop_propagation();
                                 shell_thread.update(cx, |this, cx| {
                                     this.vm.open_thread(&root_id);
                                     this.sync_after_vm_change(window, cx);
@@ -1919,11 +2285,17 @@ impl Render for PostboxShell {
         let mut composer_section = div()
             .id("composer-container")
             .test_support()
-            .key_context(if self.vm.composer_text().is_empty() {
-                "PostboxComposerEmpty"
-            } else {
-                "PostboxComposer"
-            })
+            .key_context(
+                match (
+                    self.vm.composer_text().is_empty(),
+                    self.vm.has_composer_popup(),
+                ) {
+                    (true, true) => "PostboxComposerEmpty PostboxShortcodePopup",
+                    (true, false) => "PostboxComposerEmpty",
+                    (false, true) => "PostboxComposer PostboxShortcodePopup",
+                    (false, false) => "PostboxComposer",
+                },
+            )
             .w_full()
             .max_w(px(CHAT_COLUMN_MAX_WIDTH_PX))
             .mx_auto()
@@ -1948,11 +2320,35 @@ impl Render for PostboxShell {
             );
         }
 
-        composer_section = composer_section.child(
-            Textarea::new(&self.composer)
-                .aria_label("Message composer")
-                .bordered(true),
-        );
+        if let Some(popup) = self.render_composer_popups(&p, cx) {
+            composer_section = composer_section.child(popup);
+        }
+
+        if let Some(strip) = self.render_staged_attachments_strip(&p, cx) {
+            composer_section = composer_section.child(strip);
+        }
+
+        composer_section = composer_section
+            .on_action(cx.listener(|this, _: &PasteImage, window, cx| {
+                let plat = NativePlatform::default();
+                let payload = plat
+                    .read_paste_payload()
+                    .unwrap_or(postbox_platform::ClipboardPayload::Empty);
+                match this.vm.handle_paste_clipboard_payload(payload) {
+                    PasteStageResult::PropagateTextPaste => {
+                        // Let Textarea handle standard text paste cleanly!
+                        cx.propagate();
+                    }
+                    _ => {
+                        this.sync_after_vm_change(window, cx);
+                    }
+                }
+            }))
+            .child(
+                Textarea::new(&self.composer)
+                    .aria_label("Message composer")
+                    .bordered(true),
+            );
 
         let main_column = div()
             .id("chat-main-column")
@@ -1987,6 +2383,10 @@ impl Render for PostboxShell {
             .bg(rgb(p.background))
             .text_color(rgb(p.foreground))
             .font_family(FONT_SANS)
+            .on_drop::<ExternalPaths>(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.vm.stage_dropped_files(paths.paths());
+                this.sync_after_vm_change(window, cx);
+            }))
             .on_modifiers_changed(cx.listener(
                 |this, event: &ModifiersChangedEvent, _window, cx| {
                     let ctrl_only = event.modifiers.control
@@ -2161,6 +2561,51 @@ impl Render for PostboxShell {
             .on_action(cx.listener(|this, _: &FontReset, window, cx| {
                 this.dispatch_vm_action(PbAction::FontReset, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ReactToMessage, window, cx| {
+                this.dispatch_vm_action(PbAction::ReactToMessage, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenImageLightbox, window, cx| {
+                this.dispatch_vm_action(PbAction::OpenImageLightbox, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseLightbox, window, cx| {
+                this.dispatch_vm_action(PbAction::CloseLightbox, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrevLightboxImage, window, cx| {
+                this.dispatch_vm_action(PbAction::PrevLightboxImage, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextLightboxImage, window, cx| {
+                this.dispatch_vm_action(PbAction::NextLightboxImage, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &EmojiMoveUp, window, cx| {
+                this.dispatch_vm_action(PbAction::EmojiMoveUp, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &EmojiMoveDown, window, cx| {
+                this.dispatch_vm_action(PbAction::EmojiMoveDown, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &EmojiMoveLeft, window, cx| {
+                this.dispatch_vm_action(PbAction::EmojiMoveLeft, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &EmojiMoveRight, window, cx| {
+                this.dispatch_vm_action(PbAction::EmojiMoveRight, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &EmojiActivate, window, cx| {
+                this.dispatch_vm_action(PbAction::EmojiActivate, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseEmojiPicker, window, cx| {
+                this.dispatch_vm_action(PbAction::CloseEmojiPicker, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShortcodePrev, window, cx| {
+                this.dispatch_vm_action(PbAction::ShortcodePrev, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShortcodeNext, window, cx| {
+                this.dispatch_vm_action(PbAction::ShortcodeNext, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShortcodeAccept, window, cx| {
+                this.dispatch_vm_action(PbAction::ShortcodeAccept, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseShortcodePopup, window, cx| {
+                this.dispatch_vm_action(PbAction::CloseShortcodePopup, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &MoveViewUp, window, cx| {
                 this.dispatch_vm_action(PbAction::MoveViewUp, window, cx);
             }))
@@ -2175,7 +2620,23 @@ impl Render for PostboxShell {
             root = root.child(thread_panel);
         }
 
-        if self.vm.palette_open() {
+        if let Some(lightbox) = self.render_lightbox_overlay(&p, &self.lightbox_focus, cx) {
+            root = root.child(lightbox);
+        } else if let Some(emoji_picker) = self.render_emoji_picker_overlay(
+            &p,
+            &self.emoji_picker_focus,
+            &self.emoji_search_input,
+            cx,
+        ) {
+            root = root.child(emoji_picker);
+        } else if let Some(giphy_picker) = self.render_giphy_picker_overlay(
+            &p,
+            &self.giphy_picker_focus,
+            &self.giphy_search_input,
+            cx,
+        ) {
+            root = root.child(giphy_picker);
+        } else if self.vm.palette_open() {
             root = root.child(self.render_palette_overlay(&p, cx));
         } else if self.vm.shortcuts_open() {
             root = root.child(self.render_shortcuts_overlay(&p, cx));
@@ -2291,6 +2752,7 @@ mod desktop_tests {
                 media_kind: None,
                 mime_type: None,
                 filename: None,
+                file_size: None,
                 reactions: vec![],
                 read_status: ReadStatus::Read,
                 deleted: false,
@@ -2310,6 +2772,7 @@ mod desktop_tests {
                 media_kind: None,
                 mime_type: None,
                 filename: None,
+                file_size: None,
                 reactions: vec![],
                 read_status: ReadStatus::None,
                 deleted: false,
@@ -2329,6 +2792,7 @@ mod desktop_tests {
                 media_kind: None,
                 mime_type: None,
                 filename: None,
+                file_size: None,
                 reactions: vec![],
                 read_status: ReadStatus::None,
                 deleted: false,
@@ -2345,6 +2809,8 @@ mod desktop_tests {
                 last_event_id: Some(1),
             },
             sync_bridge: None,
+            data_dir: std::env::temp_dir().join("postbox_desktop_test"),
+            giphy_key_available: true,
         }
     }
 
@@ -2721,6 +3187,7 @@ mod desktop_tests {
                 media_kind: None,
                 mime_type: None,
                 filename: None,
+                file_size: None,
                 reactions: vec![],
                 read_status: ReadStatus::Read,
                 deleted: false,
@@ -2831,6 +3298,8 @@ mod desktop_tests {
                 detail: None,
             },
             sync_bridge: None,
+            data_dir: std::env::temp_dir().join("postbox_desktop_test"),
+            giphy_key_available: false,
         };
         let (handle, shell) = open_shell_with_ctx(cx, ctx);
         cx.update_window(handle.into(), |_, window, cx| {
@@ -2942,6 +3411,8 @@ mod desktop_tests {
                 url: "http://127.0.0.1:9999".into(),
             },
             sync_bridge: Some(bridge),
+            data_dir: std::env::temp_dir().join("postbox_desktop_test"),
+            giphy_key_available: false,
         };
         let (handle, shell) = open_shell_with_ctx(cx, ctx);
         cx.update_window(handle.into(), |_, window, cx| {
@@ -2994,5 +3465,775 @@ mod desktop_tests {
                 }
             ));
         });
+    }
+
+    #[gpui_kit::test]
+    fn m3_overlays_reactions_lightbox_mentions_staged_strip_and_giphy_render_cleanly(
+        cx: &mut TestAppContext,
+    ) {
+        let mut ctx = seeded_launch_ctx();
+        let alice_key = ChatKey::new(Provider::Whatsapp, "main", "alice@s.whatsapp.net");
+        ctx.store
+            .upsert_message(&Message {
+                chat: alice_key.clone(),
+                msg_id: "img_m2".into(),
+                sender_id: "alice".into(),
+                sender_name: "Alice".into(),
+                from_me: false,
+                ts: "2025-01-15T12:02:00Z".into(),
+                body: "Photo".into(),
+                reply_to_id: None,
+                reply_broadcast: false,
+                media_kind: Some(postbox_core::MediaKind::Image),
+                mime_type: Some("image/png".into()),
+                filename: Some("photo.png".into()),
+                file_size: Some(2048),
+                reactions: vec![],
+                read_status: ReadStatus::Read,
+                deleted: false,
+            })
+            .unwrap();
+        let (handle, shell) = open_shell_with_ctx(cx, ctx);
+
+        // 1. Ctrl+R opens 8x6 reaction picker overlay and Esc dismisses it
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-r", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("emoji-picker-overlay").is_some());
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("emoji-picker-overlay").is_none());
+        })
+        .unwrap();
+
+        // 2. Lightbox overlay renders with counter and closes on Esc
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                let now = this.now_ms();
+                assert!(this.vm.open_lightbox_for_message("img_m2", now));
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("lightbox-overlay").is_some());
+            assert!(window.try_find("lightbox-counter").is_some());
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("lightbox-overlay").is_none());
+        })
+        .unwrap();
+
+        // 3. Staged attachment chip strip + @mention popup + Giphy picker overlay render cleanly
+        let png = postbox_media::paste::encode_png(64, 48, &vec![200u8; 64 * 48 * 4]).unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                this.vm.handle_paste_clipboard_payload(
+                    postbox_platform::ClipboardPayload::PngBytes(png),
+                );
+                this.vm.set_composer_text("hi @ali");
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("staged-attachments-strip").is_some());
+            assert!(window.try_find("mention-popup").is_some());
+            assert!(shell.read(cx).gpu_vram_bytes() <= postbox_media::VRAM_TEXTURE_BUDGET_BYTES);
+        })
+        .unwrap();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                assert!(this.vm.open_giphy_picker());
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("giphy-picker-overlay").is_some());
+        })
+        .unwrap();
+    }
+
+    fn unique_desktop_test_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("postbox_ui_{tag}_{}_{nanos}", std::process::id()))
+    }
+
+    #[gpui_kit::test]
+    fn startup_auto_downloads_initial_chat_media_via_sync_bridge(cx: &mut TestAppContext) {
+        let data_dir = unique_desktop_test_dir("startup_dl");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let (bridge, worker) = create_sync_bridge();
+        let mut ctx = seeded_launch_ctx();
+        ctx.data_dir = data_dir.clone();
+        ctx.sync_bridge = Some(bridge);
+        let alice_key = ChatKey::new(Provider::Whatsapp, "main", "alice@s.whatsapp.net");
+        ctx.store
+            .upsert_message(&Message {
+                chat: alice_key.clone(),
+                msg_id: "img_m2".into(),
+                sender_id: "alice".into(),
+                sender_name: "Alice".into(),
+                from_me: false,
+                ts: "2025-01-15T12:02:00Z".into(),
+                body: "Photo".into(),
+                reply_to_id: None,
+                reply_broadcast: false,
+                media_kind: Some(postbox_core::MediaKind::Image),
+                mime_type: Some("image/png".into()),
+                filename: Some("photo.png".into()),
+                file_size: Some(2048),
+                reactions: vec![],
+                read_status: ReadStatus::Read,
+                deleted: false,
+            })
+            .unwrap();
+
+        let (_handle, _shell) = open_shell_with_ctx(cx, ctx);
+
+        let mut cmds = Vec::new();
+        while let Ok(cmd) = worker.cmd_rx.try_recv() {
+            cmds.push(cmd);
+        }
+        assert!(
+            cmds.iter().any(|c| matches!(
+                c,
+                SyncCommand::DownloadChatMedia { chat, items }
+                    if chat == &alice_key && items.iter().any(|i| i.msg_id == "img_m2")
+            )),
+            "expected startup DownloadChatMedia for img_m2, got {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, SyncCommand::FetchAvatar { chat } if chat == &alice_key)),
+            "expected startup FetchAvatar for Alice, got {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, SyncCommand::FetchWorkspaceIcon { team } if team == "T1")),
+            "expected startup FetchWorkspaceIcon for Slack T1, got {cmds:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[gpui_kit::test]
+    fn off_ui_thread_decode_loads_inline_media_avatar_workspace_icon_slack_emoji_and_unfurl_thumb(
+        cx: &mut TestAppContext,
+    ) {
+        let data_dir = unique_desktop_test_dir("async_decode");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let png_bytes =
+            postbox_media::paste::encode_png(32, 32, &vec![180u8; 32 * 32 * 4]).unwrap();
+        let inline_path = data_dir.join("inline.png");
+        let avatar_path = data_dir.join("avatar.png");
+        let ws_icon_path = data_dir.join("ws.png");
+        let emoji_path = data_dir.join("shipit.png");
+        let unfurl_path = data_dir.join("unfurl.png");
+        for p in [
+            &inline_path,
+            &avatar_path,
+            &ws_icon_path,
+            &emoji_path,
+            &unfurl_path,
+        ] {
+            std::fs::write(p, &png_bytes).unwrap();
+        }
+
+        let mut ctx = seeded_launch_ctx();
+        ctx.data_dir = data_dir.clone();
+        let alice_key = ChatKey::new(Provider::Whatsapp, "main", "alice@s.whatsapp.net");
+        let bob_key = ChatKey::new(Provider::Slack, "T1", "slack:T1:C-bob");
+        ctx.store
+            .upsert_message(&Message {
+                chat: alice_key.clone(),
+                msg_id: "img_m2".into(),
+                sender_id: "alice".into(),
+                sender_name: "Alice".into(),
+                from_me: false,
+                ts: "2025-01-15T12:02:00Z".into(),
+                body: "Check https://example.com/guide".into(),
+                reply_to_id: None,
+                reply_broadcast: false,
+                media_kind: Some(postbox_core::MediaKind::Image),
+                mime_type: Some("image/png".into()),
+                filename: Some("photo.png".into()),
+                file_size: Some(2048),
+                reactions: vec![],
+                read_status: ReadStatus::Read,
+                deleted: false,
+            })
+            .unwrap();
+        ctx.store
+            .upsert_message(&Message {
+                chat: alice_key.clone(),
+                msg_id: "link_m3".into(),
+                sender_id: "alice".into(),
+                sender_name: "Alice".into(),
+                from_me: false,
+                ts: "2025-01-15T12:03:00Z".into(),
+                body: "Read https://example.com/guide".into(),
+                reply_to_id: None,
+                reply_broadcast: false,
+                media_kind: None,
+                mime_type: None,
+                filename: None,
+                file_size: None,
+                reactions: vec![],
+                read_status: ReadStatus::Read,
+                deleted: false,
+            })
+            .unwrap();
+        ctx.store
+            .upsert_message(&Message {
+                chat: bob_key.clone(),
+                msg_id: "1700.3".into(),
+                sender_id: "U1".into(),
+                sender_name: "Bob".into(),
+                from_me: false,
+                ts: "2025-01-15T11:02:00Z".into(),
+                body: "Übung :shipit: ready!".into(),
+                reply_to_id: None,
+                reply_broadcast: false,
+                media_kind: None,
+                mime_type: None,
+                filename: None,
+                file_size: None,
+                reactions: vec![],
+                read_status: ReadStatus::None,
+                deleted: false,
+            })
+            .unwrap();
+
+        let (handle, shell) = open_shell_with_ctx(cx, ctx);
+        let cls = postbox_media::unfurl::classify_url("https://example.com/guide").unwrap();
+
+        // Deliver MediaDownloaded, AvatarReady, WorkspaceIconReady, UnfurlReady
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                this.vm.apply_sync_event(SyncEvent::MediaDownloaded {
+                    chat: alice_key.clone(),
+                    msg_id: "img_m2".into(),
+                    path: inline_path.clone(),
+                    mime_type: "image/png".into(),
+                });
+                this.vm.apply_sync_event(SyncEvent::AvatarReady {
+                    chat: alice_key.clone(),
+                    path: Some(avatar_path.clone()),
+                });
+                this.vm.apply_sync_event(SyncEvent::WorkspaceIconReady {
+                    team: "T1".into(),
+                    path: Some(ws_icon_path.clone()),
+                });
+                this.vm.apply_sync_event(SyncEvent::UnfurlReady {
+                    target: cls.clone(),
+                    card: Some(postbox_media::unfurl::UnfurlCard {
+                        provider: postbox_media::unfurl::UnfurlProvider::Page,
+                        id: cls.id.clone(),
+                        canonical: cls.canonical.clone(),
+                        site: "example.com".into(),
+                        title: "Guide".into(),
+                        author: "example.com".into(),
+                        description: "Docs".into(),
+                        play_url: None,
+                        thumb_path: Some(unfurl_path.clone()),
+                    }),
+                });
+                this.sync_after_vm_change(window, cx);
+                // Decode jobs MUST be queued off-UI-thread (in_flight > 0 immediately before parking!)
+                assert!(
+                    this.gpu_textures.in_flight_count() > 0,
+                    "expected off-UI-thread decode jobs in flight"
+                );
+            });
+        })
+        .unwrap();
+
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("chat-avatar-img-0").is_some(),
+                "expected circular chat avatar image rendered"
+            );
+            assert!(
+                window.try_find("view-tab-icon-3").is_some(),
+                "expected Slack workspace icon rendered in view rail"
+            );
+            assert!(
+                window.try_find("msg-media-2").is_some(),
+                "expected decoded inline message image rendered"
+            );
+            assert!(
+                window.try_find("msg-unfurl-thumb-3").is_some(),
+                "expected decoded unfurl card thumbnail rendered"
+            );
+            assert!(shell.read(cx).gpu_vram_bytes() <= postbox_media::VRAM_TEXTURE_BUDGET_BYTES);
+        })
+        .unwrap();
+
+        // Switch to Slack chat Bob and deliver Slack custom emoji index + image
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                assert!(this.vm.select_chat_key(&bob_key));
+                let idx = postbox_media::avatar::SlackEmojiIndex {
+                    team: "T1".into(),
+                    fetched_at: 1000,
+                    entries: std::collections::HashMap::from([(
+                        "shipit".into(),
+                        "https://cdn.example.invalid/shipit.png".into(),
+                    )]),
+                };
+                this.vm.apply_sync_event(SyncEvent::SlackEmojiIndexReady {
+                    team: "T1".into(),
+                    index: idx,
+                });
+                this.vm.apply_sync_event(SyncEvent::SlackEmojiMediaReady {
+                    team: "T1".into(),
+                    name: "shipit".into(),
+                    path: emoji_path.clone(),
+                });
+                this.sync_after_vm_change(window, cx);
+            });
+        })
+        .unwrap();
+
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            // Find any rendered Slack custom emoji element across the message rows
+            let found_emoji = (0..6).any(|row| {
+                window
+                    .try_find(SharedString::from(format!("msg-slack-emoji-{row}-0")))
+                    .is_some()
+            });
+            assert!(
+                found_emoji,
+                "expected inline Slack custom emoji image rendered"
+            );
+        })
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[gpui_kit::test]
+    fn emoji_picker_keyboard_navigation_and_stale_query_clear_from_ctrl_r_and_palette(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, shell) = open_shell_with_ctx(cx, seeded_launch_ctx());
+
+        // 1. Open via Ctrl+R, set query to "fire", close with Escape
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-r", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                this.emoji_search_input
+                    .update(cx, |inp, cx| inp.set_value("fire", window, cx));
+            });
+            window.render_frame(cx);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        // 2. Reopen via Ctrl+R -> stale query MUST be cleared!
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.press("ctrl-r", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                shell.read(cx).emoji_search_input.read(cx).value().as_ref(),
+                ""
+            );
+            // Arrow navigation while emoji_search_input is focused MUST override Input bindings!
+            window.press("down", cx);
+            window.press("right", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            let sel = shell.read(cx).vm.emoji_picker().unwrap().selected;
+            assert_eq!(sel, 9, "down (+8) + right (+1) must select index 9");
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(shell.read(cx).vm.emoji_picker().is_none());
+            assert!(
+                !shell.read(cx).vm.messages()[0].reactions.is_empty(),
+                "Enter must activate selected emoji reaction"
+            );
+        })
+        .unwrap();
+
+        // 3. Open via Ctrl+K palette ("Insert emoji") after dirtying input -> MUST also clear!
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                this.emoji_search_input
+                    .update(cx, |inp, cx| inp.set_value("stale", window, cx));
+                assert!(this.vm.open_insert_emoji_picker());
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(
+                shell.read(cx).emoji_search_input.read(cx).value().as_ref(),
+                ""
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn giphy_picker_keyboard_navigation_window_scroll_and_escape(cx: &mut TestAppContext) {
+        let mut ctx = seeded_launch_ctx();
+        ctx.giphy_key_available = true;
+        let (handle, shell) = open_shell_with_ctx(cx, ctx);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                this.giphy_search_input
+                    .update(cx, |inp, cx| inp.set_value("stale", window, cx));
+                assert!(this.vm.open_giphy_picker());
+                let gen_id = this.vm.giphy_picker().generation;
+                let target = this.vm.giphy_picker().target.clone().unwrap();
+                let items: Vec<postbox_media::giphy::GiphyItem> = (0..20)
+                    .map(|i| postbox_media::giphy::GiphyItem {
+                        id: format!("Gif{i}"),
+                        title: format!("Title {i}"),
+                        preview: postbox_media::giphy::GiphyRendition {
+                            url: format!("https://media1.giphy.com/media/Gif{i}/200w.gif"),
+                            width: 200,
+                            height: 150,
+                            size: 1000,
+                        },
+                        original: postbox_media::giphy::GiphyRendition {
+                            url: format!("https://media1.giphy.com/media/Gif{i}/giphy.gif"),
+                            width: 400,
+                            height: 300,
+                            size: 2000,
+                        },
+                    })
+                    .collect();
+                this.vm.apply_sync_event(SyncEvent::GiphyResults {
+                    generation: gen_id,
+                    target,
+                    page: Some(postbox_media::giphy::GiphyPage {
+                        items,
+                        total_count: 20,
+                        offset: 0,
+                    }),
+                    error: None,
+                });
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            assert_eq!(
+                shell.read(cx).giphy_search_input.read(cx).value().as_ref(),
+                ""
+            );
+            // Navigate while giphy_search_input has focus: right (1), down x3 (5, 9, 13 -> row 3!)
+            window.press("right", cx);
+            window.press("down", cx);
+            window.press("down", cx);
+            window.press("down", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(shell.read(cx).vm.giphy_picker().selected, 13);
+            assert!(
+                window.try_find("giphy-tile-13").is_some(),
+                "visible_slice window must scroll to render giphy-tile-13"
+            );
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("giphy-picker-overlay").is_none());
+            assert!(!shell.read(cx).vm.giphy_picker().is_open());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn composer_mention_and_shortcode_popup_arrow_tab_escape_override_input(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, shell) = open_shell_with_ctx(cx, seeded_launch_ctx());
+
+        // 1. Mention popup: Tab accepts mention instead of inserting a literal tab character
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                this.vm.set_focus(FocusTarget::Composer);
+                this.vm.set_composer_text("hi @ali");
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("mention-popup").is_some());
+            window.press("down", cx);
+            window.press("tab", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("mention-popup").is_none());
+            let txt = shell.read(cx).vm.composer_text().to_owned();
+            assert!(!txt.contains('\t'), "Tab must accept popup, not insert \\t");
+            assert!(
+                txt.contains("@alice"),
+                "expected accepted mention, got {txt:?}"
+            );
+        })
+        .unwrap();
+
+        // 2. Shortcode popup: Escape closes popup cleanly without blurring composer
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                this.vm.set_composer_text("wow :thu");
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("shortcode-popup").is_some());
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("shortcode-popup").is_none());
+            assert_eq!(shell.read(cx).vm.focus(), FocusTarget::Composer);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn wa_received_bubble_double_click_toggles_thumbs_up_and_chip_click_stops_propagation(
+        cx: &mut TestAppContext,
+    ) {
+        let (bridge, worker) = create_sync_bridge();
+        let mut ctx = seeded_launch_ctx();
+        ctx.sync_bridge = Some(bridge);
+        let (handle, shell) = open_shell_with_ctx(cx, ctx);
+        // Drain startup commands
+        while worker.cmd_rx.try_recv().is_ok() {}
+
+        // Timeline row 0 is DateSeparator, row 1 is Alice's received WhatsApp message (`msg-bubble-1`)
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("msg-bubble-1").is_some());
+            window.double_click("msg-bubble-1", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let msg = &shell.read(cx).vm.messages()[0];
+            assert_eq!(msg.reactions.len(), 1);
+            assert_eq!(msg.reactions[0].emoji, "👍");
+            assert!(window.try_find("msg-react-1-0").is_some());
+        })
+        .unwrap();
+
+        let mut saw_add = false;
+        while let Ok(cmd) = worker.cmd_rx.try_recv() {
+            if matches!(cmd, SyncCommand::ReactToMessage { ref emoji, .. } if emoji == "👍") {
+                saw_add = true;
+            }
+        }
+        assert!(saw_add, "double-click must emit ReactToMessage 👍");
+
+        // Double-click again -> removes 👍
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.double_click("msg-bubble-1", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let mut saw_remove = false;
+        while let Ok(cmd) = worker.cmd_rx.try_recv() {
+            if matches!(cmd, SyncCommand::ReactToMessage { ref emoji, .. } if emoji.is_empty()) {
+                saw_remove = true;
+            }
+        }
+        assert!(saw_remove, "second double-click must emit removal");
+
+        // Re-add a non-thumbs-up reaction (🔥) and double-click the chip: stop_propagation must
+        // keep bubble 👍 toggle from firing!
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                let chat = this.vm.selected_chat().unwrap().key.clone();
+                this.vm.react_to_message_with_chip(&chat, "m1", "🔥", false);
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+        })
+        .unwrap();
+        while worker.cmd_rx.try_recv().is_ok() {}
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(window.try_find("msg-react-1-0").is_some());
+            window.double_click("msg-react-1-0", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let mut saw_thumbs_up_leak = false;
+        while let Ok(cmd) = worker.cmd_rx.try_recv() {
+            if matches!(cmd, SyncCommand::ReactToMessage { ref emoji, .. } if emoji == "👍") {
+                saw_thumbs_up_leak = true;
+            }
+        }
+        assert!(
+            !saw_thumbs_up_leak,
+            "clicking/double-clicking a reaction chip must stop propagation to bubble 👍 toggle"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn reaction_retry_timer_fires_at_3s_10s_30s_and_parks_at_zero_when_idle(
+        cx: &mut TestAppContext,
+    ) {
+        let (bridge, worker) = create_sync_bridge();
+        let mut ctx = seeded_launch_ctx();
+        ctx.sync_bridge = Some(bridge);
+        let alice_key = ChatKey::new(Provider::Whatsapp, "main", "alice@s.whatsapp.net");
+        let (handle, shell) = open_shell_with_ctx(cx, ctx);
+        while worker.cmd_rx.try_recv().is_ok() {}
+
+        // Trigger reaction and record initial client_id
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                assert!(
+                    this.vm
+                        .react_to_message_with_chip(&alice_key, "m1", "👍", false)
+                );
+                this.sync_after_vm_change(window, cx);
+            });
+        })
+        .unwrap();
+        let initial_client_id = match worker.cmd_rx.try_recv().unwrap() {
+            SyncCommand::ReactToMessage { client_id, .. } => client_id,
+            other => panic!("expected ReactToMessage, got {other:?}"),
+        };
+
+        // Deliver transient 503 failure -> arms one-shot 3s GPUI retry timer
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                this.vm.apply_sync_event(SyncEvent::ReactionSettled {
+                    chat: alice_key.clone(),
+                    msg_id: "m1".into(),
+                    emoji: "👍".into(),
+                    ok: false,
+                    http_status: Some(503),
+                });
+                this.sync_after_vm_change(window, cx);
+                assert!(
+                    this.reaction_retry_task.is_some(),
+                    "transient reaction failure must arm on-demand retry timer"
+                );
+            });
+        })
+        .unwrap();
+
+        // Advance GPUI fake clock by 3s -> timer fires and retries with exact same client_id!
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_secs(3));
+        cx.run_until_parked();
+
+        let retry_client_id = match worker.cmd_rx.try_recv().unwrap() {
+            SyncCommand::ReactToMessage { client_id, .. } => client_id,
+            other => panic!("expected retry ReactToMessage, got {other:?}"),
+        };
+        assert_eq!(retry_client_id, initial_client_id);
+
+        // Confirm reaction -> timer parks at None (0% idle CPU!)
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                this.vm.apply_sync_event(SyncEvent::ReactionSettled {
+                    chat: alice_key.clone(),
+                    msg_id: "m1".into(),
+                    emoji: "👍".into(),
+                    ok: true,
+                    http_status: Some(200),
+                });
+                this.sync_after_vm_change(window, cx);
+                assert!(
+                    this.reaction_retry_task.is_none(),
+                    "idle reaction queue must park timer at None (0% idle CPU)"
+                );
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn drag_and_drop_external_paths_stages_file_in_composer(cx: &mut TestAppContext) {
+        let data_dir = unique_desktop_test_dir("dnd");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let png_path = data_dir.join("dropped.png");
+        let png_bytes =
+            postbox_media::paste::encode_png(48, 48, &vec![120u8; 48 * 48 * 4]).unwrap();
+        std::fs::write(&png_path, &png_bytes).unwrap();
+
+        let mut ctx = seeded_launch_ctx();
+        ctx.data_dir = data_dir.clone();
+        let (handle, shell) = open_shell_with_ctx(cx, ctx);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let pos = Point::new(px(400.0), px(400.0));
+            let _ = window.dispatch_event(
+                gpui_kit::PlatformInput::FileDrop(gpui_kit::FileDropEvent::Entered {
+                    position: pos,
+                    paths: ExternalPaths(smallvec::smallvec![png_path.clone()]),
+                }),
+                cx,
+            );
+            let _ = window.dispatch_event(
+                gpui_kit::PlatformInput::FileDrop(gpui_kit::FileDropEvent::Submit {
+                    position: pos,
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(shell.read(cx).vm.staged_attachments().len(), 1);
+            assert!(
+                window.try_find("staged-attachments-strip").is_some(),
+                "drag-and-drop must render staged-attachments-strip"
+            );
+        })
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

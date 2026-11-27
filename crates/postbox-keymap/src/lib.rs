@@ -19,6 +19,7 @@ pub enum KeyContext {
     Dictating,
     VoiceRecording,
     ShortcodePopup,
+    GiphyPicker,
 }
 
 impl KeyContext {
@@ -37,6 +38,7 @@ impl KeyContext {
             Self::Dictating => "PostboxDictating",
             Self::VoiceRecording => "PostboxVoiceRecording",
             Self::ShortcodePopup => "PostboxShortcodePopup",
+            Self::GiphyPicker => "PostboxGiphyPicker",
         }
     }
 }
@@ -410,6 +412,42 @@ impl Keymap {
                 "Paste a copied image to send",
             ),
             b(
+                KeyContext::Composer,
+                "ctrl-shift-v",
+                Action::PasteImage,
+                "Paste a copied image to send",
+            ),
+            b(
+                KeyContext::Composer,
+                "shift-insert",
+                Action::PasteImage,
+                "Paste a copied image to send",
+            ),
+            b(
+                KeyContext::ComposerEmpty,
+                "ctrl-v",
+                Action::PasteImage,
+                "Paste a copied image into an empty composer",
+            ),
+            b(
+                KeyContext::ComposerEmpty,
+                "ctrl-shift-v",
+                Action::PasteImage,
+                "Paste a copied image into an empty composer",
+            ),
+            b(
+                KeyContext::ComposerEmpty,
+                "shift-insert",
+                Action::PasteImage,
+                "Paste a copied image into an empty composer",
+            ),
+            b(
+                KeyContext::MessageList,
+                "enter",
+                Action::OpenImageLightbox,
+                "Open selected image in lightbox",
+            ),
+            b(
                 KeyContext::ComposerEmpty,
                 "up",
                 Action::PrevMessage,
@@ -540,6 +578,42 @@ impl Keymap {
                 "escape",
                 Action::CloseEmojiPicker,
                 "Close emoji picker",
+            ),
+            b(
+                KeyContext::GiphyPicker,
+                "up",
+                Action::EmojiMoveUp,
+                "Move GIF selection up",
+            ),
+            b(
+                KeyContext::GiphyPicker,
+                "down",
+                Action::EmojiMoveDown,
+                "Move GIF selection down",
+            ),
+            b(
+                KeyContext::GiphyPicker,
+                "left",
+                Action::EmojiMoveLeft,
+                "Move GIF selection left",
+            ),
+            b(
+                KeyContext::GiphyPicker,
+                "right",
+                Action::EmojiMoveRight,
+                "Move GIF selection right",
+            ),
+            b(
+                KeyContext::GiphyPicker,
+                "enter",
+                Action::EmojiActivate,
+                "Search or select highlighted GIF",
+            ),
+            b(
+                KeyContext::GiphyPicker,
+                "escape",
+                Action::CloseEmojiPicker,
+                "Close GIPHY picker",
             ),
             b(
                 KeyContext::ThreadPanel,

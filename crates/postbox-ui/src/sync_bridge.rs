@@ -104,6 +104,23 @@ impl HubConnectionStatus {
     }
 }
 
+use postbox_core::MediaKind;
+use postbox_media::avatar::SlackEmojiIndex;
+use postbox_media::drain::MediaItemStatus;
+use postbox_media::giphy::{GiphyPage, GiphyTarget};
+use postbox_media::unfurl::{ClassifiedUrl, UnfurlCard};
+use std::path::PathBuf;
+
+/// Descriptor for a single downloadable media item queued from an open chat (newest-first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaDownloadTarget {
+    pub msg_id: String,
+    pub filename: Option<String>,
+    pub mime_type: Option<String>,
+    pub media_kind: Option<MediaKind>,
+    pub file_size: Option<u64>,
+}
+
 /// Commands pushed from UI (`PostboxViewModel`) to the background Tokio Hub sync engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncCommand {
@@ -128,6 +145,57 @@ pub enum SyncCommand {
         msg_id: String,
         client_id: String,
     },
+    // --- Milestone 3 commands ---
+    /// Auto-downloads all eligible media (`<= 100 MiB`) in an opened chat newest-first.
+    DownloadChatMedia {
+        chat: ChatKey,
+        items: Vec<MediaDownloadTarget>,
+    },
+    /// User-triggered explicit download (for `> 100 MiB`, retry, or lightbox on-demand).
+    DownloadMediaExplicit {
+        chat: ChatKey,
+        target: MediaDownloadTarget,
+    },
+    FetchAvatar {
+        chat: ChatKey,
+    },
+    FetchWorkspaceIcon {
+        team: String,
+    },
+    EnsureSlackEmojiIndex {
+        team: String,
+    },
+    FetchSlackEmojiMedia {
+        team: String,
+        name: String,
+        url: String,
+    },
+    ReactToMessage {
+        chat: ChatKey,
+        msg_id: String,
+        emoji: String,
+        client_id: String,
+    },
+    UnfurlUrl {
+        target: ClassifiedUrl,
+    },
+    SearchGiphy {
+        query: String,
+        offset: u32,
+        generation: u64,
+        target: GiphyTarget,
+    },
+    DownloadGiphyGif {
+        gif_id: String,
+        url: String,
+        index: usize,
+        generation: u64,
+        download_generation: u64,
+        target: GiphyTarget,
+    },
+    CancelGiphy {
+        generation: u64,
+    },
     Shutdown,
 }
 
@@ -147,6 +215,71 @@ pub enum SyncEvent {
         chat: ChatKey,
         notice: Option<String>,
     },
+    // --- Milestone 3 events ---
+    MediaDownloaded {
+        chat: ChatKey,
+        msg_id: String,
+        path: PathBuf,
+        mime_type: String,
+    },
+    MediaStatusChanged {
+        chat: ChatKey,
+        msg_id: String,
+        status: MediaItemStatus,
+    },
+    AvatarReady {
+        chat: ChatKey,
+        path: Option<PathBuf>,
+    },
+    WorkspaceIconReady {
+        team: String,
+        path: Option<PathBuf>,
+    },
+    SlackEmojiIndexReady {
+        team: String,
+        index: SlackEmojiIndex,
+    },
+    SlackEmojiMediaReady {
+        team: String,
+        name: String,
+        path: PathBuf,
+    },
+    ReactionSettled {
+        chat: ChatKey,
+        msg_id: String,
+        emoji: String,
+        ok: bool,
+        http_status: Option<u16>,
+    },
+    UnfurlReady {
+        target: ClassifiedUrl,
+        card: Option<UnfurlCard>,
+    },
+    GiphyResults {
+        generation: u64,
+        target: GiphyTarget,
+        page: Option<GiphyPage>,
+        error: Option<String>,
+    },
+    GiphyPreviewReady {
+        generation: u64,
+        index: usize,
+        path: PathBuf,
+    },
+    GiphyDownloadReady {
+        generation: u64,
+        download_generation: u64,
+        target: GiphyTarget,
+        index: usize,
+        gif_id: String,
+        bytes: Vec<u8>,
+    },
+    GiphyError {
+        generation: u64,
+        index: usize,
+        download_generation: u64,
+        message: String,
+    },
     Notice(String),
 }
 
@@ -164,8 +297,8 @@ pub struct SyncWorkerHandle {
 }
 
 pub fn create_sync_bridge() -> (SyncBridge, SyncWorkerHandle) {
-    let (cmd_tx, cmd_rx) = async_channel::bounded(128);
-    let (event_tx, event_rx) = async_channel::bounded(256);
+    let (cmd_tx, cmd_rx) = async_channel::bounded(256);
+    let (event_tx, event_rx) = async_channel::bounded(512);
     (
         SyncBridge { cmd_tx, event_rx },
         SyncWorkerHandle { cmd_rx, event_tx },

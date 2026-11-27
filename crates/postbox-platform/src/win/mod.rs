@@ -1,10 +1,14 @@
 //! Windows-native platform implementations strictly quarantined under `#[cfg(windows)]`.
 
+pub mod clipboard;
 pub mod dpapi;
 pub mod registry;
+pub mod shell;
 
+use crate::clipboard::{ClipboardBackend, ClipboardPayload, ZoneMarker, mark_downloaded_file_zone};
 use crate::{EnvRegistry, Notifier, PlatformError, SecretLoad, SecretLoadOutcome, SecretStore};
 use postbox_core::ChatKey;
+use std::path::Path;
 
 #[derive(Debug, Default)]
 pub struct WindowsPlatform;
@@ -54,5 +58,17 @@ impl Notifier for WindowsPlatform {
     ) -> Result<(), PlatformError> {
         // WinRT Toast XML implementation lands in Milestone 7.
         Ok(())
+    }
+}
+
+impl ClipboardBackend for WindowsPlatform {
+    fn read_paste_payload(&self) -> Result<ClipboardPayload, PlatformError> {
+        clipboard::read_clipboard_payload()
+    }
+}
+
+impl ZoneMarker for WindowsPlatform {
+    fn mark_downloaded_file(&self, path: &Path) -> Result<bool, PlatformError> {
+        mark_downloaded_file_zone(path)
     }
 }

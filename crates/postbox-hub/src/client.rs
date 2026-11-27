@@ -9,7 +9,7 @@ use crate::request::{
 };
 use crate::types::{
     ArchiveBatchItemResult, ArchiveOutcome, Endpoint, HubChat, HubMessage, HubRequest,
-    MediaFetchState, SendFileRequest, SendReply,
+    MediaFetchDetailed, MediaFetchState, SendFileRequest, SendReply,
 };
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue};
@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REST_TIMEOUT: Duration = Duration::from_secs(30);
+/// 150s stall timeout for up-to-100 MiB Hub media downloads (`media_drain.zig:179-183`).
+pub const HUB_MEDIA_TIMEOUT: Duration = Duration::from_secs(150);
 pub const DEFAULT_MEDIA_POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_MEDIA_POLL_MAX_WAIT: Duration = Duration::from_secs(120);
 
@@ -99,11 +101,12 @@ impl HubClient {
         Ok(out)
     }
 
-    async fn execute_rest(
+    async fn execute_rest_detailed(
         &self,
         req: &HubRequest,
         max_bytes: usize,
-    ) -> Result<(u16, Vec<u8>), HubError> {
+        timeout: Option<Duration>,
+    ) -> Result<(u16, Option<String>, Vec<u8>), HubError> {
         let url = self.endpoint.url_for(&req.path);
         let method = match req.method {
             "GET" => reqwest::Method::GET,
@@ -117,6 +120,10 @@ impl HubClient {
             .header(AUTHORIZATION, self.auth_header.clone())
             .header(ACCEPT, "*/*");
 
+        if let Some(t) = timeout {
+            builder = builder.timeout(t);
+        }
+
         if let Some(body) = &req.body {
             builder = builder
                 .header(CONTENT_TYPE, "application/json; charset=utf-8")
@@ -128,7 +135,22 @@ impl HubClient {
             .await
             .map_err(|e| HubError::Transport(e.to_string()))?;
         let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.split(';').next().unwrap_or(s).trim().to_owned())
+            .filter(|s| !s.is_empty());
         let bytes = Self::read_capped_bytes(resp, max_bytes).await?;
+        Ok((status, content_type, bytes))
+    }
+
+    async fn execute_rest(
+        &self,
+        req: &HubRequest,
+        max_bytes: usize,
+    ) -> Result<(u16, Vec<u8>), HubError> {
+        let (status, _ct, bytes) = self.execute_rest_detailed(req, max_bytes, None).await?;
         Ok((status, bytes))
     }
 
@@ -317,7 +339,30 @@ impl HubClient {
     ) -> Result<SendReply, HubError> {
         let req = react_request(chat, msg_id, emoji, client_id)?;
         let (status, bytes) = self.execute_rest(&req, MAX_DOWNLOAD_BYTES).await?;
-        Self::parse_send_reply(status, &bytes, client_id)
+        if !(200..300).contains(&status) {
+            return Err(HubError::HttpStatus {
+                status,
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+        if let Ok(reply) = Self::parse_send_reply(status, &bytes, client_id) {
+            return Ok(reply);
+        }
+        // Accept minimal `200 OK` `{"ok": true}` or empty body responses cleanly.
+        if bytes.is_empty()
+            || serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| v.get("ok").and_then(serde_json::Value::as_bool))
+                == Some(true)
+        {
+            return Ok(SendReply {
+                client_id: client_id.to_owned(),
+                msg_id: msg_id.to_owned(),
+                ts: String::new(),
+                status: "sent".to_owned(),
+            });
+        }
+        Err(HubError::SendNotConfirmed)
     }
 
     pub async fn delete_message(
@@ -338,24 +383,69 @@ impl HubClient {
         }
     }
 
+    /// Single-attempt media download returning both state and response `Content-Type`, using
+    /// the 150-second Hub media stall timeout (`200` ready, `202` pending, `206` REJECTED
+    /// `PartialMedia`, `404` unavailable, `410` permanently gone).
+    pub async fn fetch_media_detailed_once(
+        &self,
+        chat: &str,
+        msg_id: &str,
+    ) -> Result<MediaFetchDetailed, HubError> {
+        let req = media_request(chat, Some(msg_id))?;
+        let (status, content_type, bytes) = self
+            .execute_rest_detailed(&req, MAX_DOWNLOAD_BYTES, Some(HUB_MEDIA_TIMEOUT))
+            .await?;
+        let state = match status {
+            200 => MediaFetchState::Ready(bytes),
+            202 => MediaFetchState::Pending,
+            206 => return Err(HubError::PartialMedia),
+            404 => MediaFetchState::Unavailable,
+            410 => MediaFetchState::Gone,
+            other => {
+                return Err(HubError::HttpStatus {
+                    status: other,
+                    body: String::from_utf8_lossy(&bytes).into_owned(),
+                });
+            }
+        };
+        Ok(MediaFetchDetailed {
+            state,
+            content_type,
+        })
+    }
+
     /// Single-attempt media download (`200` ready, `202` pending, `206` REJECTED `PartialMedia`,
-    /// `404`/`410` unavailable).
+    /// `404` unavailable, `410` permanently gone).
     pub async fn fetch_media_once(
         &self,
         chat: &str,
         msg_id: &str,
     ) -> Result<MediaFetchState, HubError> {
-        let req = media_request(chat, Some(msg_id))?;
-        let (status, bytes) = self.execute_rest(&req, MAX_DOWNLOAD_BYTES).await?;
-        match status {
-            200 => Ok(MediaFetchState::Ready(bytes)),
-            202 => Ok(MediaFetchState::Pending),
-            206 => Err(HubError::PartialMedia),
-            404 | 410 => Ok(MediaFetchState::Unavailable),
-            other => Err(HubError::HttpStatus {
-                status: other,
-                body: String::from_utf8_lossy(&bytes).into_owned(),
-            }),
+        Ok(self.fetch_media_detailed_once(chat, msg_id).await?.state)
+    }
+
+    /// Polls `202 Pending` every `poll_interval` (default `1s`) up to `max_wait` (default `120s`),
+    /// returning both state and `Content-Type`.
+    pub async fn fetch_media_detailed_polling(
+        &self,
+        chat: &str,
+        msg_id: &str,
+        poll_interval: Duration,
+        max_wait: Duration,
+    ) -> Result<MediaFetchDetailed, HubError> {
+        let start = Instant::now();
+        loop {
+            let detailed = self.fetch_media_detailed_once(chat, msg_id).await?;
+            match detailed.state {
+                MediaFetchState::Pending => {
+                    if start.elapsed() >= max_wait {
+                        return Ok(detailed);
+                    }
+                    let remaining = max_wait.saturating_sub(start.elapsed());
+                    tokio::time::sleep(poll_interval.min(remaining)).await;
+                }
+                _ => return Ok(detailed),
+            }
         }
     }
 
@@ -367,19 +457,10 @@ impl HubClient {
         poll_interval: Duration,
         max_wait: Duration,
     ) -> Result<MediaFetchState, HubError> {
-        let start = Instant::now();
-        loop {
-            match self.fetch_media_once(chat, msg_id).await? {
-                MediaFetchState::Pending => {
-                    if start.elapsed() >= max_wait {
-                        return Ok(MediaFetchState::Pending);
-                    }
-                    let remaining = max_wait.saturating_sub(start.elapsed());
-                    tokio::time::sleep(poll_interval.min(remaining)).await;
-                }
-                other => return Ok(other),
-            }
-        }
+        Ok(self
+            .fetch_media_detailed_polling(chat, msg_id, poll_interval, max_wait)
+            .await?
+            .state)
     }
 
     pub async fn fetch_avatar(&self, chat: &str) -> Result<Option<Vec<u8>>, HubError> {

@@ -9,12 +9,16 @@ workspace = true
 
 [features]
 default = []
-desktop = ["dep:gpui-kit"]
+desktop = ["dep:gpui-kit", "dep:image", "dep:smallvec"]
 desktop-test = ["desktop", "gpui-kit/test-support"]
 
 [dependencies]
 async-channel.workspace = true
 gpui-kit = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
 postbox-core.workspace = true
 postbox-keymap.workspace = true
+postbox-media.workspace = true
+postbox-platform.workspace = true
 postbox-store.workspace = true
+smallvec = { workspace = true, optional = true }

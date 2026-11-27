@@ -7,7 +7,10 @@ mod sync;
 
 use postbox_hub::Endpoint;
 use postbox_keymap::Keymap;
-use postbox_platform::{HubDiscoveryOutcome, NativePlatform, discover_hub_credentials_from_system};
+use postbox_platform::{
+    GiphyKeyOutcome, HubDiscoveryOutcome, NativePlatform, discover_giphy_api_key_from_system,
+    discover_hub_credentials_from_system,
+};
 use postbox_store::Store;
 use postbox_ui::{HubConnectionStatus, PostboxLaunchContext, create_sync_bridge};
 use std::path::{Path, PathBuf};
@@ -128,9 +131,15 @@ fn build_launch_context(
     let keymap = load_keymap(cfg, &data_dir);
 
     // Feature #42: Auto-discover Hub URL & Bearer token on startup (HKCU\Environment -> env -> DPAPI HubToken).
+    // Feature #26: Auto-discover GIPHY_API_KEY -> DPAPI GiphyApiKey.
     let platform = NativePlatform::default();
     let discovery =
         discover_hub_credentials_from_system(cfg.hub_url.as_deref(), &platform, &platform);
+    let giphy_api_key = match discover_giphy_api_key_from_system(&platform, &platform) {
+        GiphyKeyOutcome::Ready(key) => Some(key),
+        GiphyKeyOutcome::Missing | GiphyKeyOutcome::Error(_) => None,
+    };
+    let giphy_key_available = giphy_api_key.is_some();
 
     let (hub_status, sync_bridge) = match discovery {
         HubDiscoveryOutcome::Configured(discovered) => {
@@ -140,7 +149,14 @@ fn build_launch_context(
                     let url_display = endpoint.base_url();
                     if spawn_background_sync {
                         let (bridge, worker) = create_sync_bridge();
-                        let _ = spawn_sync_engine(endpoint, discovered.token, store_loc, worker);
+                        let _ = spawn_sync_engine(
+                            endpoint,
+                            discovered.token,
+                            store_loc,
+                            data_dir.clone(),
+                            giphy_api_key,
+                            worker,
+                        );
                         (
                             HubConnectionStatus::Connecting { url: url_display },
                             Some(bridge),
@@ -193,6 +209,8 @@ fn build_launch_context(
         started_at,
         hub_status,
         sync_bridge,
+        data_dir,
+        giphy_key_available,
     }
 }
 
@@ -209,12 +227,15 @@ fn main() {
     #[cfg(not(feature = "desktop"))]
     {
         let launch_ctx = build_launch_context(&cfg, started_at, false);
-        let vm = postbox_ui::PostboxViewModel::new(
+        let mut vm = postbox_ui::PostboxViewModel::new_uninitialized(
             launch_ctx.store,
             launch_ctx.keymap,
             launch_ctx.version,
         )
-        .with_hub_status(launch_ctx.hub_status);
+        .with_hub_status(launch_ctx.hub_status)
+        .with_data_dir(launch_ctx.data_dir)
+        .with_giphy_key_available(launch_ctx.giphy_key_available);
+        vm.initialize();
         let elapsed_ms = launch_ctx.started_at.elapsed().as_millis();
         println!(
             "{} (headless check) | hub={} | font={} | theme={} | scale={}% | {} bindings | {} cached chats | init={}ms",

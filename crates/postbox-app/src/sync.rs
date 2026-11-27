@@ -10,11 +10,31 @@ use postbox_hub::{
     SendFileRequest, SseParser, SseReconnectState, classify_signal_send_failure,
     classify_telegram_send_failure, is_real_message, read_message_id, should_run_safety_poll,
 };
+use postbox_media::MEDIA_EVICTION_DAYS;
+use postbox_media::age::{evict_expired_media_cache, format_utc_rfc3339};
+use postbox_media::avatar::{
+    SlackEmojiIndex, fetch_or_load_avatar, fetch_or_load_slack_emoji_media,
+    fetch_or_load_workspace_icon,
+};
+use postbox_media::drain::{
+    BACKGROUND_MEDIA_LIMIT, CachedDownloadResult, DownloadOutcome, MAX_BACKGROUND_READ_FAILURES,
+    MediaDownloadSpec, MediaDownloader, MediaDrainTracker, MediaItemStatus, atomic_write_file,
+    background_chat_due, background_may_start, effective_cached_mime, is_downloadable_message,
+    is_oversized, media_cache_key,
+};
+use postbox_media::giphy::{
+    GIPHY_DEFAULT_LIMIT, GIPHY_MSG_NEEDS_KEY, GiphyClient, giphy_error_message,
+};
+use postbox_media::unfurl::{ClassifiedUrl, UnfurlCard, UnfurlService};
 use postbox_store::Store;
-use postbox_ui::{HubConnectionStatus, SyncCommand, SyncEvent, SyncWorkerHandle};
-use std::collections::{BTreeMap, HashMap};
+use postbox_ui::{
+    HubConnectionStatus, MediaDownloadTarget, SyncCommand, SyncEvent, SyncWorkerHandle,
+};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, watch};
 
 #[derive(Debug, Clone)]
 pub enum StoreLocation {
@@ -46,11 +66,14 @@ fn now_epoch_millis() -> i64 {
 }
 
 /// Spawns the dedicated background OS thread owning a single-threaded Tokio runtime for live
-/// Hub HTTP/2 + SSE sync, durable SQLite outbox delivery, pending mark-read, and archive batching.
+/// Hub HTTP/2 + SSE sync, durable SQLite outbox delivery, pending mark-read, archive batching,
+/// media auto-downloading, avatars/Slack emoji, link unfurls, and cancellable Giphy searches.
 pub fn spawn_sync_engine(
     endpoint: Endpoint,
     token: String,
     store_loc: StoreLocation,
+    data_dir: PathBuf,
+    giphy_api_key: Option<String>,
     worker: SyncWorkerHandle,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
@@ -85,6 +108,15 @@ pub fn spawn_sync_engine(
                     }
                 };
 
+                // Startup 14-day media disk + SQLite cache eviction (`main.zig:7986-8039`).
+                let hub_media_dir = data_dir.join("hub-media");
+                let _ = evict_expired_media_cache(
+                    &store,
+                    &hub_media_dir,
+                    now_epoch_secs(),
+                    MEDIA_EVICTION_DAYS,
+                );
+
                 // SendQueue.tla startup crash recovery: any `uncertain` rows from a prior crash
                 // become `held` + `ambiguous = true` and NEVER auto-resend.
                 if let Ok(recovered) = store.recover_uncertain_on_startup() {
@@ -111,15 +143,36 @@ pub fn spawn_sync_engine(
                     }
                 };
 
-                let mut engine = SyncEngine::new(client, store, worker);
+                let mut engine =
+                    SyncEngine::with_m3(client, store, worker, data_dir, giphy_api_key);
                 engine.run().await;
             });
         })
         .expect("spawn postbox-hub-sync thread")
 }
 
+enum BackgroundTaskResult {
+    MediaDownloadDone {
+        chat: ChatKey,
+        target: MediaDownloadTarget,
+        automatic: bool,
+        is_background: bool,
+        result: Result<CachedDownloadResult, postbox_media::MediaError>,
+    },
+    UnfurlDone {
+        target: ClassifiedUrl,
+        card: Option<UnfurlCard>,
+    },
+    BackgroundChatMessagesFetched {
+        chat: ChatKey,
+        last_msg_ts: String,
+        is_group: bool,
+        result: Result<Vec<postbox_hub::HubMessage>, HubError>,
+    },
+}
+
 struct SyncEngine {
-    client: HubClient,
+    client: Arc<HubClient>,
     store: Store,
     worker: SyncWorkerHandle,
     open_chat: Option<ChatKey>,
@@ -127,20 +180,109 @@ struct SyncEngine {
     reconnect: SseReconnectState,
     last_sync_mono: Instant,
     last_sync_wall: i64,
+    started_at: Instant,
+    #[cfg(test)]
+    test_clock_offset_ms: u64,
+    data_dir: PathBuf,
+    downloader: Arc<MediaDownloader>,
+    drain_tracker: MediaDrainTracker,
+    unfurl_service: Option<Arc<UnfurlService>>,
+    giphy_client: Option<GiphyClient>,
+    giphy_api_key: Option<String>,
+    giphy_cancel_tx: Option<(u64, watch::Sender<bool>)>,
+    slack_emoji_cache: HashMap<String, SlackEmojiIndex>,
+    background_swept_chats: HashMap<ChatKey, String>,
+    bg_tx: mpsc::UnboundedSender<BackgroundTaskResult>,
+    bg_rx: mpsc::UnboundedReceiver<BackgroundTaskResult>,
+    retry_targets: HashMap<String, (ChatKey, MediaDownloadTarget)>,
+    pending_gone_events: Vec<(ChatKey, String)>,
+    open_media_in_flight: usize,
+    bg_media_in_flight: usize,
+    bg_fetch_in_flight: HashSet<ChatKey>,
+    bg_read_failures: HashMap<ChatKey, (String, u8)>,
+    bg_burst_started_ms: u64,
+    bg_burst_files_started: usize,
+    bg_drain_pending: bool,
 }
 
 impl SyncEngine {
+    #[cfg(test)]
     fn new(client: HubClient, store: Store, worker: SyncWorkerHandle) -> Self {
+        let data_dir = std::env::temp_dir().join("postbox-sync-test");
+        Self::with_m3(client, store, worker, data_dir, None)
+    }
+
+    fn with_m3(
+        client: HubClient,
+        store: Store,
+        worker: SyncWorkerHandle,
+        data_dir: PathBuf,
+        giphy_api_key: Option<String>,
+    ) -> Self {
+        let downloader = Arc::new(MediaDownloader::new(data_dir.join("hub-media")));
+        let unfurl_service = UnfurlService::new(data_dir.join("link-previews"))
+            .ok()
+            .map(Arc::new);
+        let giphy_client = GiphyClient::new().ok();
+        let (bg_tx, bg_rx) = mpsc::unbounded_channel();
+        let now = Instant::now();
         Self {
-            client,
+            client: Arc::new(client),
             store,
             worker,
             open_chat: None,
             sse_parser: SseParser::new(),
             reconnect: SseReconnectState::new(),
-            last_sync_mono: Instant::now(),
+            last_sync_mono: now,
             last_sync_wall: now_epoch_secs(),
+            started_at: now,
+            #[cfg(test)]
+            test_clock_offset_ms: 0,
+            data_dir,
+            downloader,
+            drain_tracker: MediaDrainTracker::new(),
+            unfurl_service,
+            giphy_client,
+            giphy_api_key,
+            giphy_cancel_tx: None,
+            slack_emoji_cache: HashMap::new(),
+            background_swept_chats: HashMap::new(),
+            bg_tx,
+            bg_rx,
+            retry_targets: HashMap::new(),
+            pending_gone_events: Vec::new(),
+            open_media_in_flight: 0,
+            bg_media_in_flight: 0,
+            bg_fetch_in_flight: HashSet::new(),
+            bg_read_failures: HashMap::new(),
+            bg_burst_started_ms: 0,
+            bg_burst_files_started: 0,
+            bg_drain_pending: false,
         }
+    }
+
+    fn now_media_ms(&self) -> u64 {
+        let base = self.started_at.elapsed().as_millis() as u64;
+        #[cfg(test)]
+        {
+            base.saturating_add(self.test_clock_offset_ms)
+        }
+        #[cfg(not(test))]
+        {
+            base
+        }
+    }
+
+    fn next_media_wake_duration(&self) -> Option<Duration> {
+        let now_ms = self.now_media_ms();
+        let earliest = [
+            self.drain_tracker.next_retry_due_ms(),
+            self.drain_tracker.next_gone_flush_due_ms(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()?;
+        Some(Duration::from_millis(earliest.saturating_sub(now_ms)))
     }
 
     fn emit(&self, ev: SyncEvent) {
@@ -276,22 +418,37 @@ impl SyncEngine {
     }
 
     async fn wait_for_restart_or_shutdown(&mut self) -> bool {
-        while let Ok(cmd) = self.worker.cmd_rx.recv().await {
-            match cmd {
-                SyncCommand::Shutdown => return false,
-                SyncCommand::RestartLiveSync => return true,
-                other => {
-                    self.handle_command(other).await;
+        loop {
+            tokio::select! {
+                cmd = self.worker.cmd_rx.recv() => {
+                    match cmd {
+                        Ok(SyncCommand::Shutdown) | Err(_) => return false,
+                        Ok(SyncCommand::RestartLiveSync) => return true,
+                        Ok(other) => {
+                            self.handle_command(other).await;
+                        }
+                    }
+                }
+                Some(bg) = self.bg_rx.recv() => {
+                    self.handle_bg_result(bg);
                 }
             }
         }
-        false
     }
 
     async fn sleep_interruptible(&mut self, dur: Duration) -> bool {
         let sleep = tokio::time::sleep(dur);
         tokio::pin!(sleep);
         loop {
+            let media_wake_opt = self.next_media_wake_duration();
+            let media_sleep = async {
+                match media_wake_opt {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(media_sleep);
+
             tokio::select! {
                 _ = &mut sleep => return true,
                 cmd = self.worker.cmd_rx.recv() => {
@@ -302,6 +459,12 @@ impl SyncEngine {
                             self.handle_command(other).await;
                         }
                     }
+                }
+                Some(bg) = self.bg_rx.recv() => {
+                    self.handle_bg_result(bg);
+                }
+                _ = &mut media_sleep => {
+                    self.process_media_timers();
                 }
             }
         }
@@ -315,6 +478,15 @@ impl SyncEngine {
             let outbox_sleep_dur = self.next_outbox_sleep_duration();
             let outbox_sleep = tokio::time::sleep(outbox_sleep_dur);
             tokio::pin!(outbox_sleep);
+
+            let media_wake_opt = self.next_media_wake_duration();
+            let media_sleep = async {
+                match media_wake_opt {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(media_sleep);
 
             tokio::select! {
                 chunk_opt = stream.next_chunk() => {
@@ -348,6 +520,12 @@ impl SyncEngine {
                             self.handle_command(cmd).await;
                         }
                     }
+                }
+                Some(bg) = self.bg_rx.recv() => {
+                    self.handle_bg_result(bg);
+                }
+                _ = &mut media_sleep => {
+                    self.process_media_timers();
                 }
                 _ = &mut outbox_sleep => {
                     self.drain_outbox().await;
@@ -448,8 +626,707 @@ impl SyncEngine {
                     }
                 }
             }
+            SyncCommand::DownloadChatMedia { chat, items } => {
+                self.open_chat = Some(chat.clone());
+                self.enqueue_media_targets(&chat, &items, true, false);
+                self.maybe_start_background_drain();
+            }
+            SyncCommand::DownloadMediaExplicit { chat, target } => {
+                let key = media_cache_key(&chat, &target.msg_id);
+                self.drain_tracker.forget_attempt(&key);
+                self.retry_targets.remove(&key);
+                self.enqueue_media_targets(&chat, &[target], false, false);
+            }
+            SyncCommand::FetchAvatar { chat } => {
+                let avatar_dir = self.data_dir.join("avatars");
+                if let Ok(path) = fetch_or_load_avatar(
+                    &self.client,
+                    &self.store,
+                    &avatar_dir,
+                    &chat,
+                    now_epoch_secs(),
+                )
+                .await
+                {
+                    self.emit(SyncEvent::AvatarReady { chat, path });
+                }
+            }
+            SyncCommand::FetchWorkspaceIcon { team } => {
+                let avatar_dir = self.data_dir.join("avatars");
+                if let Ok(path) = fetch_or_load_workspace_icon(
+                    &self.client,
+                    &self.store,
+                    &avatar_dir,
+                    &team,
+                    now_epoch_secs(),
+                )
+                .await
+                {
+                    self.emit(SyncEvent::WorkspaceIconReady { team, path });
+                }
+            }
+            SyncCommand::EnsureSlackEmojiIndex { team } => {
+                let now = now_epoch_secs();
+                if let Some(cached) = self.slack_emoji_cache.get(&team)
+                    && cached.is_fresh(now)
+                {
+                    self.emit(SyncEvent::SlackEmojiIndexReady {
+                        team,
+                        index: cached.clone(),
+                    });
+                    return;
+                }
+                if let Ok(json_val) = self.client.fetch_slack_emoji_index(&team).await {
+                    let index = SlackEmojiIndex::from_hub_json(&team, &json_val, now);
+                    self.slack_emoji_cache.insert(team.clone(), index.clone());
+                    self.emit(SyncEvent::SlackEmojiIndexReady { team, index });
+                }
+            }
+            SyncCommand::FetchSlackEmojiMedia { team, name, url } => {
+                let dir = self.data_dir.join("slack-emoji");
+                if let Ok(Some(path)) =
+                    fetch_or_load_slack_emoji_media(&self.client, &dir, &team, &name, &url).await
+                {
+                    self.emit(SyncEvent::SlackEmojiMediaReady { team, name, path });
+                }
+            }
+            SyncCommand::ReactToMessage {
+                chat,
+                msg_id,
+                emoji,
+                client_id,
+            } => {
+                let res = self
+                    .client
+                    .react(&chat.id, &msg_id, &emoji, &client_id)
+                    .await;
+                let (ok, http_status) = match res {
+                    Ok(_) => (true, Some(200)),
+                    Err(HubError::HttpStatus { status, .. }) => (false, Some(status)),
+                    Err(_) => (false, None),
+                };
+                self.emit(SyncEvent::ReactionSettled {
+                    chat,
+                    msg_id,
+                    emoji,
+                    ok,
+                    http_status,
+                });
+            }
+            SyncCommand::UnfurlUrl { target } => {
+                let Some(svc) = self.unfurl_service.clone() else {
+                    self.emit(SyncEvent::UnfurlReady { target, card: None });
+                    return;
+                };
+                if let Some(cached) = svc.load_from_disk(&target) {
+                    self.emit(SyncEvent::UnfurlReady {
+                        target,
+                        card: Some(cached),
+                    });
+                    return;
+                }
+                let bg_tx = self.bg_tx.clone();
+                tokio::spawn(async move {
+                    let card = svc.fetch_or_load(&target).await.ok();
+                    let _ = bg_tx.send(BackgroundTaskResult::UnfurlDone { target, card });
+                });
+            }
+            SyncCommand::SearchGiphy {
+                query,
+                offset,
+                generation,
+                target,
+            } => {
+                // Cancel any prior in-flight GIPHY search.
+                if let Some((_prev_gen, prev_tx)) = self.giphy_cancel_tx.take() {
+                    let _ = prev_tx.send(true);
+                }
+                let Some(api_key) = self.giphy_api_key.clone() else {
+                    self.emit(SyncEvent::GiphyResults {
+                        generation,
+                        target,
+                        page: None,
+                        error: Some(GIPHY_MSG_NEEDS_KEY.to_owned()),
+                    });
+                    return;
+                };
+                let Some(giphy) = self.giphy_client.clone() else {
+                    return;
+                };
+                let (cancel_tx, mut cancel_rx) = watch::channel(false);
+                self.giphy_cancel_tx = Some((generation, cancel_tx));
+                let event_tx = self.worker.event_tx.clone();
+                let preview_dir = self.data_dir.join("giphy-previews");
+                tokio::spawn(async move {
+                    match giphy
+                        .search_or_trending(
+                            &api_key,
+                            &query,
+                            GIPHY_DEFAULT_LIMIT,
+                            offset,
+                            &mut cancel_rx,
+                        )
+                        .await
+                    {
+                        Ok(page) => {
+                            let preview_urls: Vec<(usize, String, String)> = page
+                                .items
+                                .iter()
+                                .enumerate()
+                                .map(|(i, item)| (i, item.id.clone(), item.preview.url.clone()))
+                                .collect();
+                            let _ = event_tx.try_send(SyncEvent::GiphyResults {
+                                generation,
+                                target,
+                                page: Some(page),
+                                error: None,
+                            });
+                            for (idx, gif_id, url) in preview_urls {
+                                if *cancel_rx.borrow() {
+                                    break;
+                                }
+                                if let Ok(bytes) = giphy
+                                    .download_gif(&gif_id, &url, true, &mut cancel_rx)
+                                    .await
+                                {
+                                    let p = preview_dir.join(format!("{gif_id}.gif"));
+                                    if atomic_write_file(&p, &bytes).is_ok() {
+                                        let _ = event_tx.try_send(SyncEvent::GiphyPreviewReady {
+                                            generation,
+                                            index: idx,
+                                            path: p,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        Err(postbox_media::MediaError::Cancelled) => {}
+                        Err(err) => {
+                            let msg = giphy_error_message(&err, false).to_owned();
+                            let _ = event_tx.try_send(SyncEvent::GiphyResults {
+                                generation,
+                                target,
+                                page: None,
+                                error: Some(msg),
+                            });
+                        }
+                    }
+                });
+            }
+            SyncCommand::DownloadGiphyGif {
+                gif_id,
+                url,
+                index,
+                generation,
+                download_generation,
+                target,
+            } => {
+                let Some(giphy) = self.giphy_client.clone() else {
+                    return;
+                };
+                let (cancel_tx, mut cancel_rx) = watch::channel(false);
+                if let Some((_prev_gen, prev_tx)) =
+                    self.giphy_cancel_tx.replace((generation, cancel_tx))
+                {
+                    let _ = prev_tx.send(true);
+                }
+                let event_tx = self.worker.event_tx.clone();
+                tokio::spawn(async move {
+                    match giphy
+                        .download_gif(&gif_id, &url, false, &mut cancel_rx)
+                        .await
+                    {
+                        Ok(bytes) => {
+                            let _ = event_tx.try_send(SyncEvent::GiphyDownloadReady {
+                                generation,
+                                download_generation,
+                                target,
+                                index,
+                                gif_id,
+                                bytes,
+                            });
+                        }
+                        Err(postbox_media::MediaError::Cancelled) => {}
+                        Err(err) => {
+                            let msg = giphy_error_message(&err, true).to_owned();
+                            let _ = event_tx.try_send(SyncEvent::GiphyError {
+                                generation,
+                                index,
+                                download_generation,
+                                message: msg,
+                            });
+                        }
+                    }
+                });
+            }
+            SyncCommand::CancelGiphy { generation } => {
+                if let Some((cur_gen, tx)) = self.giphy_cancel_tx.take() {
+                    if cur_gen == generation || generation == 0 {
+                        let _ = tx.send(true);
+                    } else {
+                        self.giphy_cancel_tx = Some((cur_gen, tx));
+                    }
+                }
+            }
             SyncCommand::RestartLiveSync | SyncCommand::Shutdown => {}
         }
+    }
+
+    fn enqueue_media_targets(
+        &mut self,
+        chat: &ChatKey,
+        items: &[MediaDownloadTarget],
+        automatic: bool,
+        is_background: bool,
+    ) -> usize {
+        let now_ms = self.now_media_ms();
+        let mut spawned = 0usize;
+        for target in items {
+            if automatic && target.file_size.is_some_and(is_oversized) {
+                self.emit(SyncEvent::MediaStatusChanged {
+                    chat: chat.clone(),
+                    msg_id: target.msg_id.clone(),
+                    status: MediaItemStatus::Oversized,
+                });
+                continue;
+            }
+            let key = media_cache_key(chat, &target.msg_id);
+            if self.drain_tracker.is_in_flight(&key) {
+                continue;
+            }
+            if automatic
+                && self
+                    .store
+                    .is_media_gone(chat, &target.msg_id)
+                    .unwrap_or(false)
+            {
+                if !self.drain_tracker.should_skip_auto(&key, now_ms) {
+                    self.handle_gone_outcome(
+                        chat.clone(),
+                        target.msg_id.clone(),
+                        &key,
+                        now_ms,
+                        false,
+                    );
+                }
+                continue;
+            }
+            if let Some(hit) =
+                self.downloader
+                    .resolve_cached_entry(&self.store, chat, &target.msg_id)
+            {
+                self.drain_tracker.forget_attempt(&key);
+                self.retry_targets.remove(&key);
+                self.emit(SyncEvent::MediaDownloaded {
+                    chat: chat.clone(),
+                    msg_id: target.msg_id.clone(),
+                    path: hit.path,
+                    mime_type: effective_cached_mime(target.mime_type.as_deref(), &hit.mime_type),
+                });
+                continue;
+            }
+            if automatic && self.drain_tracker.should_skip_auto(&key, now_ms) {
+                continue;
+            }
+            self.spawn_media_download(chat.clone(), target.clone(), key, automatic, is_background);
+            spawned += 1;
+        }
+        spawned
+    }
+
+    fn spawn_media_download(
+        &mut self,
+        chat: ChatKey,
+        target: MediaDownloadTarget,
+        key: String,
+        automatic: bool,
+        is_background: bool,
+    ) {
+        self.drain_tracker.mark_in_flight(key);
+        if is_background {
+            self.bg_media_in_flight = self.bg_media_in_flight.saturating_add(1);
+        } else {
+            self.open_media_in_flight = self.open_media_in_flight.saturating_add(1);
+        }
+        let spec = MediaDownloadSpec {
+            chat: chat.clone(),
+            msg_id: target.msg_id.clone(),
+            filename: target.filename.clone(),
+            mime_type: target.mime_type.clone(),
+            media_kind: target.media_kind,
+        };
+        let downloader = self.downloader.clone();
+        let client = self.client.clone();
+        let bg_tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = downloader.download_to_cache_owned(client, None, spec).await;
+            let _ = bg_tx.send(BackgroundTaskResult::MediaDownloadDone {
+                chat,
+                target,
+                automatic,
+                is_background,
+                result,
+            });
+        });
+    }
+
+    fn handle_gone_outcome(
+        &mut self,
+        chat: ChatKey,
+        msg_id: String,
+        key: &str,
+        now_ms: u64,
+        force_emit: bool,
+    ) {
+        self.drain_tracker.note_gone(key);
+        if self.drain_tracker.should_repaint_gone(now_ms) {
+            let pending = std::mem::take(&mut self.pending_gone_events);
+            let mut emitted_current = false;
+            for (p_chat, p_msg_id) in pending {
+                if p_chat == chat && p_msg_id == msg_id {
+                    emitted_current = true;
+                }
+                self.emit(SyncEvent::MediaStatusChanged {
+                    chat: p_chat,
+                    msg_id: p_msg_id,
+                    status: MediaItemStatus::Gone,
+                });
+            }
+            if !emitted_current {
+                self.emit(SyncEvent::MediaStatusChanged {
+                    chat,
+                    msg_id,
+                    status: MediaItemStatus::Gone,
+                });
+            }
+        } else if force_emit {
+            self.emit(SyncEvent::MediaStatusChanged {
+                chat,
+                msg_id,
+                status: MediaItemStatus::Gone,
+            });
+        } else if !self
+            .pending_gone_events
+            .iter()
+            .any(|(c, m)| c == &chat && m == &msg_id)
+        {
+            self.pending_gone_events.push((chat, msg_id));
+        }
+    }
+
+    fn handle_bg_result(&mut self, bg: BackgroundTaskResult) {
+        match bg {
+            BackgroundTaskResult::MediaDownloadDone {
+                chat,
+                target,
+                automatic,
+                is_background,
+                result,
+            } => {
+                if is_background {
+                    self.bg_media_in_flight = self.bg_media_in_flight.saturating_sub(1);
+                } else {
+                    self.open_media_in_flight = self.open_media_in_flight.saturating_sub(1);
+                }
+                let now_ms = self.now_media_ms();
+                let key = media_cache_key(&chat, &target.msg_id);
+                let outcome = match result {
+                    Ok(cached) => MediaDownloader::commit_download_result(
+                        &self.store,
+                        &chat,
+                        &target.msg_id,
+                        cached,
+                    ),
+                    Err(err) => Err(err),
+                };
+                match outcome {
+                    Ok(DownloadOutcome::Ready { path, mime_type }) => {
+                        self.drain_tracker.note_success(&key);
+                        self.retry_targets.remove(&key);
+                        self.emit(SyncEvent::MediaDownloaded {
+                            chat,
+                            msg_id: target.msg_id,
+                            path,
+                            mime_type,
+                        });
+                    }
+                    Ok(DownloadOutcome::Gone) => {
+                        self.retry_targets.remove(&key);
+                        self.handle_gone_outcome(chat, target.msg_id, &key, now_ms, !automatic);
+                    }
+                    Ok(DownloadOutcome::Unavailable) => {
+                        let st = self.drain_tracker.note_failure(&key, 404, now_ms);
+                        if matches!(st, MediaItemStatus::RetryPending { .. }) {
+                            self.retry_targets
+                                .insert(key, (chat.clone(), target.clone()));
+                        } else {
+                            self.retry_targets.remove(&key);
+                        }
+                        self.emit(SyncEvent::MediaStatusChanged {
+                            chat,
+                            msg_id: target.msg_id,
+                            status: st,
+                        });
+                    }
+                    Ok(DownloadOutcome::TransientFailure { http_status })
+                    | Ok(DownloadOutcome::OtherFailure { http_status }) => {
+                        let st = self.drain_tracker.note_failure(&key, http_status, now_ms);
+                        if matches!(st, MediaItemStatus::RetryPending { .. }) {
+                            self.retry_targets
+                                .insert(key, (chat.clone(), target.clone()));
+                        } else {
+                            self.retry_targets.remove(&key);
+                        }
+                        self.emit(SyncEvent::MediaStatusChanged {
+                            chat,
+                            msg_id: target.msg_id,
+                            status: st,
+                        });
+                    }
+                    Err(_) => {
+                        let st = self.drain_tracker.note_failure(&key, 0, now_ms);
+                        if matches!(st, MediaItemStatus::RetryPending { .. }) {
+                            self.retry_targets
+                                .insert(key, (chat.clone(), target.clone()));
+                        } else {
+                            self.retry_targets.remove(&key);
+                        }
+                        self.emit(SyncEvent::MediaStatusChanged {
+                            chat,
+                            msg_id: target.msg_id,
+                            status: st,
+                        });
+                    }
+                }
+                if self.bg_drain_pending
+                    && self.open_media_in_flight == 0
+                    && self.bg_media_in_flight == 0
+                {
+                    self.maybe_start_background_drain();
+                }
+            }
+            BackgroundTaskResult::UnfurlDone { target, card } => {
+                self.emit(SyncEvent::UnfurlReady { target, card });
+            }
+            BackgroundTaskResult::BackgroundChatMessagesFetched {
+                chat,
+                last_msg_ts,
+                is_group,
+                result,
+            } => {
+                self.bg_fetch_in_flight.remove(&chat);
+                match result {
+                    Ok(hub_msgs) => {
+                        self.bg_read_failures.remove(&chat);
+                        let core_msgs: Vec<Message> = hub_msgs
+                            .iter()
+                            .filter(|m| is_real_message(m))
+                            .map(|m| m.to_core_message(&chat, is_group))
+                            .collect();
+                        let _ = self.store.upsert_messages_batch(&core_msgs);
+                        if core_msgs.is_empty() {
+                            self.background_swept_chats.insert(chat, last_msg_ts);
+                        } else {
+                            self.bg_drain_pending = true;
+                            self.maybe_start_background_drain();
+                        }
+                    }
+                    Err(_) => {
+                        let entry = self
+                            .bg_read_failures
+                            .entry(chat)
+                            .or_insert_with(|| (last_msg_ts.clone(), 0));
+                        if entry.0 != last_msg_ts {
+                            entry.0 = last_msg_ts;
+                            entry.1 = 1;
+                        } else {
+                            entry.1 = entry.1.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn process_media_timers(&mut self) {
+        let now_ms = self.now_media_ms();
+        if self.drain_tracker.should_repaint_gone(now_ms) {
+            let pending = std::mem::take(&mut self.pending_gone_events);
+            for (chat, msg_id) in pending {
+                self.emit(SyncEvent::MediaStatusChanged {
+                    chat,
+                    msg_id,
+                    status: MediaItemStatus::Gone,
+                });
+            }
+        }
+        for key in self.drain_tracker.take_due_retries(now_ms) {
+            let Some((chat, target)) = self.retry_targets.get(&key).cloned() else {
+                self.drain_tracker.clear_in_flight(&key);
+                self.drain_tracker.forget_attempt(&key);
+                continue;
+            };
+            if self
+                .store
+                .is_media_gone(&chat, &target.msg_id)
+                .unwrap_or(false)
+            {
+                self.retry_targets.remove(&key);
+                self.handle_gone_outcome(chat, target.msg_id, &key, now_ms, false);
+                continue;
+            }
+            if let Some(hit) =
+                self.downloader
+                    .resolve_cached_entry(&self.store, &chat, &target.msg_id)
+            {
+                self.drain_tracker.note_success(&key);
+                self.drain_tracker.forget_attempt(&key);
+                self.retry_targets.remove(&key);
+                self.emit(SyncEvent::MediaDownloaded {
+                    chat,
+                    msg_id: target.msg_id,
+                    path: hit.path,
+                    mime_type: effective_cached_mime(target.mime_type.as_deref(), &hit.mime_type),
+                });
+                continue;
+            }
+            let is_background = self.open_chat.as_ref() != Some(&chat);
+            self.spawn_media_download(chat, target, key, true, is_background);
+        }
+    }
+
+    fn has_due_open_chat_retry(&self, now_ms: u64) -> bool {
+        let Some(open) = &self.open_chat else {
+            return false;
+        };
+        self.retry_targets.iter().any(|(key, (chat, _))| {
+            chat == open && !self.drain_tracker.should_skip_auto(key, now_ms)
+        })
+    }
+
+    /// Background 14-day recent-chat media drain yielding to the open chat (up to 4 files / 20s
+    /// burst), fetching messages from Hub for unopened 0-message recent chats instead of
+    /// prematurely marking them swept.
+    fn maybe_start_background_drain(&mut self) {
+        let now_ms = self.now_media_ms();
+        if self.bg_burst_files_started == 0
+            || now_ms.saturating_sub(self.bg_burst_started_ms)
+                >= postbox_media::drain::BURST_BUDGET_MS
+        {
+            self.bg_burst_started_ms = now_ms;
+            self.bg_burst_files_started = 0;
+        }
+        let active = self.open_media_in_flight + self.bg_media_in_flight;
+        let open_ready = self.has_due_open_chat_retry(now_ms);
+        if !background_may_start(
+            active,
+            open_ready,
+            self.bg_burst_files_started,
+            now_ms,
+            self.bg_burst_started_ms,
+        ) {
+            if self.open_media_in_flight > 0 || open_ready {
+                self.bg_drain_pending = true;
+            }
+            return;
+        }
+
+        let now_s = now_epoch_secs();
+        let cutoff = format_utc_rfc3339(now_s - MEDIA_EVICTION_DAYS * 86_400);
+        let Ok(recent) = self.store.list_recent_chats_within_days(&cutoff, 8) else {
+            self.bg_drain_pending = false;
+            return;
+        };
+
+        for chat in recent {
+            if !background_chat_due(
+                self.open_chat.as_ref() == Some(&chat.key),
+                &chat.last_msg_ts,
+                self.background_swept_chats
+                    .get(&chat.key)
+                    .map(String::as_str),
+                now_s,
+            ) {
+                continue;
+            }
+            if self.bg_fetch_in_flight.contains(&chat.key) {
+                continue;
+            }
+            if self.bg_read_failures.get(&chat.key).is_some_and(|(ts, n)| {
+                ts == &chat.last_msg_ts && *n >= MAX_BACKGROUND_READ_FAILURES
+            }) {
+                continue;
+            }
+            let Ok(msgs) = self
+                .store
+                .list_messages(&chat.key, BACKGROUND_MEDIA_LIMIT, None)
+            else {
+                continue;
+            };
+            if msgs.is_empty() {
+                self.bg_fetch_in_flight.insert(chat.key.clone());
+                let client = self.client.clone();
+                let bg_tx = self.bg_tx.clone();
+                let chat_key = chat.key.clone();
+                let last_msg_ts = chat.last_msg_ts.clone();
+                let is_group = chat.is_group;
+                tokio::spawn(async move {
+                    let result = client
+                        .fetch_messages(&chat_key.id, BACKGROUND_MEDIA_LIMIT, None)
+                        .await;
+                    let _ = bg_tx.send(BackgroundTaskResult::BackgroundChatMessagesFetched {
+                        chat: chat_key,
+                        last_msg_ts,
+                        is_group,
+                        result,
+                    });
+                });
+                return;
+            }
+
+            let mut spawned_one = false;
+            for msg in msgs.iter().rev() {
+                if !is_downloadable_message(msg) || msg.file_size.is_some_and(is_oversized) {
+                    continue;
+                }
+                if self
+                    .store
+                    .is_media_gone(&chat.key, &msg.msg_id)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let key = media_cache_key(&chat.key, &msg.msg_id);
+                if self
+                    .downloader
+                    .resolve_cached_entry(&self.store, &chat.key, &msg.msg_id)
+                    .is_some()
+                {
+                    continue;
+                }
+                if self.drain_tracker.should_skip_auto(&key, now_ms) {
+                    continue;
+                }
+                let target = MediaDownloadTarget {
+                    msg_id: msg.msg_id.clone(),
+                    filename: msg.filename.clone(),
+                    mime_type: msg.mime_type.clone(),
+                    media_kind: msg.media_kind,
+                    file_size: msg.file_size,
+                };
+                self.spawn_media_download(chat.key.clone(), target, key, true, true);
+                self.bg_burst_files_started += 1;
+                self.bg_drain_pending = true;
+                spawned_one = true;
+                break;
+            }
+            if spawned_one {
+                return;
+            }
+            self.background_swept_chats
+                .insert(chat.key, chat.last_msg_ts);
+        }
+        self.bg_drain_pending = false;
     }
 
     async fn sync_chats(&mut self, reset: bool) -> Result<(), HubError> {
@@ -753,6 +1630,7 @@ impl SyncEngine {
                         } else {
                             Some(claimed.wire_filename.clone())
                         },
+                        file_size: (claimed.file_bytes > 0).then_some(claimed.file_bytes),
                         reactions: Vec::new(),
                         read_status: ReadStatus::Sent,
                         deleted: false,
@@ -1342,5 +2220,532 @@ mod tests {
         let _ = std::fs::remove_file(&voice_path);
         let _ = std::fs::remove_file(&file_path);
         server.abort();
+    }
+
+    fn unique_sync_test_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("postbox_sync_{tag}_{}_{nanos}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn concurrent_media_downloads_run_3_in_parallel_without_blocking_commands_or_shutdown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+
+        let current = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(3));
+
+        let cur_srv = current.clone();
+        let peak_srv = peak.clone();
+        let bar_srv = barrier.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let cur = cur_srv.clone();
+                let pk = peak_srv.clone();
+                let bar = bar_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req.lines().next().unwrap_or("");
+                    let mut parts = first_line.split_whitespace();
+                    let method = parts.next().unwrap_or("");
+                    let path = parts.next().unwrap_or("");
+
+                    if method == "GET" && path.starts_with("/v1/wazig/events") {
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n: keepalive\n\n";
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        return;
+                    }
+                    if method == "GET" && path.starts_with("/v1/wazig/chats") {
+                        let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]";
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                        return;
+                    }
+                    if method == "POST" && path == "/v1/wazig/react" {
+                        let body = r#"{"ok":true}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                        return;
+                    }
+                    if method == "GET" && path.starts_with("/v1/wazig/media/") {
+                        let active = cur.fetch_add(1, Ordering::SeqCst) + 1;
+                        pk.fetch_max(active, Ordering::SeqCst);
+                        // First 3 requests must arrive concurrently to pass the barrier!
+                        if path.ends_with("/m0") || path.ends_with("/m1") || path.ends_with("/m2") {
+                            let _ = tokio::time::timeout(Duration::from_secs(2), bar.wait()).await;
+                        }
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        cur.fetch_sub(1, Ordering::SeqCst);
+                        let resp = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 4\r\nConnection: close\r\n\r\nPNG!";
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                        return;
+                    }
+                    let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let data_dir = unique_sync_test_dir("concurrent3");
+        let endpoint = Endpoint::parse(&format!("http://127.0.0.1:{port}"), true).unwrap();
+        let client = HubClient::new(endpoint, "test-token").unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let (bridge, worker) = create_sync_bridge();
+        let mut engine = SyncEngine::with_m3(client, store, worker, data_dir.clone(), None);
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let engine_task = tokio::task::spawn_local(async move {
+                    engine.run().await;
+                });
+
+                // Wait until SSE is Connected
+                loop {
+                    let ev = tokio::time::timeout(Duration::from_secs(3), bridge.event_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if matches!(
+                        ev,
+                        SyncEvent::StatusChanged(HubConnectionStatus::Connected { .. })
+                    ) {
+                        break;
+                    }
+                }
+
+                let chat = ChatKey::new(Provider::Whatsapp, "main", "conc@s.whatsapp.net");
+                let items: Vec<MediaDownloadTarget> = (0..5)
+                    .map(|i| MediaDownloadTarget {
+                        msg_id: format!("m{i}"),
+                        filename: Some(format!("pic{i}.png")),
+                        mime_type: Some("image/png".into()),
+                        media_kind: Some(MediaKind::Image),
+                        file_size: Some(1024),
+                    })
+                    .collect();
+                bridge
+                    .cmd_tx
+                    .send(SyncCommand::DownloadChatMedia {
+                        chat: chat.clone(),
+                        items,
+                    })
+                    .await
+                    .unwrap();
+                bridge
+                    .cmd_tx
+                    .send(SyncCommand::ReactToMessage {
+                        chat: chat.clone(),
+                        msg_id: "m0".into(),
+                        emoji: "👍".into(),
+                        client_id: "cid_react".into(),
+                    })
+                    .await
+                    .unwrap();
+
+                let mut downloaded = 0usize;
+                let mut reaction_settled_before_all_downloads = false;
+                let mut reaction_settled = false;
+                while downloaded < 5 || !reaction_settled {
+                    let ev = tokio::time::timeout(Duration::from_secs(4), bridge.event_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    match ev {
+                        SyncEvent::MediaDownloaded { .. } => downloaded += 1,
+                        SyncEvent::ReactionSettled { ok: true, .. } => {
+                            reaction_settled = true;
+                            if downloaded < 5 {
+                                reaction_settled_before_all_downloads = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                assert!(
+                    reaction_settled_before_all_downloads,
+                    "ReactToMessage must complete without waiting for all 5 media downloads"
+                );
+                assert_eq!(peak.load(Ordering::SeqCst), 3);
+
+                // Shutdown must terminate promptly (< 500ms)
+                let shutdown_start = Instant::now();
+                bridge.cmd_tx.send(SyncCommand::Shutdown).await.unwrap();
+                tokio::time::timeout(Duration::from_millis(500), engine_task)
+                    .await
+                    .expect("SyncEngine must shut down within 500ms")
+                    .unwrap();
+                assert!(shutdown_start.elapsed() < Duration::from_millis(500));
+            })
+            .await;
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn drain_tracker_suppresses_backoff_and_exhaustion_and_auto_retries_when_due() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits_transient = Arc::new(AtomicUsize::new(0));
+        let hits_missing = Arc::new(AtomicUsize::new(0));
+        let ht = hits_transient.clone();
+        let hm = hits_missing.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let ht = ht.clone();
+                let hm = hm.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("");
+                    let resp = if path.contains("m_transient") {
+                        let hit = ht.fetch_add(1, Ordering::SeqCst) + 1;
+                        if hit < 3 {
+                            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        } else {
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 3\r\nConnection: close\r\n\r\nIMG"
+                        }
+                    } else if path.contains("m_missing") {
+                        hm.fetch_add(1, Ordering::SeqCst);
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let data_dir = unique_sync_test_dir("backoff");
+        let endpoint = Endpoint::parse(&format!("http://127.0.0.1:{port}"), true).unwrap();
+        let client = HubClient::new(endpoint, "test-token").unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let (bridge, worker) = create_sync_bridge();
+        let mut engine = SyncEngine::with_m3(client, store, worker, data_dir.clone(), None);
+
+        let chat = ChatKey::new(Provider::Whatsapp, "main", "retry@s.whatsapp.net");
+        let items = vec![
+            MediaDownloadTarget {
+                msg_id: "m_transient".into(),
+                filename: Some("a.png".into()),
+                mime_type: Some("image/png".into()),
+                media_kind: Some(MediaKind::Image),
+                file_size: Some(100),
+            },
+            MediaDownloadTarget {
+                msg_id: "m_missing".into(),
+                filename: Some("b.png".into()),
+                mime_type: Some("image/png".into()),
+                media_kind: Some(MediaKind::Image),
+                file_size: Some(100),
+            },
+        ];
+
+        engine.enqueue_media_targets(&chat, &items, true, false);
+        for _ in 0..2 {
+            let bg = engine.bg_rx.recv().await.unwrap();
+            engine.handle_bg_result(bg);
+        }
+        assert_eq!(hits_transient.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_missing.load(Ordering::SeqCst), 1);
+
+        // Immediate re-enqueue MUST be suppressed by should_skip_auto!
+        assert_eq!(engine.enqueue_media_targets(&chat, &items, true, false), 0);
+        assert_eq!(hits_transient.load(Ordering::SeqCst), 1);
+        assert_eq!(hits_missing.load(Ordering::SeqCst), 1);
+
+        // +5s -> m_transient retries (attempt 2, 429 -> 10s delay); m_missing still suppressed!
+        engine.test_clock_offset_ms += 5_000;
+        engine.process_media_timers();
+        let bg = engine.bg_rx.recv().await.unwrap();
+        engine.handle_bg_result(bg);
+        assert_eq!(hits_transient.load(Ordering::SeqCst), 2);
+        assert_eq!(hits_missing.load(Ordering::SeqCst), 1);
+
+        // +10s -> m_transient hits 3 and succeeds (MediaDownloaded)!
+        engine.test_clock_offset_ms += 10_000;
+        engine.process_media_timers();
+        let bg = engine.bg_rx.recv().await.unwrap();
+        engine.handle_bg_result(bg);
+        assert_eq!(hits_transient.load(Ordering::SeqCst), 3);
+
+        // +15s (30s total) -> m_missing attempt 2 (404 -> 60s delay)
+        engine.test_clock_offset_ms += 15_000;
+        engine.process_media_timers();
+        let bg = engine.bg_rx.recv().await.unwrap();
+        engine.handle_bg_result(bg);
+        assert_eq!(hits_missing.load(Ordering::SeqCst), 2);
+
+        // +60s -> m_missing attempt 3 -> exhausted into Unavailable!
+        engine.test_clock_offset_ms += 60_000;
+        engine.process_media_timers();
+        let bg = engine.bg_rx.recv().await.unwrap();
+        engine.handle_bg_result(bg);
+        assert_eq!(hits_missing.load(Ordering::SeqCst), 3);
+        assert_eq!(engine.drain_tracker.next_retry_due_ms(), None);
+
+        // Further automatic downloads remain suppressed after exhaustion!
+        assert_eq!(engine.enqueue_media_targets(&chat, &items, true, false), 0);
+        assert_eq!(hits_missing.load(Ordering::SeqCst), 3);
+
+        let mut saw_downloaded = false;
+        let mut saw_unavailable = false;
+        while let Ok(ev) = bridge.event_rx.try_recv() {
+            match ev {
+                SyncEvent::MediaDownloaded { msg_id, .. } if msg_id == "m_transient" => {
+                    saw_downloaded = true;
+                }
+                SyncEvent::MediaStatusChanged {
+                    msg_id,
+                    status: MediaItemStatus::Unavailable,
+                    ..
+                } if msg_id == "m_missing" => {
+                    saw_unavailable = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_downloaded);
+        assert!(saw_unavailable);
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn gone_410_burst_respects_20s_repaint_throttle_and_flushes_pending() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let h = hits_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    h.fetch_add(1, Ordering::SeqCst);
+                    let resp =
+                        "HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let data_dir = unique_sync_test_dir("gone410");
+        let endpoint = Endpoint::parse(&format!("http://127.0.0.1:{port}"), true).unwrap();
+        let client = HubClient::new(endpoint, "test-token").unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let (bridge, worker) = create_sync_bridge();
+        let mut engine = SyncEngine::with_m3(client, store, worker, data_dir.clone(), None);
+
+        let chat = ChatKey::new(Provider::Whatsapp, "main", "gone@s.whatsapp.net");
+        let items: Vec<MediaDownloadTarget> = (1..=5)
+            .map(|i| MediaDownloadTarget {
+                msg_id: format!("g{i}"),
+                filename: Some(format!("g{i}.jpg")),
+                mime_type: Some("image/jpeg".into()),
+                media_kind: Some(MediaKind::Image),
+                file_size: Some(500),
+            })
+            .collect();
+
+        engine.enqueue_media_targets(&chat, &items, true, false);
+        for _ in 0..5 {
+            let bg = engine.bg_rx.recv().await.unwrap();
+            engine.handle_bg_result(bg);
+        }
+
+        // All 5 persisted immediately in SQLite `gone_media`
+        for i in 1..=5 {
+            assert!(engine.store.is_media_gone(&chat, &format!("g{i}")).unwrap());
+        }
+
+        // Exactly 1 Gone event emitted immediately; 4 buffered behind 20s throttle!
+        let mut immediate_gone = 0usize;
+        while let Ok(ev) = bridge.event_rx.try_recv() {
+            if matches!(
+                ev,
+                SyncEvent::MediaStatusChanged {
+                    status: MediaItemStatus::Gone,
+                    ..
+                }
+            ) {
+                immediate_gone += 1;
+            }
+        }
+        assert_eq!(immediate_gone, 1);
+        assert_eq!(engine.pending_gone_events.len(), 4);
+        assert!(engine.drain_tracker.next_gone_flush_due_ms().is_some());
+
+        // Re-sending causes 0 additional Hub hits
+        let before_hits = hits.load(Ordering::SeqCst);
+        assert_eq!(engine.enqueue_media_targets(&chat, &items, true, false), 0);
+        assert_eq!(hits.load(Ordering::SeqCst), before_hits);
+
+        // Advance +20s -> flushes remaining 4 Gone events and clears flush timer
+        engine.test_clock_offset_ms += 20_000;
+        engine.process_media_timers();
+        let mut flushed_gone = 0usize;
+        while let Ok(ev) = bridge.event_rx.try_recv() {
+            if matches!(
+                ev,
+                SyncEvent::MediaStatusChanged {
+                    status: MediaItemStatus::Gone,
+                    ..
+                }
+            ) {
+                flushed_gone += 1;
+            }
+        }
+        assert_eq!(flushed_gone, 4);
+        assert_eq!(engine.drain_tracker.next_gone_flush_due_ms(), None);
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn background_drain_yields_to_open_chat_and_fetches_unopened_zero_message_chats() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let msg_fetches = Arc::new(AtomicUsize::new(0));
+        let media_fetches = Arc::new(AtomicUsize::new(0));
+        let mf = msg_fetches.clone();
+        let mef = media_fetches.clone();
+
+        let recent_ts = format_utc_rfc3339(now_epoch_secs() - 60);
+        let msg_json = format!(
+            r#"[{{"MsgID":"bg_m1","ChatJID":"bg@s.whatsapp.net","FromMe":false,"Timestamp":"{recent_ts}","Text":"","MediaType":"image","MimeType":"image/png","Filename":"bg.png"}}]"#
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mf = mf.clone();
+                let mef = mef.clone();
+                let mj = msg_json.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("");
+                    if path.starts_with("/v1/wazig/messages") {
+                        mf.fetch_add(1, Ordering::SeqCst);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{mj}",
+                            mj.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    } else if path.starts_with("/v1/wazig/media/") {
+                        mef.fetch_add(1, Ordering::SeqCst);
+                        let resp = "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 4\r\nConnection: close\r\n\r\nDATA";
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    } else {
+                        let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    }
+                });
+            }
+        });
+
+        let data_dir = unique_sync_test_dir("bgdrain");
+        let endpoint = Endpoint::parse(&format!("http://127.0.0.1:{port}"), true).unwrap();
+        let client = HubClient::new(endpoint, "test-token").unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let open_chat = ChatKey::new(Provider::Whatsapp, "main", "open@s.whatsapp.net");
+        let bg_chat = ChatKey::new(Provider::Whatsapp, "main", "bg@s.whatsapp.net");
+        let now_s = now_epoch_secs();
+        for (k, title) in [(&open_chat, "Open"), (&bg_chat, "Unopened")] {
+            store
+                .upsert_chat(
+                    &postbox_core::Chat {
+                        key: k.clone(),
+                        title: title.into(),
+                        is_group: false,
+                        archived_local: false,
+                        archived_remote: false,
+                        pinned: false,
+                        unread_count: 0,
+                        last_msg_ts: recent_ts.clone(),
+                        last_msg_preview: "img".into(),
+                        avatar_hash: None,
+                    },
+                    now_s,
+                )
+                .unwrap();
+        }
+
+        let (_bridge, worker) = create_sync_bridge();
+        let mut engine = SyncEngine::with_m3(client, store, worker, data_dir.clone(), None);
+        engine.open_chat = Some(open_chat.clone());
+
+        // 1. While open-chat download is active, background drain MUST yield!
+        engine.open_media_in_flight = 1;
+        engine.maybe_start_background_drain();
+        assert_eq!(msg_fetches.load(Ordering::SeqCst), 0);
+        assert!(engine.bg_drain_pending);
+        assert!(!engine.background_swept_chats.contains_key(&bg_chat));
+
+        // 2. Open-chat finishes -> background drain fetches Hub messages for 0-message bg_chat!
+        engine.open_media_in_flight = 0;
+        engine.maybe_start_background_drain();
+        let bg_msgs_res = engine.bg_rx.recv().await.unwrap();
+        engine.handle_bg_result(bg_msgs_res);
+        assert_eq!(msg_fetches.load(Ordering::SeqCst), 1);
+        assert!(!engine.background_swept_chats.contains_key(&bg_chat));
+
+        // 3. Message persisted and its media download spawned -> completes & marks bg_chat swept!
+        let bg_dl_res = engine.bg_rx.recv().await.unwrap();
+        engine.handle_bg_result(bg_dl_res);
+        assert_eq!(media_fetches.load(Ordering::SeqCst), 1);
+        assert!(engine.background_swept_chats.contains_key(&bg_chat));
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

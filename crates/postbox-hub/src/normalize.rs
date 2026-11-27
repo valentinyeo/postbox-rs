@@ -443,6 +443,20 @@ pub fn normalize_messages(raw: &str, expected_chat: &str) -> Result<Vec<HubMessa
         let sender_name = opt_nonempty_str(&obj, &["SenderName", "PushName", "sender_name"])
             .unwrap_or_else(|| sender_id.clone());
 
+        let file_size = u64_size_field(
+            &obj,
+            &[
+                "FileSize",
+                "FileLength",
+                "MediaSize",
+                "Size",
+                "file_size",
+                "file_length",
+                "media_size",
+                "size",
+            ],
+        );
+
         out.push(HubMessage {
             msg_id,
             chat_jid: expected_chat.to_owned(),
@@ -459,6 +473,7 @@ pub fn normalize_messages(raw: &str, expected_chat: &str) -> Result<Vec<HubMessa
             media_type: str_field(&obj, &["MediaType", "media_type"]),
             mime_type: opt_nonempty_str(&obj, &["MimeType", "mime_type"]),
             filename: opt_nonempty_str(&obj, &["Filename", "filename"]),
+            file_size,
             reaction_to_id: str_field(&obj, &["ReactionToID", "reaction_to_id"]),
             reaction_emoji,
             reactions,
@@ -482,6 +497,25 @@ pub fn normalize_messages(raw: &str, expected_chat: &str) -> Result<Vec<HubMessa
     }
 
     Ok(out)
+}
+
+fn u64_size_field(obj: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    for &key in keys {
+        let Some(val) = obj.get(key) else {
+            continue;
+        };
+        if let Some(n) = val.as_u64() {
+            if n > 0 {
+                return Some(n);
+            }
+        } else if let Some(s) = val.as_str()
+            && let Ok(n) = s.trim().parse::<u64>()
+            && n > 0
+        {
+            return Some(n);
+        }
+    }
+    None
 }
 
 /// Exact port of `hub.zig:70-99`: merges `second` into `first` deduplicating by `msg_id`,

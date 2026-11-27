@@ -6,10 +6,10 @@
 use crate::desktop::PostboxShell;
 use crate::m5::{DICTATION_METER_TICK_MS, DictationPhase};
 use crate::theme::ShadcnPalette;
-use gpui_kit::gpui::{
-    AnyElement, Context, IntoElement, ParentElement, Styled, Window, div, px, rgb,
+use gpui_kit::{
+    AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, TestSupportExt, Window, div, px, rgb,
 };
-use gpui_kit::prelude::{InteractiveElement, StatefulInteractiveElement};
 use postbox_core::voice::format_voice_clock;
 
 impl PostboxShell {

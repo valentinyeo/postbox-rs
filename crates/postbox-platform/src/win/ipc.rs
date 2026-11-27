@@ -212,7 +212,7 @@ mod tests {
             );
         }
         assert_eq!(
-            pipe_path(r"\\.\pipe\\\\.\pipe\postbox-link-test"),
+            pipe_path(concat!(r"\\.\pipe\", r"\\.\pipe\", "postbox-link-test")),
             PathBuf::from(r"\\.\pipe\postbox-link-test")
         );
     }

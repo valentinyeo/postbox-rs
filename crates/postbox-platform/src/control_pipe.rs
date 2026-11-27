@@ -319,6 +319,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_full_path_pasted_twice_still_names_one_pipe() {
+        // Built with `concat!` so the three backslashes between the two prefixes can never
+        // be miscounted: one closes the first prefix, two open the second.
+        assert_eq!(
+            underlying_pipe_name(concat!(r"\\.\pipe\", r"\\.\pipe\", "postbox-link-test")),
+            "postbox-link-test"
+        );
+    }
+
+    #[test]
     fn transport_parses_a_win32_pipe_name() {
         assert_eq!(
             Transport::parse(r"\\.\pipe\postbox-control-valentin"),

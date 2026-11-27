@@ -471,6 +471,12 @@ fn main() {
                 println!("Postbox is already running; handed the request over.");
             }
             StartupRole::Primary { link } => {
+                if let Ok(exe) = std::env::current_exe()
+                    && let Some(install_dir) = exe.parent()
+                    && let Some(exe_name) = exe.file_name().and_then(|name| name.to_str())
+                {
+                    postbox_platform::cleanup_backup(install_dir, exe_name);
+                }
                 let mut launch_ctx = build_launch_context(&cfg, started_at, true);
                 launch_ctx.startup_link = link.map(|target| postbox_ui::toast_launch_url(&target));
                 launch_ctx.last_exit_record = last_exit;

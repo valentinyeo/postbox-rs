@@ -9,13 +9,14 @@
 //! 3. extract the new binary to `*.staged.exe` beside the live binary.
 //!
 //! `commit` (the restart click):
-//! 4. copy the live binary to `*.backup.exe`,
-//! 5. replace the live binary with the staged one in one `MoveFileExW`
-//!    (`REPLACE_EXISTING | WRITE_THROUGH`) on Windows, one `rename` on Unix,
-//! 6. on any failure after step 4, move the backup back and report the error.
+//! 4. rename the live binary to `*.old`,
+//! 5. move the staged binary into the now-vacant live path using `MoveFileExW`
+//!    (`REPLACE_EXISTING | WRITE_THROUGH`) on Windows, `rename` on Unix,
+//! 6. if step 5 fails, move the backup back and report the error.
 //!
-//! Steps 1-3 never touch the live binary, and step 5 is the only mutating call, so the app
-//! is runnable before it, during it and after it.
+//! Steps 1-3 never touch the live binary. During the swap, the previous executable stays
+//! runnable at the backup path until the new binary takes its place. A later launch removes
+//! the leftover backup on a best-effort basis.
 //!
 //! The zip reader, the installer and the relaunch hook are traits so the whole sequence runs
 //! on Linux CI with real files and a fake relaunch. [`stage_release`] picks the reader from
@@ -30,12 +31,12 @@ use std::path::{Path, PathBuf};
 pub const STAGED_SUFFIX: &str = ".staged";
 /// Suffix of the extracted replacement binary.
 pub const PENDING_SUFFIX: &str = ".staged.exe";
-/// Suffix of the copy of the live binary taken just before the swap.
-pub const BACKUP_SUFFIX: &str = ".backup.exe";
+/// Suffix of the live binary moved aside just before the swap.
+pub const BACKUP_SUFFIX: &str = ".old";
 /// Name of the executable inside the release zip and of the installed binary.
 pub const EXE_ASSET_NAME: &str = "postbox.exe";
 
-/// Moves the staged file over the live one. The only mutating OS call in the flow.
+/// Moves executables between the live, pending and backup paths.
 pub trait AtomicReplacer: Send + Sync {
     /// Replaces `target` with `staged` in one step, leaving `target` untouched on failure.
     fn replace(&self, staged: &Path, target: &Path) -> Result<(), PlatformError>;
@@ -147,6 +148,11 @@ pub fn pending_exe_path(install_dir: &Path, exe_name: &str) -> PathBuf {
 
 pub fn backup_exe_path(install_dir: &Path, exe_name: &str) -> PathBuf {
     install_dir.join(format!("{exe_name}{BACKUP_SUFFIX}"))
+}
+
+/// Best-effort cleanup of the previous executable after an update relaunch.
+pub fn cleanup_backup(install_dir: &Path, exe_name: &str) {
+    let _ = std::fs::remove_file(backup_exe_path(install_dir, exe_name));
 }
 
 /// Verifies downloaded bytes against the manifest before anything is extracted.
@@ -307,10 +313,10 @@ pub fn discard(staged: &StagedUpdate) {
     let _ = std::fs::remove_file(&staged.pending_exe);
 }
 
-/// Steps 4-6: back up the live binary, swap the staged one in atomically and clean up.
+/// Steps 4-6: move the live binary aside, move the staged one in and clean up.
 ///
-/// The swap either replaces the live executable or leaves it exactly as it was, and a failed
-/// replace restores the backup, so this never leaves the install without a runnable exe.
+/// A failed swap restores the backup. If restoring also fails, the error reports the backup
+/// path so the previous executable can be recovered.
 pub fn commit(
     staged: &StagedUpdate,
     replacer: &dyn AtomicReplacer,
@@ -321,7 +327,9 @@ pub fn commit(
     let live = staged.install_dir.join(&staged.exe_name);
     let backup = backup_exe_path(&staged.install_dir, &staged.exe_name);
     if live.exists() {
-        std::fs::copy(&live, &backup)?;
+        let _ = std::fs::remove_file(&backup);
+        // Windows permits renaming a running executable, but not replacing it in place.
+        replacer.replace(&live, &backup)?;
     }
 
     swap_with_rollback(replacer, &staged.pending_exe, &live, &backup)?;
@@ -477,32 +485,17 @@ mod tests {
         }
     }
 
-    /// How a fake swap fails.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum FailMode {
-        /// Fails without touching the target (the live binary survives as it was).
-        BeforeTouching,
-        /// Deletes the target and then fails, so only the backup is runnable.
-        AfterDeleting,
-    }
-
     struct FailingReplacer {
         calls: Mutex<Vec<(PathBuf, PathBuf)>>,
-        mode: FailMode,
-        fail_calls: usize,
+        fail_calls: Vec<usize>,
     }
 
     impl FailingReplacer {
-        fn new(mode: FailMode, fail_calls: usize) -> Self {
+        fn new(fail_calls: &[usize]) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
-                mode,
-                fail_calls,
+                fail_calls: fail_calls.to_vec(),
             }
-        }
-
-        fn always(mode: FailMode) -> Self {
-            Self::new(mode, usize::MAX)
         }
     }
 
@@ -511,19 +504,14 @@ mod tests {
             let should_fail = {
                 let mut calls = self.calls.lock().unwrap();
                 calls.push((staged.to_path_buf(), target.to_path_buf()));
-                calls.len() <= self.fail_calls
+                self.fail_calls.contains(&calls.len())
             };
-            if !should_fail {
-                std::fs::rename(staged, target)?;
-                return Ok(());
+            if should_fail {
+                return Err(PlatformError::OsUnavailable);
             }
-            match self.mode {
-                FailMode::BeforeTouching => Err(PlatformError::OsUnavailable),
-                FailMode::AfterDeleting => {
-                    let _ = std::fs::remove_file(target);
-                    Err(PlatformError::OsUnavailable)
-                }
-            }
+            assert!(!target.exists(), "the running exe must be moved aside first");
+            std::fs::rename(staged, target)?;
+            Ok(())
         }
     }
 
@@ -596,7 +584,18 @@ mod tests {
         )
         .unwrap();
 
-        let report = commit(&staged, &NativeReplacer).expect("the restart click commits");
+        let backup = backup_exe_path(&dir, "postbox.exe");
+        std::fs::write(&backup, b"stale backup").unwrap();
+        let replacer = FailingReplacer::new(&[]);
+        let report = commit(&staged, &replacer).expect("the restart click commits");
+
+        assert_eq!(
+            *replacer.calls.lock().unwrap(),
+            vec![
+                (live.clone(), backup),
+                (staged.pending_exe.clone(), live.clone()),
+            ]
+        );
 
         assert_eq!(std::fs::read(&live).unwrap(), bytes);
         assert_eq!(report.installed_exe, live);
@@ -716,13 +715,12 @@ mod tests {
     }
 
     #[test]
-    fn a_swap_that_loses_the_live_binary_rolls_the_backup_back() {
+    fn a_failed_second_move_restores_the_backup() {
         let dir = temp_dir("rollback");
         let live = dir.join("postbox.exe");
         std::fs::write(&live, b"installed build").unwrap();
         let bytes = b"new build";
-        // The first replace deletes the live file and fails; the second (rollback) succeeds.
-        let replacer = FailingReplacer::new(FailMode::AfterDeleting, 1);
+        let replacer = FailingReplacer::new(&[2]);
 
         let err = install(
             &asset_for(bytes),
@@ -743,19 +741,28 @@ mod tests {
             b"installed build",
             "the previous build is restored"
         );
-        let calls = replacer.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2, "one failed swap plus one restore");
-        assert!(calls[1].0.ends_with("postbox.exe.backup.exe"));
+        let backup = backup_exe_path(&dir, "postbox.exe");
+        let pending = pending_exe_path(&dir, "postbox.exe");
+        assert_eq!(
+            *replacer.calls.lock().unwrap(),
+            vec![
+                (live.clone(), backup.clone()),
+                (pending.clone(), live.clone()),
+                (backup.clone(), live),
+            ]
+        );
+        assert!(!backup.exists());
+        assert_eq!(std::fs::read(pending).unwrap(), bytes);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_swap_that_never_touched_the_live_binary_still_reports_the_failure() {
+    fn a_failed_backup_move_leaves_the_live_binary_untouched() {
         let dir = temp_dir("untouched");
         let live = dir.join("postbox.exe");
         std::fs::write(&live, b"installed build").unwrap();
         let bytes = b"new build";
-        let replacer = FailingReplacer::always(FailMode::BeforeTouching);
+        let replacer = FailingReplacer::new(&[1, 2]);
 
         let err = install(
             &asset_for(bytes),
@@ -765,16 +772,16 @@ mod tests {
             &PlainFileExtractor,
             &replacer,
         )
-        .expect_err("a failed swap is reported");
-        assert!(
-            matches!(err, UpdateError::SwapFailedRolledBack(_)),
-            "{err:?}"
-        );
+        .expect_err("a failed backup move is reported");
+        assert!(matches!(err, UpdateError::Io(_)), "{err:?}");
         assert_eq!(std::fs::read(&live).unwrap(), b"installed build");
         assert_eq!(
-            replacer.calls.lock().unwrap().len(),
-            1,
-            "no restore is needed when the live file never moved"
+            *replacer.calls.lock().unwrap(),
+            vec![(live, backup_exe_path(&dir, "postbox.exe"))]
+        );
+        assert_eq!(
+            std::fs::read(pending_exe_path(&dir, "postbox.exe")).unwrap(),
+            bytes
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -785,7 +792,7 @@ mod tests {
         let live = dir.join("postbox.exe");
         std::fs::write(&live, b"installed build").unwrap();
         let bytes = b"new build";
-        let replacer = FailingReplacer::always(FailMode::BeforeTouching);
+        let replacer = FailingReplacer::new(&[1, 2]);
         // Delete the live binary to simulate a replace that removed it and then failed.
         let pending = pending_exe_path(&dir, "postbox.exe");
         std::fs::write(&pending, bytes).unwrap();
@@ -822,6 +829,37 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_backup_removes_only_the_old_binary_and_is_repeatable() {
+        let dir = temp_dir("cleanup");
+        let live = dir.join("postbox.exe");
+        let backup = dir.join("postbox.exe.old");
+        let pending = pending_exe_path(&dir, "postbox.exe");
+        std::fs::write(&live, b"new build").unwrap();
+        std::fs::write(&backup, b"old build").unwrap();
+        std::fs::write(&pending, b"pending build").unwrap();
+
+        cleanup_backup(&dir, "postbox.exe");
+        cleanup_backup(&dir, "postbox.exe");
+
+        assert!(!backup.exists());
+        assert_eq!(std::fs::read(&live).unwrap(), b"new build");
+        assert_eq!(std::fs::read(&pending).unwrap(), b"pending build");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_backup_ignores_removal_errors() {
+        let dir = temp_dir("cleanup-error");
+        let backup = dir.join("postbox.exe.old");
+        std::fs::create_dir(&backup).unwrap();
+
+        cleanup_backup(&dir, "postbox.exe");
+
+        assert!(backup.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn staging_paths_stay_beside_the_install_directory() {
         let dir = Path::new(r"C:\Program Files\Postbox");
         let staged = staged_archive_path(dir, "postbox-windows-x64.zip");
@@ -832,7 +870,7 @@ mod tests {
         );
         assert_eq!(
             backup_exe_path(dir, "postbox.exe"),
-            dir.join("postbox.exe.backup.exe")
+            dir.join("postbox.exe.old")
         );
         assert_eq!(staged.parent(), Some(dir), "same volume as the live binary");
     }

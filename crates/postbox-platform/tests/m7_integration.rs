@@ -554,27 +554,21 @@ mod control_round_trip {
 // 4. Atomic self-updater
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FailMode {
-    /// Deletes the live file and then refuses, so only the backup is runnable.
-    AfterDeleting,
-}
-
+#[derive(Default)]
 struct ScriptedReplacer {
     calls: Mutex<Vec<(PathBuf, PathBuf)>>,
-    mode: FailMode,
+    fail_calls: Vec<usize>,
 }
 
 impl AtomicReplacer for ScriptedReplacer {
     fn replace(&self, staged: &Path, target: &Path) -> Result<(), PlatformError> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push((staged.to_path_buf(), target.to_path_buf()));
-        if self.mode == FailMode::AfterDeleting {
-            let _ = std::fs::remove_file(target);
+        let mut calls = self.calls.lock().unwrap();
+        calls.push((staged.to_path_buf(), target.to_path_buf()));
+        if self.fail_calls.contains(&calls.len()) {
+            return Err(PlatformError::OsUnavailable);
         }
-        Err(PlatformError::OsUnavailable)
+        assert!(!target.exists(), "the running exe must be moved aside first");
+        postbox_platform::NativeReplacer.replace(staged, target)
     }
 }
 
@@ -626,6 +620,9 @@ mod updater {
         let asset = manifest.select_asset().unwrap();
         let bytes = source.download(&asset).unwrap();
         assert_eq!(source.download_count(), 1);
+        let backup = dir.join("postbox.exe.old");
+        std::fs::write(&backup, b"stale backup").unwrap();
+        let replacer = ScriptedReplacer::default();
 
         let report = postbox_platform::install(
             &asset,
@@ -633,15 +630,28 @@ mod updater {
             &dir,
             postbox_platform::updater::EXE_ASSET_NAME,
             &postbox_platform::PlainFileExtractor,
-            &postbox_platform::NativeReplacer,
+            &replacer,
         )
         .expect("install succeeds");
+
+        assert_eq!(
+            *replacer.calls.lock().unwrap(),
+            vec![
+                (live.clone(), backup.clone()),
+                (dir.join("postbox.exe.staged.exe"), live.clone()),
+            ]
+        );
 
         assert_eq!(std::fs::read(&live).unwrap(), payload);
         assert_eq!(report.verified_sha256, digest_hex(payload));
         let backup = report.backup.expect("the previous build was kept");
         assert_eq!(std::fs::read(&backup).unwrap(), b"installed build");
         assert!(!dir.join("postbox-windows-x64.zip.staged").exists());
+
+        postbox_platform::cleanup_backup(&dir, "postbox.exe");
+        postbox_platform::cleanup_backup(&dir, "postbox.exe");
+        assert!(!backup.exists());
+        assert_eq!(std::fs::read(&live).unwrap(), payload);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -715,7 +725,7 @@ mod updater {
 
         assert_eq!(std::fs::read(&live).unwrap(), payload);
         assert_eq!(report.verified_sha256, digest_hex(&archive));
-        assert_eq!(report.backup, Some(dir.join("postbox.exe.backup.exe")));
+        assert_eq!(report.backup, Some(dir.join("postbox.exe.old")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -771,42 +781,63 @@ mod updater {
             b"installed build",
             "the live binary must be byte-identical after a refused update"
         );
-        assert!(!dir.join("postbox.exe.backup.exe").exists());
+        assert!(!dir.join("postbox.exe.old").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_failed_swap_puts_the_previous_executable_back() {
-        let dir = temp_dir("update-rollback");
-        let live = dir.join("postbox.exe");
-        std::fs::write(&live, b"installed build").unwrap();
-        let payload = b"new build";
-        let asset = manifest_for(payload, "v0.2.0").select_asset().unwrap();
-        let replacer = ScriptedReplacer {
-            calls: Mutex::new(Vec::new()),
-            mode: FailMode::AfterDeleting,
-        };
+    fn a_failed_second_move_restores_the_previous_executable_or_reports_its_backup() {
+        for fail_rollback in [false, true] {
+            let dir = temp_dir(if fail_rollback {
+                "update-rollback-failed"
+            } else {
+                "update-rollback"
+            });
+            let live = dir.join("postbox.exe");
+            let backup = dir.join("postbox.exe.old");
+            let pending = dir.join("postbox.exe.staged.exe");
+            std::fs::write(&live, b"installed build").unwrap();
+            let payload = b"new build";
+            let asset = manifest_for(payload, "v0.2.0").select_asset().unwrap();
+            let replacer = ScriptedReplacer {
+                fail_calls: if fail_rollback { vec![2, 3] } else { vec![2] },
+                ..Default::default()
+            };
 
-        // The scripted replacer always fails, so the first swap loses the live file and the
-        // rollback (a second `replace`) also fails, leaving the backup as the only copy.
-        let err = postbox_platform::install(
-            &asset,
-            payload,
-            &dir,
-            postbox_platform::updater::EXE_ASSET_NAME,
-            &postbox_platform::PlainFileExtractor,
-            &replacer,
-        )
-        .expect_err("the swap fails");
-        match err {
-            UpdateError::SwapFailedRollbackFailed { backup, .. } => {
-                let backup = backup.expect("the backup path is reported");
+            let err = postbox_platform::install(
+                &asset,
+                payload,
+                &dir,
+                postbox_platform::updater::EXE_ASSET_NAME,
+                &postbox_platform::PlainFileExtractor,
+                &replacer,
+            )
+            .expect_err("the swap fails");
+            if fail_rollback {
+                match err {
+                    UpdateError::SwapFailedRollbackFailed { backup: path, .. } => {
+                        assert_eq!(path, Some(backup.clone()));
+                    }
+                    other => panic!("expected a failed rollback with a backup path, got {other:?}"),
+                }
+                assert!(!live.exists());
                 assert_eq!(std::fs::read(&backup).unwrap(), b"installed build");
+            } else {
+                assert!(matches!(err, UpdateError::SwapFailedRolledBack(_)), "{err:?}");
+                assert_eq!(std::fs::read(&live).unwrap(), b"installed build");
+                assert!(!backup.exists());
             }
-            other => panic!("expected a failed rollback with a backup path, got {other:?}"),
+            assert_eq!(std::fs::read(&pending).unwrap(), payload);
+            assert_eq!(
+                *replacer.calls.lock().unwrap(),
+                vec![
+                    (live.clone(), backup.clone()),
+                    (pending, live.clone()),
+                    (backup, live),
+                ]
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        assert_eq!(replacer.calls.lock().unwrap().len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -817,20 +848,10 @@ mod updater {
         let payload = b"new build";
         let asset = manifest_for(payload, "v0.2.0").select_asset().unwrap();
 
-        // First call fails before touching, so the rollback call succeeds (it renames the
-        // backup over the untouched live file, which is still runnable either way).
-        struct FirstOnly(Mutex<usize>);
-        impl AtomicReplacer for FirstOnly {
-            fn replace(&self, staged: &Path, target: &Path) -> Result<(), PlatformError> {
-                let mut calls = self.0.lock().unwrap();
-                *calls += 1;
-                if *calls == 1 {
-                    return Err(PlatformError::OsUnavailable);
-                }
-                std::fs::rename(staged, target).map_err(PlatformError::Io)
-            }
-        }
-        let replacer = FirstOnly(Mutex::new(0));
+        let replacer = ScriptedReplacer {
+            fail_calls: vec![1],
+            ..Default::default()
+        };
         let err = postbox_platform::install(
             &asset,
             payload,
@@ -839,10 +860,15 @@ mod updater {
             &postbox_platform::PlainFileExtractor,
             &replacer,
         )
-        .expect_err("the failed swap is reported");
-        assert!(
-            matches!(err, UpdateError::SwapFailedRolledBack(_)),
-            "{err:?}"
+        .expect_err("the failed backup move is reported");
+        assert!(matches!(err, UpdateError::Io(_)), "{err:?}");
+        assert_eq!(
+            *replacer.calls.lock().unwrap(),
+            vec![(live.clone(), dir.join("postbox.exe.old"))]
+        );
+        assert_eq!(
+            std::fs::read(dir.join("postbox.exe.staged.exe")).unwrap(),
+            payload
         );
         assert_eq!(
             std::fs::read(&live).unwrap(),

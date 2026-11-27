@@ -1,4 +1,5 @@
 pub mod geometry;
+pub mod m3;
 pub mod palette;
 pub mod sync_bridge;
 pub mod theme;
@@ -7,13 +8,17 @@ pub mod viewmodel;
 
 #[cfg(feature = "desktop")]
 pub mod desktop;
+#[cfg(feature = "desktop")]
+mod desktop_m3;
 
 pub use geometry::RowGeometry;
+pub use m3::{M3State, MentionPopupState, ShortcodePopupState};
 pub use palette::{
     PaletteCommand, PaletteEntry, PaletteEntryKind, PaletteGroupKind, PaletteMode, PaletteSection,
 };
 pub use sync_bridge::{
-    HubConnectionStatus, SyncBridge, SyncCommand, SyncEvent, SyncWorkerHandle, create_sync_bridge,
+    HubConnectionStatus, MediaDownloadTarget, SyncBridge, SyncCommand, SyncEvent, SyncWorkerHandle,
+    create_sync_bridge,
 };
 pub use theme::{
     ARCHIVED_ROW_FOREGROUND_WEIGHT, ShadcnPalette, archived_row_color, archived_text_color,

@@ -108,6 +108,14 @@ pub enum MediaFetchState {
     Ready(Vec<u8>),
     Pending,
     Unavailable,
+    /// HTTP 410 Gone — media is permanently unavailable and MUST be recorded in SQLite `gone_media`.
+    Gone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaFetchDetailed {
+    pub state: MediaFetchState,
+    pub content_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +206,7 @@ pub struct HubMessage {
     pub media_type: String,
     pub mime_type: Option<String>,
     pub filename: Option<String>,
+    pub file_size: Option<u64>,
     pub reaction_to_id: String,
     pub reaction_emoji: String,
     pub reactions: Vec<Reaction>,
@@ -220,7 +229,7 @@ impl HubMessage {
         } else {
             MediaKind::parse(&self.media_type).or_else(|| {
                 match self.media_type.to_ascii_lowercase().as_str() {
-                    "ptt" | "audio" => Some(MediaKind::Voice),
+                    "ptt" => Some(MediaKind::Voice),
                     "file" | "doc" => Some(MediaKind::Document),
                     _ => None,
                 }
@@ -272,6 +281,7 @@ impl HubMessage {
             media_kind,
             mime_type: self.mime_type.clone(),
             filename: self.filename.clone(),
+            file_size: self.file_size,
             reactions: self.reactions.clone(),
             read_status,
             deleted: self.revoked,

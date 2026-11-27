@@ -139,6 +139,7 @@ pub enum MediaKind {
     Image,
     Gif,
     Video,
+    Audio,
     Voice,
     Sticker,
     Document,
@@ -150,6 +151,7 @@ impl MediaKind {
             Self::Image => "image",
             Self::Gif => "gif",
             Self::Video => "video",
+            Self::Audio => "audio",
             Self::Voice => "voice",
             Self::Sticker => "sticker",
             Self::Document => "document",
@@ -157,15 +159,30 @@ impl MediaKind {
     }
 
     pub fn parse(raw: &str) -> Option<Self> {
-        match raw.to_ascii_lowercase().as_str() {
+        match raw.trim().to_ascii_lowercase().as_str() {
             "image" => Some(Self::Image),
             "gif" => Some(Self::Gif),
             "video" => Some(Self::Video),
+            "audio" => Some(Self::Audio),
             "voice" => Some(Self::Voice),
             "sticker" => Some(Self::Sticker),
             "document" => Some(Self::Document),
             _ => None,
         }
+    }
+
+    /// All 7 media types auto-download on chat open (unless > 100 MiB).
+    pub const fn is_downloadable(self) -> bool {
+        matches!(
+            self,
+            Self::Image
+                | Self::Sticker
+                | Self::Video
+                | Self::Gif
+                | Self::Audio
+                | Self::Voice
+                | Self::Document
+        )
     }
 }
 
@@ -225,6 +242,8 @@ pub struct Message {
     pub media_kind: Option<MediaKind>,
     pub mime_type: Option<String>,
     pub filename: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
     pub reactions: Vec<Reaction>,
     pub read_status: ReadStatus,
     pub deleted: bool,
@@ -508,10 +527,12 @@ mod tests {
             MediaKind::Image,
             MediaKind::Gif,
             MediaKind::Video,
+            MediaKind::Audio,
             MediaKind::Voice,
             MediaKind::Sticker,
             MediaKind::Document,
         ] {
+            assert!(kind.is_downloadable());
             assert_eq!(MediaKind::parse(kind.as_str()), Some(kind));
             assert_eq!(
                 MediaKind::parse(&kind.as_str().to_ascii_uppercase()),

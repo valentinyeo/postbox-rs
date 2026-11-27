@@ -1,0 +1,24 @@
+[package]
+name = "postbox-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures-util.workspace = true
+image.workspace = true
+postbox-core.workspace = true
+postbox-hub.workspace = true
+postbox-platform.workspace = true
+postbox-store.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true

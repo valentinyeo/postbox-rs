@@ -5389,6 +5389,7 @@ dependencies = [
  "postbox-core",
  "postbox-hub",
  "postbox-keymap",
+ "postbox-media",
  "postbox-platform",
  "postbox-store",
  "postbox-ui",
@@ -5440,6 +5441,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "postbox-media"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "image",
+ "postbox-core",
+ "postbox-hub",
+ "postbox-platform",
+ "postbox-store",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "postbox-platform"
 version = "0.1.0"
 dependencies = [
@@ -5465,9 +5486,13 @@ version = "0.1.0"
 dependencies = [
  "async-channel",
  "gpui-kit",
+ "image",
  "postbox-core",
  "postbox-keymap",
+ "postbox-media",
+ "postbox-platform",
  "postbox-store",
+ "smallvec",
 ]
 
 [[package]]

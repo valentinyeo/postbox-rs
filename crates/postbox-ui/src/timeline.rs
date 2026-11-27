@@ -256,6 +256,7 @@ mod tests {
             media_kind: None,
             mime_type: None,
             filename: None,
+            file_size: None,
             reactions: vec![],
             read_status: ReadStatus::Read,
             deleted: false,

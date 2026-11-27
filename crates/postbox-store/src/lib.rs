@@ -1,3 +1,4 @@
+pub mod media;
 pub mod outbox;
 pub mod state;
 
@@ -16,6 +17,7 @@ use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 
+pub use media::{FetchMarker, MediaCacheEntry, SETTING_EMOJI_RECENTS, gone_media_pair_key};
 pub use postbox_core::outbox::{OutboxKind, OutboxPhase, OutboxRecord};
 pub use state::{MAX_PINS, PendingArchiveRow};
 
@@ -191,6 +193,7 @@ CREATE TABLE IF NOT EXISTS messages (
     media_type TEXT,
     mime_type TEXT,
     filename TEXT,
+    file_size INTEGER,
     reactions_json TEXT NOT NULL DEFAULT '[]',
     read_status TEXT NOT NULL DEFAULT 'none',
     deleted INTEGER NOT NULL DEFAULT 0,
@@ -350,6 +353,25 @@ CREATE TABLE IF NOT EXISTS view_prefs (
     selected_account_id TEXT,
     selected_chat_id TEXT
 );
+
+CREATE TABLE IF NOT EXISTS gone_media (
+    pair_key TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    msg_id TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gone_media_chat
+    ON gone_media (provider, account_id, chat_id);
+
+CREATE TABLE IF NOT EXISTS media_fetch_markers (
+    marker_key TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    checked_at INTEGER NOT NULL,
+    rel_path TEXT
+);
 "#;
 
 const SETTING_THEME: &str = "ui.theme";
@@ -448,6 +470,10 @@ impl Store {
                 "ALTER TABLE messages ADD COLUMN ts_key TEXT NOT NULL DEFAULT ''",
                 [],
             )?;
+        }
+        // Forward-migration for existing M0/M1/M2 databases missing `file_size` on `messages`.
+        if !table_has_column(&conn, "messages", "file_size")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN file_size INTEGER", [])?;
         }
         {
             let mut stmt =
@@ -951,11 +977,11 @@ impl Store {
                 INSERT INTO messages (
                     provider, account_id, chat_id, msg_id, sender_id, sender_name,
                     from_me, ts, ts_key, body, reply_to_id, reply_broadcast,
-                    media_type, mime_type, filename, reactions_json, read_status, deleted
+                    media_type, mime_type, filename, file_size, reactions_json, read_status, deleted
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6,
                     ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15, ?16, ?17, ?18
+                    ?13, ?14, ?15, ?16, ?17, ?18, ?19
                 )
                 ON CONFLICT(provider, account_id, chat_id, msg_id) DO UPDATE SET
                     sender_id = excluded.sender_id,
@@ -969,6 +995,7 @@ impl Store {
                     media_type = excluded.media_type,
                     mime_type = excluded.mime_type,
                     filename = excluded.filename,
+                    file_size = COALESCE(excluded.file_size, messages.file_size),
                     reactions_json = excluded.reactions_json,
                     read_status = CASE
                         WHEN excluded.deleted != 0 THEN excluded.read_status
@@ -1001,6 +1028,7 @@ impl Store {
                 let media_type = msg.media_kind.map(MediaKind::as_str);
                 let read_status = msg.read_status.as_str();
                 let ts_key = canonical_ts_sort_key(&msg.ts);
+                let file_size = msg.file_size.map(|sz| sz.min(i64::MAX as u64) as i64);
 
                 let msg_rowid: i64 = upsert_stmt.query_row(
                     params![
@@ -1019,6 +1047,7 @@ impl Store {
                         media_type,
                         msg.mime_type,
                         msg.filename,
+                        file_size,
                         reactions_json,
                         read_status,
                         i64::from(msg.deleted),
@@ -1106,7 +1135,7 @@ impl Store {
                 r#"
                 SELECT msg_id, sender_id, sender_name, from_me, ts, body,
                        reply_to_id, reply_broadcast, media_type, mime_type,
-                       filename, reactions_json, read_status, deleted
+                       filename, file_size, reactions_json, read_status, deleted
                 FROM messages
                 WHERE provider = ?1 AND account_id = ?2 AND chat_id = ?3
                   AND (ts_key, msg_id) < (?4, ?5)
@@ -1131,7 +1160,7 @@ impl Store {
                 r#"
                 SELECT msg_id, sender_id, sender_name, from_me, ts, body,
                        reply_to_id, reply_broadcast, media_type, mime_type,
-                       filename, reactions_json, read_status, deleted
+                       filename, file_size, reactions_json, read_status, deleted
                 FROM messages
                 WHERE provider = ?1 AND account_id = ?2 AND chat_id = ?3
                 ORDER BY ts_key DESC, msg_id DESC
@@ -1391,25 +1420,15 @@ impl Store {
     }
 
     pub fn evict_expired_media(&self, now_unix: i64) -> Result<Vec<String>, StoreError> {
-        let cutoff = now_unix - MEDIA_TTL_SECS;
-        let mut stmt = self
-            .conn
-            .prepare("SELECT rel_path FROM media_cache WHERE last_accessed_at < ?1")?;
-        let paths = stmt
-            .query_map(params![cutoff], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        self.conn.execute(
-            "DELETE FROM media_cache WHERE last_accessed_at < ?1",
-            params![cutoff],
-        )?;
-        Ok(paths)
+        self.evict_expired_media_older_than(now_unix - MEDIA_TTL_SECS)
     }
 }
 
 fn map_message_row(chat_key: &ChatKey, row: &Row<'_>) -> rusqlite::Result<Message> {
     let media_type: Option<String> = row.get(8)?;
-    let reactions_json: String = row.get(11)?;
-    let read_status_str: String = row.get(12)?;
+    let file_size: Option<i64> = row.get(11)?;
+    let reactions_json: String = row.get(12)?;
+    let read_status_str: String = row.get(13)?;
     let reactions: Vec<Reaction> = serde_json::from_str(&reactions_json).unwrap_or_default();
 
     Ok(Message {
@@ -1425,9 +1444,10 @@ fn map_message_row(chat_key: &ChatKey, row: &Row<'_>) -> rusqlite::Result<Messag
         media_kind: media_type.as_deref().and_then(MediaKind::parse),
         mime_type: row.get(9)?,
         filename: row.get(10)?,
+        file_size: file_size.and_then(|v| u64::try_from(v).ok()),
         reactions,
         read_status: ReadStatus::parse(&read_status_str),
-        deleted: row.get::<_, i64>(13)? != 0,
+        deleted: row.get::<_, i64>(14)? != 0,
     })
 }
 
@@ -1565,6 +1585,7 @@ mod tests {
                 media_kind: None,
                 mime_type: None,
                 filename: None,
+                file_size: None,
                 reactions: vec![],
                 read_status: ReadStatus::None,
                 deleted: false,
@@ -1791,6 +1812,7 @@ mod tests {
                 media_kind: None,
                 mime_type: None,
                 filename: None,
+                file_size: None,
                 reactions: vec![],
                 read_status: ReadStatus::Read,
                 deleted: false,
@@ -1821,6 +1843,7 @@ mod tests {
             media_kind: Some(MediaKind::Voice),
             mime_type: Some("audio/ogg".into()),
             filename: Some("note.ogg".into()),
+            file_size: None,
             reactions: vec![Reaction {
                 emoji: "👍".into(),
                 count: 2,
@@ -1842,6 +1865,7 @@ mod tests {
             media_kind: Some(MediaKind::Image),
             mime_type: Some("image/png".into()),
             filename: Some("pic.png".into()),
+            file_size: None,
             reactions: vec![],
             read_status: ReadStatus::Read,
             deleted: false,
@@ -1859,6 +1883,7 @@ mod tests {
             media_kind: None,
             mime_type: None,
             filename: None,
+            file_size: None,
             reactions: vec![],
             read_status: ReadStatus::Sent,
             deleted: false,
@@ -1904,6 +1929,7 @@ mod tests {
             media_kind: None,
             mime_type: None,
             filename: None,
+            file_size: None,
             reactions: vec![],
             read_status: ReadStatus::Read,
             deleted: false,
@@ -1949,6 +1975,7 @@ mod tests {
                 media_kind: None,
                 mime_type: None,
                 filename: None,
+                file_size: None,
                 reactions: vec![],
                 read_status: ReadStatus::None,
                 deleted: false,
@@ -2206,6 +2233,7 @@ mod tests {
                     media_kind: None,
                     mime_type: None,
                     filename: None,
+                    file_size: None,
                     reactions: vec![],
                     read_status: ReadStatus::Read,
                     deleted: false,
@@ -2272,6 +2300,7 @@ mod tests {
                 media_kind: None,
                 mime_type: None,
                 filename: None,
+                file_size: None,
                 reactions: vec![],
                 read_status: ReadStatus::Read,
                 deleted: false,
@@ -2312,6 +2341,7 @@ mod tests {
             media_kind: None,
             mime_type: None,
             filename: None,
+            file_size: None,
             reactions: vec![],
             read_status: ReadStatus::None,
             deleted: false,
@@ -2357,6 +2387,7 @@ mod tests {
             media_kind: None,
             mime_type: None,
             filename: None,
+            file_size: None,
             reactions: vec![],
             read_status: ReadStatus::Read,
             deleted: false,
@@ -2456,5 +2487,148 @@ mod tests {
         older.mark_read(&key, 200);
         store.save_read_state(&older).unwrap();
         assert_eq!(store.load_read_state().unwrap().get(&key).read_ts, 500);
+    }
+
+    #[test]
+    fn m3_media_cache_gone_media_recents_and_reactions_round_trip() {
+        let mut store = Store::open_in_memory().unwrap();
+        let chat_a = ChatKey::new(Provider::Whatsapp, "main", "a@s.whatsapp.net");
+        let chat_b = ChatKey::new(Provider::Whatsapp, "main", "b@s.whatsapp.net");
+        store
+            .upsert_chat(
+                &sample_chat(
+                    Provider::Whatsapp,
+                    "main",
+                    "a@s.whatsapp.net",
+                    "Alice",
+                    "2026-11-26T10:00:00Z",
+                ),
+                1000,
+            )
+            .unwrap();
+        store
+            .upsert_chat(
+                &sample_chat(
+                    Provider::Whatsapp,
+                    "main",
+                    "b@s.whatsapp.net",
+                    "Bob",
+                    "2026-10-01T10:00:00Z",
+                ),
+                1000,
+            )
+            .unwrap();
+
+        // media_cache CRUD + eviction
+        let entry = MediaCacheEntry {
+            cache_key: "k1".into(),
+            sha256: "deadbeef".into(),
+            rel_path: "hub-media/a.bin.png".into(),
+            mime_type: "image/png".into(),
+            byte_size: 4096,
+            last_accessed_at: 1000,
+        };
+        store.upsert_media_cache(&entry).unwrap();
+        assert_eq!(store.get_media_cache("k1").unwrap(), Some(entry));
+        assert!(store.touch_media_cache("k1", 5000).unwrap());
+        assert_eq!(
+            store
+                .get_media_cache("k1")
+                .unwrap()
+                .unwrap()
+                .last_accessed_at,
+            5000
+        );
+        let evicted = store.evict_expired_media_older_than(5001).unwrap();
+        assert_eq!(evicted, vec!["hub-media/a.bin.png".to_owned()]);
+        assert!(store.get_media_cache("k1").unwrap().is_none());
+
+        // gone_media never collides across chats even with identical msg_id
+        store.mark_media_gone(&chat_a, "dup_id", 1000).unwrap();
+        assert!(store.is_media_gone(&chat_a, "dup_id").unwrap());
+        assert!(!store.is_media_gone(&chat_b, "dup_id").unwrap());
+        assert_eq!(
+            store.list_gone_media_for_chat(&chat_a).unwrap(),
+            vec!["dup_id".to_owned()]
+        );
+
+        // media_fetch_markers
+        store
+            .upsert_fetch_marker("avatar:a", "none", 2000, None)
+            .unwrap();
+        let marker = store.get_fetch_marker("avatar:a").unwrap().unwrap();
+        assert_eq!(marker.status, "none");
+        assert_eq!(marker.checked_at, 2000);
+
+        // emoji recents persistence + dedup + cap 8
+        let recents: Vec<String> = ["🔥", "👍", "🔥", "😂", "❤️", "😮", "😢", "🙏", "🎉", "🚀"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        store.save_emoji_recents(&recents).unwrap();
+        let loaded = store.load_emoji_recents().unwrap();
+        assert_eq!(loaded.len(), 8);
+        assert_eq!(loaded[0], "🔥");
+        assert_eq!(loaded[1], "👍");
+
+        // file_size + update_message_reactions
+        let msg = Message {
+            chat: chat_a.clone(),
+            msg_id: "m1".into(),
+            sender_id: "u1".into(),
+            sender_name: "Alice".into(),
+            from_me: false,
+            ts: "2026-11-26T10:00:00Z".into(),
+            body: "big file".into(),
+            reply_to_id: None,
+            reply_broadcast: false,
+            media_kind: Some(MediaKind::Document),
+            mime_type: Some("application/pdf".into()),
+            filename: Some("big.pdf".into()),
+            file_size: Some(104_857_601),
+            reactions: vec![],
+            read_status: ReadStatus::None,
+            deleted: false,
+        };
+        store.upsert_message(&msg).unwrap();
+        let reactions = vec![Reaction {
+            emoji: "👍".into(),
+            count: 1,
+            from_me: true,
+        }];
+        assert!(
+            store
+                .update_message_reactions(&chat_a, "m1", &reactions)
+                .unwrap()
+        );
+        let listed = store.list_messages(&chat_a, 10, None).unwrap();
+        assert_eq!(listed[0].file_size, Some(104_857_601));
+        assert_eq!(listed[0].reactions, reactions);
+
+        // list_recent_chats_within_days (including Slack space-separated timestamps at exact cutoff)
+        let chat_slack_space = ChatKey::new(Provider::Slack, "T1", "slack:T1:C999");
+        store
+            .upsert_chat(
+                &Chat {
+                    key: chat_slack_space.clone(),
+                    title: "#general".into(),
+                    is_group: true,
+                    archived_local: false,
+                    archived_remote: false,
+                    pinned: false,
+                    unread_count: 0,
+                    last_msg_ts: "2026-11-12 00:00:00".into(),
+                    last_msg_preview: "hi".into(),
+                    avatar_hash: None,
+                },
+                1000,
+            )
+            .unwrap();
+        let recent = store
+            .list_recent_chats_within_days("2026-11-12T00:00:00Z", 10)
+            .unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].key, chat_a);
+        assert_eq!(recent[1].key, chat_slack_space);
     }
 }

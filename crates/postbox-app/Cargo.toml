@@ -20,6 +20,7 @@ async-channel.workspace = true
 postbox-core.workspace = true
 postbox-hub.workspace = true
 postbox-keymap.workspace = true
+postbox-media.workspace = true
 postbox-platform.workspace = true
 postbox-store.workspace = true
 postbox-ui.workspace = true

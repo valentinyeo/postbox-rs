@@ -948,8 +948,16 @@ async fn media_202_poll_206_reject_and_410_unavailable() {
         Err(HubError::PartialMedia)
     );
 
-    // 410 Gone returns Unavailable.
+    // 410 Gone returns Gone (permanently unavailable) while 404 returns Unavailable.
     state.lock().unwrap().media_status_override = Some(410);
+    assert_eq!(
+        client
+            .fetch_media_once("personal:1@s.whatsapp.net", "m1")
+            .await
+            .unwrap(),
+        MediaFetchState::Gone
+    );
+    state.lock().unwrap().media_status_override = Some(404);
     assert_eq!(
         client
             .fetch_media_once("personal:1@s.whatsapp.net", "m1")

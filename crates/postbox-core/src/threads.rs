@@ -141,6 +141,7 @@ mod tests {
             media_kind: None,
             mime_type: None,
             filename: None,
+            file_size: None,
             reactions: Vec::new(),
             read_status: ReadStatus::None,
             deleted: false,

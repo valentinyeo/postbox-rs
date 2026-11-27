@@ -18,7 +18,9 @@
 //! is runnable before it, during it and after it.
 //!
 //! The zip reader, the installer and the relaunch hook are traits so the whole sequence runs
-//! on Linux CI with real files and a fake relaunch.
+//! on Linux CI with real files and a fake relaunch. [`stage_release`] picks the reader from
+//! the download (zip magic or a `.zip` asset, otherwise a ready executable), so a manifest
+//! that serves a plain binary stages the same way on every OS.
 
 use crate::PlatformError;
 use postbox_core::update::{UpdateAsset, digest_matches};
@@ -258,6 +260,44 @@ pub fn stage(
         install_dir: install_dir.to_path_buf(),
         exe_name: exe_name.to_owned(),
     })
+}
+
+/// Stages a downloaded release, choosing the archive reader from the download itself.
+///
+/// A release archive is the only thing the zip reader may see, and a real one always starts
+/// with the zip local-header magic. A payload that does not is taken as a ready executable
+/// and copied. Picking the reader from the build target instead meant the same download
+/// staged on Linux and failed on Windows, because the Windows build always used the zip
+/// reader. The digest check in [`stage`] has already proved the bytes match the manifest, so
+/// this only decides how to unpack them.
+pub fn stage_release(
+    asset: &UpdateAsset,
+    archive_bytes: &[u8],
+    install_dir: &Path,
+    exe_name: &str,
+) -> Result<StagedUpdate, UpdateError> {
+    if is_zip_payload(archive_bytes) {
+        stage(
+            asset,
+            archive_bytes,
+            install_dir,
+            exe_name,
+            &crate::zip::ZipExtractor,
+        )
+    } else {
+        stage(
+            asset,
+            archive_bytes,
+            install_dir,
+            exe_name,
+            &PlainFileExtractor,
+        )
+    }
+}
+
+/// `true` when the download is a zip, so it must go through the zip reader.
+fn is_zip_payload(archive_bytes: &[u8]) -> bool {
+    archive_bytes.starts_with(b"PK\x03\x04")
 }
 
 /// Deletes a staged download and its extracted executable, for a release that a newer one
@@ -806,6 +846,86 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, exe);
         assert_eq!(calls[0].1, vec!["--restored".to_owned()]);
+    }
+
+    /// A one-entry stored zip, so this module needs no archive builder from the zip tests.
+    fn stored_zip(name: &str, payload: &[u8]) -> Vec<u8> {
+        let crc = crc32fast::hash(payload);
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags: sizes are in the header
+        out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+        out.extend_from_slice(&[0u8; 4]); // time, date
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(payload);
+
+        let central_offset = out.len();
+        out.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&[0u8; 12]);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+
+        let central_size = out.len() - central_offset;
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&(central_size as u32).to_le_bytes());
+        out.extend_from_slice(&(central_offset as u32).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn a_zip_payload_is_unpacked_on_every_os() {
+        // The regression: this decision used to follow the build target, so the same real
+        // release archive staged on Linux and failed on Windows.
+        let dir = temp_dir("stagezip");
+        std::fs::write(dir.join("postbox.exe"), b"installed build").unwrap();
+        let payload = b"the new build inside the release zip";
+        let archive = stored_zip("postbox.exe", payload);
+        let asset = asset_for(&archive);
+
+        let staged = stage_release(&asset, &archive, &dir, "postbox.exe").expect("zip stages");
+
+        assert_eq!(std::fs::read(&staged.pending_exe).unwrap(), payload);
+        assert_eq!(
+            std::fs::read(dir.join("postbox.exe")).unwrap(),
+            b"installed build",
+            "the live binary is still untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_plain_payload_is_copied_on_every_os() {
+        // A manifest may serve the executable itself rather than a zip. The digest check
+        // already proved the bytes, so the reader must not refuse them for lacking a zip
+        // header, which is what the Windows-only extractor used to do.
+        let dir = temp_dir("stageplain");
+        std::fs::write(dir.join("postbox.exe"), b"installed build").unwrap();
+        let bytes = b"a plain release binary";
+        let asset = asset_for(bytes);
+
+        let staged = stage_release(&asset, bytes, &dir, "postbox.exe").expect("plain stages");
+
+        assert_eq!(std::fs::read(&staged.pending_exe).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

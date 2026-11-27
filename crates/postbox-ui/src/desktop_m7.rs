@@ -777,13 +777,7 @@ pub fn run_update_cycle(
                     };
                 }
             };
-            match postbox_platform::stage(
-                &asset,
-                &bytes,
-                install_dir,
-                exe_name,
-                &native_extractor(),
-            ) {
+            match postbox_platform::stage_release(&asset, &bytes, install_dir, exe_name) {
                 Ok(staged) => UpdateCycleOutcome::Staged {
                     staged: Box::new(staged),
                     notes,
@@ -900,17 +894,6 @@ fn native_replacer() -> Box<dyn postbox_platform::AtomicReplacer> {
     #[cfg(not(windows))]
     {
         Box::new(postbox_platform::NativeReplacer)
-    }
-}
-
-fn native_extractor() -> Box<dyn postbox_platform::ArchiveExtractor> {
-    #[cfg(windows)]
-    {
-        Box::new(postbox_platform::win::updater::ZipExtractor)
-    }
-    #[cfg(not(windows))]
-    {
-        Box::new(postbox_platform::PlainFileExtractor)
     }
 }
 

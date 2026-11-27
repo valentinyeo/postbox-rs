@@ -5892,6 +5892,30 @@ mod desktop_tests {
         (dir, live)
     }
 
+    /// Runs the executor until the updater leaves its in-flight phases.
+    ///
+    /// The manifest check, the download and the staging run on a background thread, so one
+    /// `run_until_parked()` can return before that thread's result reaches the shell. Polling
+    /// the phase instead of sleeping a fixed time keeps the wait bounded and gives the same
+    /// answer on a fast Linux disk and a slow Windows CI disk.
+    fn settle_update_cycle(cx: &mut TestAppContext, shell: &Entity<PostboxShell>) {
+        for _ in 0..600 {
+            cx.run_until_parked();
+            let settled = cx.update(|cx| !shell.read(cx).vm.m7().busy());
+            if settled {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.update(|cx| {
+            panic!(
+                "the update cycle never settled, still {:?}: {:?}",
+                shell.read(cx).vm.m7().update_phase,
+                shell.read(cx).vm.m7().update_note
+            )
+        });
+    }
+
     #[gpui_kit::test]
     fn auto_check_stages_the_download_and_offers_the_restart_card(cx: &mut TestAppContext) {
         let (install_dir, live) = install_fixture("update_auto");
@@ -5913,7 +5937,7 @@ mod desktop_tests {
             shell.update(cx, |this, cx| this.start_update_cycle(cx, false));
         })
         .unwrap();
-        cx.run_until_parked();
+        settle_update_cycle(cx, &shell);
 
         cx.update(|cx| {
             let this = shell.read(cx);
@@ -5990,7 +6014,7 @@ mod desktop_tests {
             shell.update(cx, |this, cx| this.start_update_cycle(cx, false));
         })
         .unwrap();
-        cx.run_until_parked();
+        settle_update_cycle(cx, &shell);
 
         // Clicking Later hides the card and changes nothing on disk.
         cx.update_window(handle.into(), |_, window, cx| {
@@ -6063,7 +6087,7 @@ mod desktop_tests {
             shell.update(cx, |this, cx| this.start_update_cycle(cx, false));
         })
         .unwrap();
-        cx.run_until_parked();
+        settle_update_cycle(cx, &shell);
 
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
@@ -6133,7 +6157,7 @@ mod desktop_tests {
             shell.update(cx, |this, cx| this.start_update_cycle(cx, true));
         })
         .unwrap();
-        cx.run_until_parked();
+        settle_update_cycle(cx, &shell);
 
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
@@ -6178,7 +6202,7 @@ mod desktop_tests {
             shell.update(cx, |this, cx| this.start_update_cycle(cx, false));
         })
         .unwrap();
-        cx.run_until_parked();
+        settle_update_cycle(cx, &shell);
 
         cx.update(|cx| {
             let this = shell.read(cx);
@@ -6276,7 +6300,7 @@ mod desktop_tests {
             shell.update(cx, |this, cx| this.start_update_cycle(cx, false));
         })
         .unwrap();
-        cx.run_until_parked();
+        settle_update_cycle(cx, &shell);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             window.click("update-ready-later", cx);
@@ -6290,7 +6314,7 @@ mod desktop_tests {
             shell.update(cx, |this, cx| this.start_update_cycle(cx, true));
         })
         .unwrap();
-        cx.run_until_parked();
+        settle_update_cycle(cx, &shell);
 
         cx.update(|cx| {
             let this = shell.read(cx);

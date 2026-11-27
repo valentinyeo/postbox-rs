@@ -283,8 +283,9 @@ fn the_update_command_reaches_the_palette_and_tracks_state() {
         outcome,
         postbox_core::update::CheckOutcome::Available { .. }
     ));
-    assert_eq!(vm.m7().update_phase, UpdatePhase::Available);
-    assert_eq!(vm.update_command_label(), "Install the available update");
+    // A newer release starts the background download; nothing blocks the UI.
+    assert_eq!(vm.m7().update_phase, UpdatePhase::Downloading);
+    assert_eq!(vm.update_command_label(), "Downloading the update...");
 }
 
 #[test]
@@ -423,6 +424,68 @@ fn a_whole_request_line_written_by_the_cli_drives_the_view_model() {
     let reply = postbox_core::control::encode_response(&response);
     let parsed = postbox_core::control::decode_response(&reply).unwrap();
     assert_eq!(parsed.message.as_deref(), Some("Font scale set to 130%"));
+}
+
+#[test]
+fn a_staged_update_can_be_restarted_from_ctrl_k_and_esc_does_not_break_modals() {
+    let mut vm = vm();
+    let asset = {
+        let body = format!(
+            r#"{{"tag":"v0.2.0","sha256":"{}","asset":"postbox-windows-x64.zip","assets":[{{"name":"postbox-windows-x64.zip","browser_download_url":"https://example.invalid/a.zip","size":10}}]}}"#,
+            digest_hex(b"payload")
+        );
+        UpdateManifest::parse(&body)
+            .unwrap()
+            .select_asset()
+            .unwrap()
+    };
+    assert!(vm.m7_mut().offer(asset, false));
+    vm.m7_mut().mark_staged("v0.2.0", "- Notes", 1_000);
+    assert_eq!(vm.update_command_label(), "Check for updates now");
+    let prompt = vm.update_prompt().expect("the card is offered");
+    assert_eq!(prompt.headline(), "Postbox v0.2.0 is ready");
+
+    // `Esc` with a modal open closes the modal and leaves the restart card alone.
+    vm.open_palette();
+    assert!(vm.palette_open());
+    vm.handle_escape();
+    assert!(!vm.palette_open());
+    assert!(
+        vm.update_prompt().is_some(),
+        "the non-modal card survives a modal's Esc"
+    );
+
+    // `Esc` with nothing modal hides the card for this session.
+    vm.handle_escape();
+    assert!(vm.update_prompt().is_none());
+    assert_eq!(vm.m7().staged_tag(), Some("v0.2.0"));
+
+    // The `Ctrl+K` restart entry asks the shell for the swap exactly once.
+    vm.open_palette();
+    let restart = vm
+        .palette_entries()
+        .iter()
+        .find(|entry| entry.label == "Restart to install update")
+        .cloned()
+        .expect("the restart entry is listed");
+    vm.execute_palette_entry(&restart);
+    assert!(vm.take_update_restart_request());
+    assert!(!vm.take_update_restart_request());
+}
+
+#[test]
+fn a_bad_manifest_offer_never_reaches_the_restart_card() {
+    let mut vm = vm();
+    // A manifest with a short digest selects no asset, so nothing can be staged.
+    let body = r#"{"tag":"v0.2.0","sha256":"abc","assets":[{"name":"postbox-windows-x64.zip","browser_download_url":"https://example.invalid/a.zip","size":1}]}"#;
+    let manifest = UpdateManifest::parse(body).unwrap();
+    let outcome = vm.check_for_updates(&manifest);
+    assert!(matches!(
+        outcome,
+        postbox_core::update::CheckOutcome::UpToDate { .. }
+    ));
+    assert!(vm.update_prompt().is_none());
+    assert_eq!(vm.m7().staged_tag(), None);
 }
 
 #[test]

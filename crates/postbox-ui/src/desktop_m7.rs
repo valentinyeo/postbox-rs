@@ -18,7 +18,6 @@ use gpui_kit::{
 };
 use postbox_core::control::{ControlRequest, ControlResponse, decode_request, encode_response};
 use postbox_core::crash::ExitKind;
-use postbox_platform::Relauncher as _;
 use postbox_platform::control_pipe::Transport;
 use postbox_platform::os_integration::route_line;
 use postbox_platform::{LinkOutcome, exit_records::ExitRecordStore};
@@ -32,6 +31,12 @@ pub const LINK_POLL_MS: u64 = 120;
 pub const CONTROL_POLL_MS: u64 = 60;
 /// Longest queue of pending link lines kept before dropping the oldest.
 pub const MAX_PENDING_LINKS: usize = 16;
+/// Delay before the first automatic update check, so cold start stays untouched.
+pub const UPDATE_FIRST_CHECK_DELAY_MS: u64 = 20_000;
+/// Gap between automatic update checks. Zig checks every 15 minutes.
+pub const UPDATE_CHECK_INTERVAL_MS: u64 = 15 * 60 * 1000;
+/// Width of the restart card, matching Zig's `update_card_layout.zig` compact card.
+pub const UPDATE_CARD_WIDTH_PX: f32 = 366.0;
 
 /// One command for the shell, produced off the UI thread.
 #[derive(Debug, Clone, PartialEq)]
@@ -275,6 +280,15 @@ impl PostboxShell {
         self
     }
 
+    /// How the restart click launches the installed build. Tests record the call.
+    pub fn with_relauncher(
+        mut self,
+        relauncher: std::sync::Arc<dyn postbox_platform::Relauncher>,
+    ) -> Self {
+        self.relauncher = relauncher;
+        self
+    }
+
     /// The manifest/archive source. `None` keeps the shell offline and fully usable, which is
     /// what the tests and the headless CI check use.
     pub fn with_release_source(
@@ -297,30 +311,75 @@ impl PostboxShell {
         Some(spawn_os_pump(window, cx))
     }
 
-    /// Kicks off one update cycle on the background executor and folds the result back in.
+    /// Starts the background update loop: one deferred check after the first frame, then one
+    /// every `UPDATE_CHECK_INTERVAL_MS`. No polling, no timer while a cycle is idle.
+    pub fn start_update_scheduler(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<()> {
+        if self.update_scheduler_task.is_some() || self.release_source.is_none() {
+            return None;
+        }
+        let task = cx.spawn_in(window, async move |this, cx| {
+            // Cold start stays untouched: the first check waits past the first painted frame.
+            cx.background_executor()
+                .timer(Duration::from_millis(UPDATE_FIRST_CHECK_DELAY_MS))
+                .await;
+            loop {
+                if this
+                    .update_in(cx, |shell, _window, cx| {
+                        shell.start_update_cycle(cx, false);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(UPDATE_CHECK_INTERVAL_MS))
+                    .await;
+            }
+        });
+        self.update_scheduler_task = Some(task);
+        Some(())
+    }
+
+    /// Runs one update cycle: check, download, verify and stage, all off the UI thread.
     ///
-    /// `postboxapp` injects the GitHub Releases source, so this crate never links an HTTP
-    /// stack. A shell without a source stays offline and says so.
-    pub fn spawn_update_check(&mut self, cx: &mut Context<Self>) {
+    /// A manual `Ctrl+K` check on an already staged release surfaces the card again without
+    /// touching the network. A shell without a source stays offline and says so.
+    pub fn start_update_cycle(&mut self, cx: &mut Context<Self>, manual: bool) {
         if self.vm.m7().busy() {
             return;
         }
+        if manual && self.vm.m7().staged_tag().is_some() {
+            self.vm.m7_mut().reshow_update_prompt();
+            if let Some(note) = self.vm.m7().update_note.clone() {
+                self.vm.set_status_notice(note);
+            }
+            cx.notify();
+            return;
+        }
         let Some(source) = self.release_source.clone() else {
-            self.vm
-                .set_status_notice("Update checks are unavailable in this build");
+            if manual {
+                self.vm
+                    .set_status_notice("Update checks are unavailable in this build");
+            }
             return;
         };
+        if !self.vm.m7_mut().begin_check(manual) {
+            return;
+        }
         let install_dir = self.install_dir.clone();
         let version = self.vm.version().to_owned();
         let current = postbox_core::update::Version::parse(&version)
             .unwrap_or_else(|| postbox_core::update::Version::new(0, 0, 0));
-        self.vm.m7_mut().update_phase = crate::m7::UpdatePhase::Busy;
 
         cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    run_update(
+                    run_update_cycle(
                         source.as_ref(),
                         &install_dir,
                         postbox_platform::updater::EXE_ASSET_NAME,
@@ -329,33 +388,92 @@ impl PostboxShell {
                 })
                 .await;
             let _ = this.update(cx, |shell, cx| {
-                shell.apply_update_outcome(outcome);
+                shell.apply_update_cycle(outcome, manual);
                 cx.notify();
             });
         })
         .detach();
     }
 
-    /// Folds an update outcome into the shell state.
-    pub fn apply_update_outcome(&mut self, outcome: UpdateOutcome) {
+    /// Folds one cycle into shell state. Background failures stay silent.
+    pub fn apply_update_cycle(&mut self, outcome: UpdateCycleOutcome, manual: bool) {
+        let now_ms = crate::viewmodel::now_epoch_millis_public() as u64;
         match outcome {
-            UpdateOutcome::UpToDate { current } => {
-                self.vm.m7_mut().update_phase = crate::m7::UpdatePhase::UpToDate;
-                self.vm.m7_mut().update_note =
-                    Some(format!("Postbox {current} is the newest version."));
+            UpdateCycleOutcome::UpToDate { current } => {
+                self.vm.m7_mut().mark_up_to_date(&current, manual);
             }
-            UpdateOutcome::Installed { tag, exe } => {
-                self.vm.m7_mut().mark_installed(&tag);
-                // Relaunch detached, so the swap survives the old process leaving.
-                let _ = postbox_platform::ProcessRelauncher.relaunch(&exe, &[]);
+            UpdateCycleOutcome::Staged { staged, notes } => {
+                let tag = staged.tag.clone();
+                // A newer release replaces the older staged files instead of leaving them
+                // beside the install directory for ever.
+                if let Some(previous) = self.staged_update.replace(*staged)
+                    && previous.tag != tag
+                {
+                    postbox_platform::discard(&previous);
+                }
+                self.vm.m7_mut().mark_staged(&tag, &notes, now_ms);
             }
-            UpdateOutcome::Failed { reason } => {
-                self.vm.m7_mut().mark_failed(&reason);
+            UpdateCycleOutcome::Failed { reason } => {
+                self.vm.m7_mut().mark_failed(&reason, manual);
             }
         }
         if let Some(note) = self.vm.m7().update_note.clone() {
             self.vm.set_status_notice(note);
         }
+    }
+
+    /// The restart click: swap the staged binary in atomically, then relaunch.
+    ///
+    /// The swap is one `MoveFileExW` after a backup copy, and a failed swap restores the
+    /// backup, so the install always keeps a runnable executable. The relaunch passes the
+    /// current window geometry, so the new build opens maximized on the same monitor.
+    pub fn request_update_restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vm.m7().busy() {
+            return;
+        }
+        let Some(staged) = self.staged_update.take() else {
+            self.vm
+                .set_status_notice("There is no downloaded update to install");
+            return;
+        };
+        self.vm.m7_mut().mark_installing();
+        let window_state = relaunch_window_state(window, cx);
+
+        match postbox_platform::commit(&staged, native_replacer().as_ref()) {
+            Ok(report) => {
+                let tag = staged.tag.clone();
+                self.vm.m7_mut().mark_installed(&tag);
+                match self
+                    .relauncher
+                    .relaunch(&report.installed_exe, &relaunch_args(&window_state))
+                {
+                    Ok(()) => {
+                        if let Some(note) = self.vm.m7().update_note.clone() {
+                            self.vm.set_status_notice(note);
+                        }
+                        // Only a real run exits here; tests and `--no-os-integration` keep
+                        // the window so the installed binary is still inspectable.
+                        if self.os_runtime.is_some() {
+                            cx.quit();
+                        }
+                    }
+                    Err(err) => {
+                        self.vm.set_status_notice(format!(
+                            "Update installed, but Postbox could not restart itself: {err}. Close and reopen Postbox to finish."
+                        ));
+                    }
+                }
+            }
+            Err(err) => {
+                // Put the staged download back so the card can offer another try.
+                self.staged_update = Some(staged);
+                self.vm.m7_mut().mark_failed(&err.to_string(), true);
+                if let Some(note) = self.vm.m7().update_note.clone() {
+                    self.vm.set_status_notice(note);
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// Applies a startup `postbox://` URL, from the command line or a second launch.
@@ -442,6 +560,100 @@ impl PostboxShell {
         };
         self.vm
             .notify_incoming(message, ts, window_focused, notifier.as_ref())
+    }
+
+    /// The non-modal "Restart to update" card, once an update is staged.
+    ///
+    /// Compact, shadcn, and never blocking: the timeline, the composer and the palette keep
+    /// working underneath it. `Later` hides it for this version until a newer one arrives.
+    pub fn render_update_card(
+        &self,
+        p: &ShadcnPalette,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui_kit::AnyElement> {
+        let prompt = self.vm.update_prompt()?.clone();
+        let notes = prompt.notes.trim().to_owned();
+        Some(
+            div()
+                .id("update-ready-card")
+                .test_support()
+                .w(px(UPDATE_CARD_WIDTH_PX))
+                .max_w_full()
+                .mx_auto()
+                .mb_2()
+                .p_3()
+                .rounded_lg()
+                .bg(rgb(p.card))
+                .border_1()
+                .border_color(rgb(p.border))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .font_family(FONT_SANS)
+                        .text_size(px(TYPE_LABEL_PX))
+                        .text_color(rgb(p.foreground))
+                        .child(prompt.headline()),
+                )
+                .child(
+                    div()
+                        .font_family(FONT_SANS)
+                        .text_size(px(TYPE_TIME_PX))
+                        .text_color(rgb(p.muted_foreground))
+                        .child(if notes.is_empty() {
+                            "Restarting takes a few seconds.".to_owned()
+                        } else {
+                            notes
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("update-ready-restart")
+                                .test_support()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(p.primary))
+                                .font_family(FONT_SANS)
+                                .text_size(px(TYPE_TIME_PX))
+                                .text_color(rgb(p.primary_foreground))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    this.request_update_restart(window, cx);
+                                }))
+                                .child("Restart to update"),
+                        )
+                        .child(
+                            div()
+                                .id("update-ready-later")
+                                .test_support()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(p.secondary))
+                                .border_1()
+                                .border_color(rgb(p.border))
+                                .font_family(FONT_SANS)
+                                .text_size(px(TYPE_TIME_PX))
+                                .text_color(rgb(p.foreground))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    if this.vm.dismiss_update_prompt() {
+                                        this.sync_after_vm_change(window, cx);
+                                    }
+                                }))
+                                .child("Later"),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The dismissible status card, when one is up.
@@ -533,58 +745,44 @@ impl M7State {
     }
 }
 
-/// Runs one update cycle off the UI thread: fetch, verify, install, relaunch.
+/// Runs one update cycle off the UI thread: fetch, verify, stage. Never installs.
 ///
-/// Returns the state to apply and, when the install succeeded, the binary to relaunch. The
-/// live executable is only replaced after the digest matches, and a failed swap puts the
-/// previous binary back, so a run of this can never leave the app uninstalled.
-pub fn run_update(
+/// The live executable is untouched until [`PostboxShell::request_update_restart`], so a
+/// cycle that fails anywhere leaves the running build exactly as it was.
+pub fn run_update_cycle(
     source: &dyn postbox_platform::ReleaseSource,
     install_dir: &std::path::Path,
     exe_name: &str,
     current: postbox_core::update::Version,
-) -> UpdateOutcome {
+) -> UpdateCycleOutcome {
     let manifest = match source.fetch_manifest() {
         Ok(manifest) => manifest,
         Err(err) => {
-            return UpdateOutcome::Failed {
+            return UpdateCycleOutcome::Failed {
                 reason: err.to_string(),
             };
         }
     };
     match postbox_core::update::evaluate(&manifest, current) {
         postbox_core::update::CheckOutcome::UpToDate { current } => {
-            UpdateOutcome::UpToDate { current }
+            UpdateCycleOutcome::UpToDate { current }
         }
         postbox_core::update::CheckOutcome::Available { asset } => {
+            let notes = asset.notes.clone();
             let bytes = match source.download(&asset) {
                 Ok(bytes) => bytes,
                 Err(err) => {
-                    return UpdateOutcome::Failed {
+                    return UpdateCycleOutcome::Failed {
                         reason: err.to_string(),
                     };
                 }
             };
-            // A bad hash never reaches `install`, so the live binary is untouched.
-            if let Err(err) = postbox_platform::verify_download(&bytes, &asset) {
-                return UpdateOutcome::Failed {
-                    reason: err.to_string(),
-                };
-            }
-            let replacer = native_replacer();
-            match postbox_platform::install(
-                &asset,
-                &bytes,
-                install_dir,
-                exe_name,
-                &native_extractor(),
-                replacer.as_ref(),
-            ) {
-                Ok(report) => UpdateOutcome::Installed {
-                    tag: asset.tag.clone(),
-                    exe: report.installed_exe,
+            match postbox_platform::stage_release(&asset, &bytes, install_dir, exe_name) {
+                Ok(staged) => UpdateCycleOutcome::Staged {
+                    staged: Box::new(staged),
+                    notes,
                 },
-                Err(err) => UpdateOutcome::Failed {
+                Err(err) => UpdateCycleOutcome::Failed {
                     reason: err.to_string(),
                 },
             }
@@ -592,19 +790,100 @@ pub fn run_update(
     }
 }
 
-/// What one update cycle produced.
+/// What one cycle produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UpdateOutcome {
+pub enum UpdateCycleOutcome {
     UpToDate {
         current: String,
     },
-    Installed {
-        tag: String,
-        exe: std::path::PathBuf,
+    Staged {
+        staged: Box<postbox_platform::StagedUpdate>,
+        notes: String,
     },
     Failed {
         reason: String,
     },
+}
+
+/// The arguments the relaunched build receives: the update flag and the window geometry.
+pub fn relaunch_args(state: &postbox_platform::WindowState) -> Vec<String> {
+    vec![
+        postbox_platform::UPDATE_RELAUNCH_ARG.to_owned(),
+        postbox_platform::WINDOW_STATE_ARG.to_owned(),
+        state.encode(),
+    ]
+}
+
+/// Window bounds for a launch: the remembered geometry, maximized when it was maximized.
+pub fn initial_window_bounds(
+    state: Option<postbox_platform::WindowState>,
+) -> gpui_kit::WindowBounds {
+    let Some(state) = state else {
+        return gpui_kit::WindowBounds::Windowed(gpui_kit::Bounds {
+            origin: gpui_kit::Point::default(),
+            size: gpui_kit::size(px(1240.0), px(820.0)),
+        });
+    };
+    let bounds = gpui_kit::Bounds {
+        origin: gpui_kit::Point {
+            x: px(state.x as f32),
+            y: px(state.y as f32),
+        },
+        size: gpui_kit::size(px(state.width as f32), px(state.height as f32)),
+    };
+    if state.is_maximized() {
+        gpui_kit::WindowBounds::Maximized(bounds)
+    } else {
+        gpui_kit::WindowBounds::Windowed(bounds)
+    }
+}
+
+/// Remembers the current window rectangle so the relaunched build opens where this one is.
+pub fn relaunch_window_state(
+    window: &Window,
+    cx: &mut Context<PostboxShell>,
+) -> postbox_platform::WindowState {
+    let monitors: Vec<postbox_platform::MonitorRect> = cx
+        .displays()
+        .into_iter()
+        .map(|display| {
+            let bounds = display.visible_bounds();
+            postbox_platform::MonitorRect::new(
+                f32::from(bounds.origin.x) as i32,
+                f32::from(bounds.origin.y) as i32,
+                f32::from(bounds.size.width).max(0.0) as u32,
+                f32::from(bounds.size.height).max(0.0) as u32,
+            )
+        })
+        .collect();
+    if monitors.is_empty() {
+        return postbox_platform::WindowState::default();
+    }
+    let bounds = window.bounds();
+    let maximized = matches!(window.window_bounds(), gpui_kit::WindowBounds::Maximized(_));
+    let host = monitors
+        .iter()
+        .position(|monitor| {
+            monitor.overlaps(
+                &postbox_platform::MonitorRect::new(
+                    f32::from(bounds.origin.x) as i32,
+                    f32::from(bounds.origin.y) as i32,
+                    f32::from(bounds.size.width).max(0.0) as u32,
+                    f32::from(bounds.size.height).max(0.0) as u32,
+                ),
+                120,
+            )
+        })
+        .unwrap_or(0);
+    postbox_platform::WindowState::new(
+        f32::from(bounds.origin.x) as i32,
+        f32::from(bounds.origin.y) as i32,
+        f32::from(bounds.size.width).max(0.0) as u32,
+        f32::from(bounds.size.height).max(0.0) as u32,
+        maximized,
+        host,
+    )
+    .sanitized()
 }
 
 fn native_replacer() -> Box<dyn postbox_platform::AtomicReplacer> {
@@ -615,17 +894,6 @@ fn native_replacer() -> Box<dyn postbox_platform::AtomicReplacer> {
     #[cfg(not(windows))]
     {
         Box::new(postbox_platform::NativeReplacer)
-    }
-}
-
-fn native_extractor() -> Box<dyn postbox_platform::ArchiveExtractor> {
-    #[cfg(windows)]
-    {
-        Box::new(postbox_platform::win::updater::ZipExtractor)
-    }
-    #[cfg(not(windows))]
-    {
-        Box::new(postbox_platform::PlainFileExtractor)
     }
 }
 
@@ -704,4 +972,54 @@ pub fn crash_card(state: &M7State, now_ms: u64) -> Option<StatusCard> {
     state
         .crash_banner()
         .map(|note| StatusCard::new("last-crash", "Postbox closed unexpectedly", note, now_ms))
+}
+
+#[cfg(all(test, feature = "desktop-test"))]
+mod update_scheduling_tests {
+    use super::*;
+
+    #[test]
+    fn the_relaunch_carries_the_window_geometry_on_the_command_line() {
+        let state = postbox_platform::WindowState::new(2100, 200, 1200, 800, true, 1);
+        let args = relaunch_args(&state);
+        assert_eq!(args[0], postbox_platform::UPDATE_RELAUNCH_ARG);
+        assert_eq!(args[1], postbox_platform::WINDOW_STATE_ARG);
+        // The app parses exactly this back, so the new build reopens where the old one was.
+        assert_eq!(
+            postbox_platform::WindowState::decode(&args[2]),
+            state.sanitized()
+        );
+        assert!(args[2].contains("max=1"), "{}", args[2]);
+    }
+
+    #[test]
+    fn a_remembered_window_opens_maximized_on_the_same_monitor() {
+        let state = postbox_platform::WindowState::new(2100, 200, 1200, 800, true, 1);
+        match initial_window_bounds(Some(state)) {
+            gpui_kit::WindowBounds::Maximized(bounds) => {
+                assert_eq!(f32::from(bounds.origin.x), 2100.0);
+                assert_eq!(f32::from(bounds.size.width), 1200.0);
+            }
+            other => panic!("expected a maximized window, got {other:?}"),
+        }
+        match initial_window_bounds(Some(postbox_platform::WindowState::new(
+            100, 60, 900, 600, false, 0,
+        ))) {
+            gpui_kit::WindowBounds::Windowed(bounds) => {
+                assert_eq!(f32::from(bounds.origin.y), 60.0);
+            }
+            other => panic!("expected a windowed launch, got {other:?}"),
+        }
+        assert!(matches!(
+            initial_window_bounds(None),
+            gpui_kit::WindowBounds::Windowed(_)
+        ));
+    }
+
+    #[test]
+    fn the_check_cadence_matches_the_zig_schedule_and_keeps_cold_start_clear() {
+        assert_eq!(UPDATE_CHECK_INTERVAL_MS, 15 * 60 * 1000);
+        // A first check would otherwise land inside the cold-start measurement window.
+        const { assert!(UPDATE_FIRST_CHECK_DELAY_MS >= 10_000) };
+    }
 }

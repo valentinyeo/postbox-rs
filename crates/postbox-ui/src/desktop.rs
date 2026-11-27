@@ -20,13 +20,13 @@ use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerStat
 use gpui_kit::component::{IndexPath, Theme, ThemeMode, VirtualListScrollHandle, v_virtual_list};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Action as GpuiAction, AnyElement, App, AppContext as _, AsyncWindowContext, Bounds, Context,
-    Entity, ExternalPaths, FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement,
-    KeyBinding, KeyBindingContextPredicate, KeyDownEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, ObjectFit, ParentElement as _, Pixels,
-    Point, Render, ScrollStrategy, SharedString, Size, StatefulInteractiveElement as _,
-    Styled as _, StyledImage as _, Subscription, Task, TitlebarOptions, WeakEntity, Window,
-    WindowBounds, WindowOptions, div, hsla, img, px, rgb, size,
+    Action as GpuiAction, AnyElement, App, AppContext as _, AsyncWindowContext, Context, Entity,
+    ExternalPaths, FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement, KeyBinding,
+    KeyBindingContextPredicate, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, ObjectFit, ParentElement as _, Pixels, Render, ScrollStrategy,
+    SharedString, Size, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
+    Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowOptions, div, hsla, img, px,
+    rgb, size,
 };
 use postbox_core::threads::replies_line;
 use postbox_core::{FontScale, Provider, ThemeChoice};
@@ -434,6 +434,12 @@ pub struct PostboxShell {
     pub(crate) install_dir: std::path::PathBuf,
     /// Milestone 7: manifest/archive source, injected by `postbox-app`.
     pub(crate) release_source: Option<std::sync::Arc<dyn postbox_platform::ReleaseSource>>,
+    /// Milestone 7: the verified, staged update waiting for the restart click.
+    pub(crate) staged_update: Option<postbox_platform::StagedUpdate>,
+    /// Milestone 7: deferred first check plus the repeating background update loop.
+    pub(crate) update_scheduler_task: Option<Task<()>>,
+    /// Milestone 7: how the restart click launches the installed build.
+    pub(crate) relauncher: std::sync::Arc<dyn postbox_platform::Relauncher>,
 }
 
 impl Drop for PostboxShell {
@@ -776,6 +782,9 @@ impl PostboxShell {
                 .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
                 .unwrap_or_else(std::env::temp_dir),
             release_source: None,
+            staged_update: None,
+            update_scheduler_task: None,
+            relauncher: std::sync::Arc::new(postbox_platform::ProcessRelauncher),
         };
         shell.refresh_visible_gpu_textures(window, cx);
         shell.sync_reaction_retry_timer(window, cx);
@@ -1082,9 +1091,12 @@ impl PostboxShell {
             cx.quit();
         }
 
-        // Milestone 7: the `Ctrl+K` "Check for updates" command, run off the UI thread.
+        // Milestone 7: the `Ctrl+K` update commands, both run off the UI thread.
         if self.vm.take_update_check_request() {
-            self.spawn_update_check(cx);
+            self.start_update_cycle(cx, true);
+        }
+        if self.vm.take_update_restart_request() {
+            self.request_update_restart(window, cx);
         }
 
         cx.notify();
@@ -2696,7 +2708,9 @@ impl Render for PostboxShell {
         // Milestone 7: a dismissible, non-modal card sits above the timeline and never blocks
         // the composer, the sidebar or the palette.
         let mut main_column = main_column;
-        if let Some(card) = self.render_status_card(&p, cx) {
+        let update_card = self.render_update_card(&p, cx);
+        let status_card = self.render_status_card(&p, cx);
+        if update_card.is_some() || status_card.is_some() {
             main_column = main_column.child(
                 div()
                     .w_full()
@@ -2704,7 +2718,10 @@ impl Render for PostboxShell {
                     .mx_auto()
                     .px_4()
                     .pt_2()
-                    .child(card),
+                    .flex()
+                    .flex_col()
+                    .children(update_card)
+                    .children(status_card),
             );
         }
         let main_column = main_column.child(timeline_pane).child(
@@ -3105,6 +3122,9 @@ impl Render for PostboxShell {
 pub fn run_desktop(launch_ctx: PostboxLaunchContext) {
     let settings = launch_ctx.store.load_ui_settings().unwrap_or_default();
     let initial_title = postbox_core::ViewTab::CombinedInbox.window_title(&launch_ctx.version);
+    // The updater relaunch passes the geometry it left, so the new build opens maximized on
+    // the same monitor instead of snapping back to the default rectangle.
+    let initial_bounds = crate::desktop_m7::initial_window_bounds(launch_ctx.restore_window);
 
     // Milestone 7: start the control server and the link pipe before the window opens, so a
     // `postboxctl status` or a second launch's URL lands as soon as the shell is live.
@@ -3139,10 +3159,7 @@ pub fn run_desktop(launch_ctx: PostboxLaunchContext) {
                     title: Some(initial_title.clone().into()),
                     ..Default::default()
                 }),
-                window_bounds: Some(WindowBounds::Windowed(Bounds {
-                    origin: Point::default(),
-                    size: size(px(1240.0), px(820.0)),
-                })),
+                window_bounds: Some(initial_bounds),
                 app_id: Some("postbox".to_owned()),
                 ..Default::default()
             };
@@ -3165,6 +3182,8 @@ pub fn run_desktop(launch_ctx: PostboxLaunchContext) {
                     if shell.os_runtime.is_some() {
                         shell.os_pump_task = shell.start_os_pump(window, cx);
                     }
+                    // Warms nothing at cold start: the first check waits past the first frame.
+                    let _ = shell.start_update_scheduler(window, cx);
                     shell
                 })
             })
@@ -3178,6 +3197,7 @@ mod desktop_tests {
     use crate::sync_bridge::create_sync_bridge;
     use gpui_kit::base::Root;
     use gpui_kit::test::{TestEventExt as _, TestWindowExt as _};
+    use gpui_kit::{Bounds, Point, WindowBounds};
     use gpui_kit::{TestAppContext, WindowHandle};
     use postbox_core::{Account, Chat, ChatKey, Message, ReadStatus};
     use postbox_store::Store;
@@ -3313,6 +3333,7 @@ mod desktop_tests {
             last_exit_record: None,
             os_integration: false,
             release_source: None,
+            restore_window: None,
         }
     }
 
@@ -3982,6 +4003,7 @@ mod desktop_tests {
             last_exit_record: None,
             os_integration: false,
             release_source: None,
+            restore_window: None,
         };
         let (handle, shell) = open_shell_with_ctx(cx, ctx);
         cx.update_window(handle.into(), |_, window, cx| {
@@ -4105,6 +4127,7 @@ mod desktop_tests {
             last_exit_record: None,
             os_integration: false,
             release_source: None,
+            restore_window: None,
         };
         let (handle, shell) = open_shell_with_ctx(cx, ctx);
         cx.update_window(handle.into(), |_, window, cx| {
@@ -5708,6 +5731,603 @@ mod desktop_tests {
             assert_eq!(this.resident_chat_id.as_deref(), Some(bob_key.id.as_str()));
         });
 
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Milestone 7: automatic update check, background staging and the restart card
+    // -----------------------------------------------------------------------
+
+    /// Records the relaunch instead of spawning, so no test starts a real Postbox.
+    #[derive(Debug, Default)]
+    struct RecordingRelauncher {
+        calls: std::sync::Mutex<Vec<(std::path::PathBuf, Vec<String>)>>,
+    }
+
+    impl RecordingRelauncher {
+        fn calls(&self) -> Vec<(std::path::PathBuf, Vec<String>)> {
+            self.calls
+                .lock()
+                .map(|calls| calls.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    impl postbox_platform::Relauncher for RecordingRelauncher {
+        fn relaunch(
+            &self,
+            exe: &std::path::Path,
+            args: &[String],
+        ) -> Result<(), postbox_platform::PlatformError> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push((exe.to_path_buf(), args.to_vec()));
+            }
+            Ok(())
+        }
+    }
+
+    /// A release source that answers with a fixed manifest and archive, and counts requests.
+    struct FixedRelease {
+        manifest: postbox_core::update::UpdateManifest,
+        archive: Vec<u8>,
+        downloads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl postbox_platform::ReleaseSource for FixedRelease {
+        fn fetch_manifest(
+            &self,
+        ) -> Result<postbox_core::update::UpdateManifest, postbox_platform::UpdateError> {
+            Ok(self.manifest.clone())
+        }
+
+        fn download(
+            &self,
+            asset: &postbox_core::update::UpdateAsset,
+        ) -> Result<Vec<u8>, postbox_platform::UpdateError> {
+            self.downloads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            postbox_platform::verify_download(&self.archive, asset)?;
+            Ok(self.archive.clone())
+        }
+    }
+
+    /// A source that always fails, like an offline machine.
+    struct OfflineRelease {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl postbox_platform::ReleaseSource for OfflineRelease {
+        fn fetch_manifest(
+            &self,
+        ) -> Result<postbox_core::update::UpdateManifest, postbox_platform::UpdateError> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(postbox_platform::UpdateError::Io(
+                "dns lookup failed".to_owned(),
+            ))
+        }
+
+        fn download(
+            &self,
+            _asset: &postbox_core::update::UpdateAsset,
+        ) -> Result<Vec<u8>, postbox_platform::UpdateError> {
+            Err(postbox_platform::UpdateError::Io(
+                "dns lookup failed".to_owned(),
+            ))
+        }
+    }
+
+    fn release_manifest(tag: &str, archive: &[u8]) -> postbox_core::update::UpdateManifest {
+        let body = format!(
+            r#"{{"tag":"{tag}","asset":"postbox-windows-x64.zip","sha256":"{}","size":{},"body":"- Restarting keeps your window where it is","assets":[{{"name":"postbox-windows-x64.zip","browser_download_url":"https://example.invalid/postbox-windows-x64.zip","size":{}}}]}}"#,
+            postbox_core::update::digest_hex(archive),
+            archive.len(),
+            archive.len()
+        );
+        postbox_core::update::UpdateManifest::parse(&body).expect("manifest parses")
+    }
+
+    fn update_launch_ctx(
+        data_dir: &std::path::Path,
+        source: std::sync::Arc<dyn postbox_platform::ReleaseSource>,
+    ) -> PostboxLaunchContext {
+        let mut ctx = seeded_launch_ctx();
+        ctx.data_dir = data_dir.to_path_buf();
+        ctx.release_source = Some(source);
+        ctx
+    }
+
+    /// Opens a shell whose install directory is a temp folder holding a fake live binary.
+    fn open_update_shell(
+        cx: &mut TestAppContext,
+        launch_ctx: PostboxLaunchContext,
+        install_dir: std::path::PathBuf,
+    ) -> (
+        WindowHandle<Root>,
+        Entity<PostboxShell>,
+        std::sync::Arc<RecordingRelauncher>,
+    ) {
+        let keymap = launch_ctx.keymap.clone();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            register_bundled_fonts(cx);
+            bind_postbox_keys(cx, &keymap);
+            apply_postbox_theme(cx, ThemeChoice::ZincDark, FontScale::default());
+        });
+        cx.update(|cx| {
+            let bounds = Bounds {
+                origin: Point::default(),
+                size: size(px(1200.0), px(800.0)),
+            };
+            let relauncher = std::sync::Arc::new(RecordingRelauncher::default());
+            let recorder = relauncher.clone();
+            let (window, shell) = gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                cx,
+                move |window, cx| {
+                    cx.new(|cx| {
+                        PostboxShell::new(launch_ctx, window, cx)
+                            .with_install_dir(install_dir)
+                            .with_relauncher(relauncher)
+                    })
+                },
+            )
+            .expect("open Postbox test window");
+            (
+                window.downcast::<Root>().expect("Base Root"),
+                shell,
+                recorder,
+            )
+        })
+    }
+
+    fn install_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = unique_desktop_test_dir(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join(postbox_platform::updater::EXE_ASSET_NAME);
+        std::fs::write(&live, b"installed build").unwrap();
+        (dir, live)
+    }
+
+    /// Runs the executor until the updater leaves its in-flight phases.
+    ///
+    /// The manifest check, the download and the staging run on a background thread, so one
+    /// `run_until_parked()` can return before that thread's result reaches the shell. Polling
+    /// the phase instead of sleeping a fixed time keeps the wait bounded and gives the same
+    /// answer on a fast Linux disk and a slow Windows CI disk.
+    fn settle_update_cycle(cx: &mut TestAppContext, shell: &Entity<PostboxShell>) {
+        for _ in 0..600 {
+            cx.run_until_parked();
+            let settled = cx.update(|cx| !shell.read(cx).vm.m7().busy());
+            if settled {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.update(|cx| {
+            panic!(
+                "the update cycle never settled, still {:?}: {:?}",
+                shell.read(cx).vm.m7().update_phase,
+                shell.read(cx).vm.m7().update_note
+            )
+        });
+    }
+
+    #[gpui_kit::test]
+    fn auto_check_stages_the_download_and_offers_the_restart_card(cx: &mut TestAppContext) {
+        let (install_dir, live) = install_fixture("update_auto");
+        let data_dir = unique_desktop_test_dir("update_auto_data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let archive = b"new release archive".to_vec();
+        let source = std::sync::Arc::new(FixedRelease {
+            manifest: release_manifest("v0.2.0", &archive),
+            archive: archive.clone(),
+            downloads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let launch_ctx = update_launch_ctx(&data_dir, source.clone());
+        let (handle, shell, _recorder) = open_update_shell(cx, launch_ctx, install_dir.clone());
+        cx.run_until_parked();
+
+        // One automatic cycle, exactly as the deferred scheduler runs it.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            shell.update(cx, |this, cx| this.start_update_cycle(cx, false));
+        })
+        .unwrap();
+        settle_update_cycle(cx, &shell);
+
+        cx.update(|cx| {
+            let this = shell.read(cx);
+            assert_eq!(
+                this.vm.m7().update_phase,
+                crate::m7::UpdatePhase::Ready,
+                "the auto check stages and offers"
+            );
+            assert_eq!(
+                this.vm.font_scale().percent(),
+                100,
+                "the card obeys the same font scale contract"
+            );
+            let prompt = this
+                .vm
+                .update_prompt()
+                .expect("the restart card is offered");
+            assert_eq!(prompt.headline(), "Postbox v0.2.0 is ready");
+            assert!(prompt.notes.contains("window"), "{}", prompt.notes);
+            assert_eq!(this.vm.update_command_label(), "Check for updates now");
+            assert_eq!(
+                this.vm.m7().restart_label(),
+                Some("Restart to install update"),
+                "Ctrl+K offers the restart while a staged update waits"
+            );
+        });
+        // Staged beside the live binary, never swapped without the click.
+        assert_eq!(
+            std::fs::read(&live).unwrap(),
+            b"installed build",
+            "the running binary is untouched until the restart click"
+        );
+        assert!(
+            std::fs::read(install_dir.join("postbox-windows-x64.zip.staged")).unwrap() == archive,
+            "the verified release archive waits beside the live binary"
+        );
+        assert_eq!(
+            source.downloads.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("update-ready-card").is_some(),
+                "the non-modal card is painted"
+            );
+            assert!(window.try_find("update-ready-restart").is_some());
+            assert!(window.try_find("update-ready-later").is_some());
+        })
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(&install_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[gpui_kit::test]
+    fn later_hides_the_card_for_that_version_and_a_newer_one_re_prompts(cx: &mut TestAppContext) {
+        let (install_dir, live) = install_fixture("update_later");
+        let data_dir = unique_desktop_test_dir("update_later_data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let archive = b"release archive v2".to_vec();
+        let source = std::sync::Arc::new(FixedRelease {
+            manifest: release_manifest("v0.2.0", &archive),
+            archive: archive.clone(),
+            downloads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let launch_ctx = update_launch_ctx(&data_dir, source);
+        let (handle, shell, _recorder) = open_update_shell(cx, launch_ctx, install_dir.clone());
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            shell.update(cx, |this, cx| this.start_update_cycle(cx, false));
+        })
+        .unwrap();
+        settle_update_cycle(cx, &shell);
+
+        // Clicking Later hides the card and changes nothing on disk.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("update-ready-later", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("update-ready-card").is_none(),
+                "Later hides the card"
+            );
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let this = shell.read(cx);
+            assert!(this.vm.update_prompt().is_none());
+            assert_eq!(this.vm.m7().staged_tag(), Some("v0.2.0"), "still staged");
+            assert!(this.staged_update.is_some());
+        });
+        assert_eq!(std::fs::read(&live).unwrap(), b"installed build");
+
+        let archive_before = install_dir.join("postbox-windows-x64.zip.staged");
+        assert!(archive_before.exists(), "the first download is staged");
+
+        // A newer release re-prompts on its own, with no extra click.
+        let newer = b"release archive v3".to_vec();
+        cx.update(|cx| {
+            shell.update(cx, |this, cx| {
+                let asset = release_manifest("v0.3.0", &newer)
+                    .select_asset()
+                    .expect("the newer asset");
+                assert!(this.vm.m7_mut().offer(asset, false));
+                this.vm.m7_mut().mark_staged("v0.3.0", "- Newer notes", 10);
+                cx.notify();
+            });
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("update-ready-card").is_some(),
+                "a newer version brings the card back"
+            );
+        })
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(&install_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[gpui_kit::test]
+    fn restart_to_update_swaps_the_binary_atomically_and_relaunches(cx: &mut TestAppContext) {
+        let (install_dir, live) = install_fixture("update_restart");
+        let data_dir = unique_desktop_test_dir("update_restart_data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let archive = b"brand new release".to_vec();
+        let source = std::sync::Arc::new(FixedRelease {
+            manifest: release_manifest("v0.2.0", &archive),
+            archive: archive.clone(),
+            downloads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let launch_ctx = update_launch_ctx(&data_dir, source);
+        let (handle, shell, recorder) = open_update_shell(cx, launch_ctx, install_dir.clone());
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            shell.update(cx, |this, cx| this.start_update_cycle(cx, false));
+        })
+        .unwrap();
+        settle_update_cycle(cx, &shell);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("update-ready-restart", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            std::fs::read(&live).unwrap(),
+            archive,
+            "the staged build is installed in one atomic replace"
+        );
+        assert!(
+            install_dir.join("postbox.exe.backup.exe").exists(),
+            "the previous build is kept for a rollback"
+        );
+        assert!(
+            !install_dir.join("postbox.exe.staged.exe").exists(),
+            "the pending executable was moved, not copied"
+        );
+        cx.update(|cx| {
+            let this = shell.read(cx);
+            assert_eq!(this.vm.m7().update_phase, crate::m7::UpdatePhase::UpToDate);
+            assert!(this.vm.update_prompt().is_none());
+            let _ = this;
+            let calls = recorder.calls();
+            assert_eq!(calls.len(), 1, "the new build is launched exactly once");
+            assert_eq!(calls[0].0, live, "the installed binary is relaunched");
+            assert!(
+                calls[0].1.iter().any(|arg| arg == "--update-relaunch"),
+                "the relaunch flags itself: {:?}",
+                calls[0].1
+            );
+            assert!(
+                calls[0].1.iter().any(|arg| arg == "--window-state"),
+                "the relaunch carries the window geometry: {:?}",
+                calls[0].1
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&install_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[gpui_kit::test]
+    fn a_bad_sha256_fails_closed_without_showing_the_ready_card(cx: &mut TestAppContext) {
+        let (install_dir, live) = install_fixture("update_badhash");
+        let data_dir = unique_desktop_test_dir("update_badhash_data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let real = b"the real release bytes".to_vec();
+        let mut manifest = release_manifest("v0.2.0", &real);
+        // The published digest no longer matches the served archive.
+        manifest.sha256 = Some(postbox_core::update::digest_hex(b"something else entirely"));
+        let source = std::sync::Arc::new(FixedRelease {
+            manifest,
+            archive: b"tampered release byte".to_vec(),
+            downloads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let launch_ctx = update_launch_ctx(&data_dir, source);
+        let (handle, shell, _recorder) = open_update_shell(cx, launch_ctx, install_dir.clone());
+        cx.run_until_parked();
+
+        // A manual check reports the failure; the card never appears.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            shell.update(cx, |this, cx| this.start_update_cycle(cx, true));
+        })
+        .unwrap();
+        settle_update_cycle(cx, &shell);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("update-ready-card").is_none(),
+                "a bad digest never offers a restart"
+            );
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let this = shell.read(cx);
+            assert_eq!(this.vm.m7().update_phase, crate::m7::UpdatePhase::Failed);
+            assert!(this.vm.update_prompt().is_none());
+            assert!(this.staged_update.is_none(), "nothing was staged");
+            let note = this.vm.m7().update_note.clone().unwrap_or_default();
+            assert!(note.contains("untouched"), "{note}");
+        });
+        assert_eq!(std::fs::read(&live).unwrap(), b"installed build");
+        assert!(
+            !install_dir.join("postbox.exe.staged.exe").exists(),
+            "no pending executable was written"
+        );
+
+        let _ = std::fs::remove_dir_all(&install_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[gpui_kit::test]
+    fn an_offline_background_check_fails_quietly(cx: &mut TestAppContext) {
+        let (install_dir, live) = install_fixture("update_offline");
+        let data_dir = unique_desktop_test_dir("update_offline_data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let source = std::sync::Arc::new(OfflineRelease {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let launch_ctx = update_launch_ctx(&data_dir, source.clone());
+        let (handle, shell, _recorder) = open_update_shell(cx, launch_ctx, install_dir.clone());
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            shell.update(cx, |this, cx| this.start_update_cycle(cx, false));
+        })
+        .unwrap();
+        settle_update_cycle(cx, &shell);
+
+        cx.update(|cx| {
+            let this = shell.read(cx);
+            assert_eq!(
+                this.vm.m7().update_phase,
+                crate::m7::UpdatePhase::Idle,
+                "a background failure leaves the updater idle, ready for the next interval"
+            );
+            assert!(this.vm.m7().update_note.is_none(), "no nagging status line");
+            assert!(this.vm.status_notice().is_none(), "and no toast either");
+            assert_eq!(
+                source.attempts.load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("update-ready-card").is_none());
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&live).unwrap(), b"installed build");
+
+        let _ = std::fs::remove_dir_all(&install_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[gpui_kit::test]
+    fn the_scheduler_checks_after_the_first_frame_and_not_before(cx: &mut TestAppContext) {
+        let (install_dir, _live) = install_fixture("update_schedule");
+        let data_dir = unique_desktop_test_dir("update_schedule_data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let source = std::sync::Arc::new(OfflineRelease {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let launch_ctx = update_launch_ctx(&data_dir, source.clone());
+        let (handle, shell, _recorder) = open_update_shell(cx, launch_ctx, install_dir.clone());
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            shell.update(cx, |this, cx| {
+                assert!(
+                    this.start_update_scheduler(window, cx).is_some(),
+                    "the scheduler arms when a release source exists"
+                );
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            source.attempts.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "cold start touches no network"
+        );
+
+        // Past the deferred first check: exactly one cycle runs, then the loop waits.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(
+                crate::desktop_m7::UPDATE_FIRST_CHECK_DELAY_MS + 1_000,
+            ));
+        cx.run_until_parked();
+        assert_eq!(
+            source.attempts.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one automatic check after the first frame"
+        );
+        // It failed quietly, so the loop is idle-ready rather than spamming.
+        cx.update(|cx| {
+            let this = shell.read(cx);
+            assert_eq!(this.vm.m7().update_phase, crate::m7::UpdatePhase::Idle);
+            assert!(this.vm.status_notice().is_none());
+        });
+
+        let _ = std::fs::remove_dir_all(&install_dir);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[gpui_kit::test]
+    fn a_manual_check_of_a_staged_update_reuses_the_download(cx: &mut TestAppContext) {
+        let (install_dir, _live) = install_fixture("update_manual");
+        let data_dir = unique_desktop_test_dir("update_manual_data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let archive = b"release to stage once".to_vec();
+        let source = std::sync::Arc::new(FixedRelease {
+            manifest: release_manifest("v0.2.0", &archive),
+            archive: archive.clone(),
+            downloads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let launch_ctx = update_launch_ctx(&data_dir, source.clone());
+        let (handle, shell, _recorder) = open_update_shell(cx, launch_ctx, install_dir.clone());
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            shell.update(cx, |this, cx| this.start_update_cycle(cx, false));
+        })
+        .unwrap();
+        settle_update_cycle(cx, &shell);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("update-ready-later", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        // `Ctrl+K` asks for a check: the staged version is surfaced, not downloaded again.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            shell.update(cx, |this, cx| this.start_update_cycle(cx, true));
+        })
+        .unwrap();
+        settle_update_cycle(cx, &shell);
+
+        cx.update(|cx| {
+            let this = shell.read(cx);
+            assert!(this.vm.update_prompt().is_some(), "the card is back");
+            assert_eq!(this.vm.m7().update_phase, crate::m7::UpdatePhase::Ready);
+        });
+        assert_eq!(
+            source.downloads.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the staged bytes are reused instead of downloaded twice"
+        );
+
+        let _ = std::fs::remove_dir_all(&install_dir);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

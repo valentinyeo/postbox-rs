@@ -73,6 +73,7 @@ pub enum PaletteCommand {
     OpenImageExternal,
     AttachFile,
     CheckForUpdates,
+    RestartToUpdate,
     Quit,
 }
 
@@ -344,6 +345,9 @@ pub struct PaletteCatalogContext<'a> {
     /// Milestone 7: the update command reads as state ("Postbox is up to date") once a check
     /// has run.
     pub update_label: &'a str,
+    /// Milestone 7: the second entry that appears once a restart is waiting, as in
+    /// `main.zig:15705`.
+    pub restart_label: Option<&'a str>,
 }
 
 fn cmd_entry(
@@ -781,6 +785,9 @@ pub fn build_palette_items(ctx: &PaletteCatalogContext<'_>) -> Vec<PaletteEntry>
         None,
         PaletteCommand::CheckForUpdates,
     ));
+    if let Some(label) = ctx.restart_label {
+        items.push(cmd_entry(label, None, PaletteCommand::RestartToUpdate));
+    }
     items.push(cmd_entry("Quit Postbox", Some("Q"), PaletteCommand::Quit));
 
     items
@@ -1041,6 +1048,58 @@ mod tests {
     }
 
     #[test]
+    fn the_restart_entry_appears_only_while_a_staged_update_waits() {
+        let hub_status = HubConnectionStatus::NotConfigured {
+            missing_url: true,
+            missing_token: true,
+            configured_url: None,
+            detail: None,
+        };
+        let mut ctx = PaletteCatalogContext {
+            version: "0.1.0",
+            hub_status: &hub_status,
+            theme: ThemeChoice::ZincDark,
+            font_scale: FontScale::default(),
+            dictation_language: DictationLanguage::Automatic,
+            playback_speed_pct: 100,
+            show_archived_inline: false,
+            show_archived_only: false,
+            slack_threads_enabled: false,
+            slack_reply_style: false,
+            accounts: &[],
+            microphones: &[],
+            selected_microphone: None,
+            selected_chat: None,
+            selected_message: None,
+            bulk_selected_count: 0,
+            marked_messages_count: 0,
+            update_label: "Check for updates now",
+            restart_label: None,
+        };
+        let idle = build_palette_items(&ctx);
+        assert!(
+            !idle.iter().any(|entry| matches!(
+                entry.kind,
+                PaletteEntryKind::Command(PaletteCommand::RestartToUpdate)
+            )),
+            "no restart entry before anything is staged"
+        );
+
+        ctx.restart_label = Some("Restart to install update");
+        let staged = build_palette_items(&ctx);
+        let restart = staged
+            .iter()
+            .find(|entry| {
+                matches!(
+                    entry.kind,
+                    PaletteEntryKind::Command(PaletteCommand::RestartToUpdate)
+                )
+            })
+            .expect("the restart entry is listed");
+        assert_eq!(restart.label, "Restart to install update");
+    }
+
+    #[test]
     fn non_empty_query_ranks_chats_above_messages_above_commands() {
         let hub_status = HubConnectionStatus::Connected {
             url: "https://hub.example".into(),
@@ -1065,6 +1124,7 @@ mod tests {
             bulk_selected_count: 0,
             marked_messages_count: 0,
             update_label: "Check for updates now",
+            restart_label: None,
         };
         let commands = build_palette_items(&ctx);
         let visible = vec![test_chat("c1", "Light Design", false)];

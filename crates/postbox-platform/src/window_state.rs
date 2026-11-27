@@ -13,6 +13,8 @@
 
 /// Registry value name under `HKCU\Software\Messages`.
 pub const WINDOW_STATE_VALUE: &str = "WindowState";
+/// Command-line argument the updater relaunch uses to pass the remembered geometry.
+pub const WINDOW_STATE_ARG: &str = "--window-state";
 /// Default window size when nothing was remembered.
 pub const DEFAULT_WIDTH: u32 = 1240;
 pub const DEFAULT_HEIGHT: u32 = 820;

@@ -107,11 +107,19 @@ jobs:
           $zipPath = "dist/postbox-windows-x64.zip"
           Compress-Archive -Path "$stage/*" -DestinationPath $zipPath -Force
 
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=$env:RELEASE_VERSION /DStageDir="$((Resolve-Path $stage).Path)" installer/postbox.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $installerPath = "dist/postbox-setup-x64.exe"
+          if (-not (Test-Path $installerPath)) {
+            throw "Missing Windows installer: $installerPath"
+          }
+
+          $installerHash = (Get-FileHash -Algorithm SHA256 -Path $installerPath).Hash.ToLowerInvariant()
           $hash = (Get-FileHash -Algorithm SHA256 -Path $zipPath).Hash.ToLowerInvariant()
           $size = (Get-Item $zipPath).Length
           [System.IO.File]::WriteAllText(
             (Join-Path (Get-Location) "dist/SHA256SUMS.txt"),
-            "$hash  postbox-windows-x64.zip`n",
+            "$hash  postbox-windows-x64.zip`n$installerHash  postbox-setup-x64.exe`n",
             (New-Object System.Text.UTF8Encoding($false))
           )
 
@@ -147,6 +155,7 @@ jobs:
           name: postbox-windows-x64
           path: |
             dist/postbox-windows-x64.zip
+            dist/postbox-setup-x64.exe
             dist/SHA256SUMS.txt
             dist/update.json
           if-no-files-found: error
@@ -160,6 +169,7 @@ jobs:
           $repo = $env:GITHUB_REPOSITORY
           $assets = @(
             "dist/postbox-windows-x64.zip",
+            "dist/postbox-setup-x64.exe",
             "dist/SHA256SUMS.txt",
             "dist/update.json"
           )

@@ -1882,11 +1882,6 @@ impl PostboxShell {
                     bubble = bubble.child(meta_row);
                 }
 
-                if let Some(chips) = self.render_reaction_chips(message, &p, ix, id_prefix, &shell)
-                {
-                    bubble = bubble.child(chips);
-                }
-
                 if let Some(badge) = outbox_status {
                     match badge {
                         OutboxBadge::Sending => {
@@ -1960,8 +1955,26 @@ impl PostboxShell {
                     );
                 }
 
+                let mut bubble_column = div()
+                    .max_w(px(620.0))
+                    .flex()
+                    .flex_col()
+                    .when(message.from_me, |el| el.items_end())
+                    .when(!message.from_me, |el| el.items_start())
+                    .child(bubble);
+                if let Some(chips) = self.render_reaction_chips(message, &p, ix, id_prefix, &shell)
+                {
+                    bubble_column = bubble_column.child(chips);
+                }
+
                 let (top_pt, bottom_pb) =
                     message_group_spacing(*grouped_with_prev, *grouped_with_next);
+                let bottom_pb = bottom_pb
+                    + if message.reactions.is_empty() {
+                        0.0
+                    } else {
+                        4.0
+                    };
                 div()
                     .w_full()
                     .max_w(px(CHAT_COLUMN_MAX_WIDTH_PX))
@@ -1972,7 +1985,7 @@ impl PostboxShell {
                     .flex()
                     .when(message.from_me, |el| el.justify_end())
                     .when(!message.from_me, |el| el.justify_start())
-                    .child(bubble)
+                    .child(bubble_column)
                     .into_any_element()
             }
         }

@@ -12,8 +12,8 @@ use postbox_core::read::select_read_message_id;
 use postbox_core::views::{format_account_label, resolve_slack_workspace_name};
 use postbox_core::{Account, ChatKey, MediaKind, Message, Provider, ReadStatus};
 use postbox_hub::{
-    ArchiveOutcome, AvatarFetchState, Endpoint, EventStream, HubClient, HubError, MAX_ROWS,
-    OLDER_PAGE_LIMIT, SendFileRequest, SseEvent, SseParser, SseReconnectState,
+    ArchiveOutcome, AvatarFetchState, Endpoint, EventStream, HubClient, HubError, HubMessage,
+    MAX_ROWS, OLDER_PAGE_LIMIT, SendFileRequest, SseEvent, SseParser, SseReconnectState,
     classify_signal_send_failure, classify_telegram_send_failure, is_real_message, read_message_id,
     should_run_safety_poll,
 };
@@ -44,6 +44,77 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
+
+pub(crate) fn fold_hub_messages_and_reactions(
+    hub_msgs: &[HubMessage],
+    chat: &ChatKey,
+    is_group: bool,
+) -> (
+    Vec<Message>,
+    Vec<String>,
+    BTreeMap<String, Vec<postbox_core::Reaction>>,
+) {
+    let mut core_msgs = Vec::new();
+    let mut reaction_rows = Vec::new();
+    let mut reaction_row_ids = Vec::new();
+    for msg in hub_msgs {
+        if !msg.reaction_to_id.is_empty() {
+            reaction_row_ids.push(msg.msg_id.clone());
+            reaction_rows.push(msg);
+        } else if is_real_message(msg) {
+            core_msgs.push(msg.to_core_message(chat, is_group));
+        }
+    }
+
+    reaction_rows.sort_by_key(|m| (m.ts.as_str(), m.msg_id.as_str()));
+    let mut active = BTreeMap::new();
+    let mut reactions_by_target_id: BTreeMap<String, Vec<postbox_core::Reaction>> = BTreeMap::new();
+    for msg in reaction_rows {
+        let target_id = msg.reaction_to_id.as_str();
+        let sender_key = if msg.from_me {
+            "__me__"
+        } else if !msg.sender_id.is_empty() {
+            msg.sender_id.as_str()
+        } else {
+            msg.msg_id.as_str()
+        };
+        // Keep empty targets so an unreact also clears reactions on cached parents.
+        reactions_by_target_id
+            .entry(target_id.to_owned())
+            .or_default();
+        let emoji = msg.reaction_emoji.trim();
+        if emoji.is_empty() {
+            active.remove(&(target_id, sender_key));
+        } else {
+            active.insert((target_id, sender_key), (emoji.to_owned(), msg.from_me));
+        }
+    }
+    for ((target_id, _), (emoji, from_me)) in active {
+        let reactions = reactions_by_target_id
+            .entry(target_id.to_owned())
+            .or_default();
+        if let Some(reaction) = reactions.iter_mut().find(|r| r.emoji == emoji) {
+            reaction.count += 1;
+            reaction.from_me |= from_me;
+        } else {
+            reactions.push(postbox_core::Reaction {
+                emoji,
+                count: 1,
+                from_me,
+            });
+        }
+    }
+    for reactions in reactions_by_target_id.values_mut() {
+        reactions.sort_by(|a, b| a.emoji.cmp(&b.emoji));
+    }
+    for msg in &mut core_msgs {
+        if let Some(reactions) = reactions_by_target_id.remove(&msg.msg_id) {
+            // Slack supplies both inline counts and per-user rows for the same reactions.
+            msg.reactions = reactions;
+        }
+    }
+    (core_msgs, reaction_row_ids, reactions_by_target_id)
+}
 
 pub(crate) fn sse_event_provider(ev: &SseEvent) -> Option<Provider> {
     if ev.chat.starts_with("slack:") {
@@ -1471,12 +1542,20 @@ impl SyncEngine {
                 match result {
                     Ok(hub_msgs) => {
                         self.bg_read_failures.remove(&chat);
-                        let core_msgs: Vec<Message> = hub_msgs
-                            .iter()
-                            .filter(|m| is_real_message(m))
-                            .map(|m| m.to_core_message(&chat, is_group))
-                            .collect();
+                        let (core_msgs, reaction_row_ids, orphan_reactions) =
+                            fold_hub_messages_and_reactions(&hub_msgs, &chat, is_group);
                         let _ = self.store.upsert_messages_batch(&core_msgs);
+                        if !reaction_row_ids.is_empty() {
+                            let _ = self.store.delete_messages_by_ids(&chat, &reaction_row_ids);
+                        }
+                        for (target_id, reactions) in orphan_reactions {
+                            if let Ok(Some(mut existing)) =
+                                self.store.get_message(&chat, &target_id)
+                            {
+                                existing.reactions = reactions;
+                                let _ = self.store.upsert_messages_batch(&[existing]);
+                            }
+                        }
                         let _ = self.store.shrink_memory();
                         if core_msgs.is_empty() {
                             self.background_swept_chats.insert(chat, last_msg_ts);
@@ -1868,13 +1947,19 @@ impl SyncEngine {
             .ok()
             .flatten()
             .is_some_and(|c| c.is_group);
-        let core_msgs: Vec<Message> = hub_msgs
-            .iter()
-            .filter(|m| is_real_message(m))
-            .map(|m| m.to_core_message(chat, is_group))
-            .collect();
+        let (core_msgs, reaction_row_ids, orphan_reactions) =
+            fold_hub_messages_and_reactions(&hub_msgs, chat, is_group);
         let added = core_msgs.len();
         let _ = self.store.upsert_messages_batch(&core_msgs);
+        if !reaction_row_ids.is_empty() {
+            let _ = self.store.delete_messages_by_ids(chat, &reaction_row_ids);
+        }
+        for (target_id, reactions) in orphan_reactions {
+            if let Ok(Some(mut existing)) = self.store.get_message(chat, &target_id) {
+                existing.reactions = reactions;
+                let _ = self.store.upsert_messages_batch(&[existing]);
+            }
+        }
         // M5.5 RAM diet: release the page cache after every message batch ingest.
         let _ = self.store.shrink_memory();
         let prepended = if before.is_some() { added } else { 0 };
@@ -2299,6 +2384,281 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn whatsapp_reaction_folds_onto_parent_and_deletes_stale_bubble() {
+        let chat = ChatKey::new(
+            Provider::Whatsapp,
+            "personal",
+            "personal:123@s.whatsapp.net",
+        );
+        let hub_msgs = postbox_hub::normalize_messages(
+            r#"[
+                {"MsgID":"personal:m1","ChatJID":"personal:123@s.whatsapp.net","Text":"Hello"},
+                {"MsgID":"personal:r1","ChatJID":"personal:123@s.whatsapp.net","SenderJID":"alice","ReactionToID":"personal:m1","ReactionEmoji":"😍","DisplayText":"Reacted 😍 to message"}
+            ]"#,
+            &chat.id,
+        ).unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .upsert_message(&hub_msgs[1].to_core_message(&chat, false))
+            .unwrap();
+        assert_eq!(store.search_messages_fts("Reacted", 10).unwrap().len(), 1);
+
+        let (messages, reaction_ids, orphans) =
+            fold_hub_messages_and_reactions(&hub_msgs, &chat, false);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].msg_id, "personal:m1");
+        assert_eq!(
+            messages[0].reactions,
+            vec![postbox_core::Reaction {
+                emoji: "😍".into(),
+                count: 1,
+                from_me: false,
+            }]
+        );
+        assert_eq!(reaction_ids, vec!["personal:r1"]);
+        assert!(orphans.is_empty());
+        store.upsert_messages_batch(&messages).unwrap();
+        assert_eq!(
+            store.delete_messages_by_ids(&chat, &reaction_ids).unwrap(),
+            1
+        );
+        assert_eq!(store.list_messages(&chat, 10, None).unwrap(), messages);
+        assert!(store.get_message(&chat, "personal:r1").unwrap().is_none());
+        assert!(store.search_messages_fts("Reacted", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reaction_changes_and_removals_follow_timestamp_then_id_order() {
+        let chat = ChatKey::new(
+            Provider::Whatsapp,
+            "personal",
+            "personal:123@s.whatsapp.net",
+        );
+        let hub_msgs = postbox_hub::normalize_messages(
+            r#"[
+                {"MsgID":"m1","ChatJID":"personal:123@s.whatsapp.net","Text":"Hello","ReactionEmoji":"😍"},
+                {"MsgID":"r2","ChatJID":"personal:123@s.whatsapp.net","SenderJID":"alice","Timestamp":"2026-11-26T10:02:00Z","ReactionToID":"m1","ReactionEmoji":" 👍 "},
+                {"MsgID":"r1","ChatJID":"personal:123@s.whatsapp.net","SenderJID":"alice","Timestamp":"2026-11-26T10:01:00Z","ReactionToID":"m1","ReactionEmoji":"😍"}
+            ]"#,
+            &chat.id,
+        ).unwrap();
+        let (messages, _, orphans) = fold_hub_messages_and_reactions(&hub_msgs, &chat, false);
+        assert_eq!(
+            messages[0].reactions,
+            vec![postbox_core::Reaction {
+                emoji: "👍".into(),
+                count: 1,
+                from_me: false,
+            }]
+        );
+        assert!(orphans.is_empty());
+
+        let mut with_removal = hub_msgs.clone();
+        let mut removal = hub_msgs[1].clone();
+        removal.msg_id = "r3".into();
+        removal.reaction_emoji = "  ".into();
+        with_removal.insert(0, removal.clone());
+        let (messages, ids, _) = fold_hub_messages_and_reactions(&with_removal, &chat, false);
+        assert!(messages[0].reactions.is_empty());
+        assert_eq!(ids.len(), 3);
+
+        let (messages, _, orphans) = fold_hub_messages_and_reactions(&[removal], &chat, false);
+        assert!(messages.is_empty());
+        assert_eq!(orphans.get("m1"), Some(&Vec::new()));
+    }
+
+    #[test]
+    fn reactions_aggregate_senders_and_unify_own_sender_ids() {
+        let chat = ChatKey::new(
+            Provider::Whatsapp,
+            "personal",
+            "personal:123@s.whatsapp.net",
+        );
+        let hub_msgs = postbox_hub::normalize_messages(
+            r#"[
+                {"MsgID":"m1","ChatJID":"personal:123@s.whatsapp.net","Text":"Hello"},
+                {"MsgID":"r3","ChatJID":"personal:123@s.whatsapp.net","FromMe":true,"SenderJID":"me-new","Timestamp":"2026-11-26T10:03:00Z","ReactionToID":"m1","ReactionEmoji":"😍"},
+                {"MsgID":"r2","ChatJID":"personal:123@s.whatsapp.net","SenderJID":"alice","Timestamp":"2026-11-26T10:02:00Z","ReactionToID":"m1","ReactionEmoji":"😍"},
+                {"MsgID":"r1","ChatJID":"personal:123@s.whatsapp.net","FromMe":true,"SenderJID":"me-old","Timestamp":"2026-11-26T10:01:00Z","ReactionToID":"m1","ReactionEmoji":"👍"}
+            ]"#,
+            &chat.id,
+        ).unwrap();
+        let (messages, _, _) = fold_hub_messages_and_reactions(&hub_msgs, &chat, false);
+        assert_eq!(
+            messages[0].reactions,
+            vec![postbox_core::Reaction {
+                emoji: "😍".into(),
+                count: 2,
+                from_me: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn reactions_without_sender_ids_remain_distinct_and_protocol_stubs_are_filtered() {
+        let chat = ChatKey::new(
+            Provider::Whatsapp,
+            "personal",
+            "personal:123@s.whatsapp.net",
+        );
+        let hub_msgs = postbox_hub::normalize_messages(
+            r#"[
+                {"MsgID":"m1","ChatJID":"personal:123@s.whatsapp.net","Text":"Hello"},
+                {"MsgID":"stub","ChatJID":"personal:123@s.whatsapp.net","Text":"(message)"},
+                {"MsgID":"r1","ChatJID":"personal:123@s.whatsapp.net","ReactionToID":"m1","ReactionEmoji":"😍"},
+                {"MsgID":"r2","ChatJID":"personal:123@s.whatsapp.net","ReactionToID":"m1","ReactionEmoji":"😍"}
+            ]"#,
+            &chat.id,
+        ).unwrap();
+        let (messages, _, _) = fold_hub_messages_and_reactions(&hub_msgs, &chat, false);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].reactions,
+            vec![postbox_core::Reaction {
+                emoji: "😍".into(),
+                count: 2,
+                from_me: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn slack_folded_reactions_replace_inline_counts_and_preserve_inline_only_parents() {
+        let chat = ChatKey::new(Provider::Slack, "T1", "slack:T1:C1");
+        let hub_msgs = postbox_hub::normalize_messages(
+            r#"[
+                {"MsgID":"m1","ChatJID":"slack:T1:C1","Text":"Hello","reactions":[{"name":"thumbsup","count":2,"from_me":true}]},
+                {"MsgID":"m2","ChatJID":"slack:T1:C1","Text":"Inline only","reactions":[{"name":"thumbsup","count":3}]},
+                {"MsgID":"reaction:aaa","ChatJID":"slack:T1:C1","SenderJID":"U1","ReactionToID":"m1","ReactionEmoji":"👍"},
+                {"MsgID":"reaction:bbb","ChatJID":"slack:T1:C1","FromMe":true,"ReactionToID":"m1","ReactionEmoji":"👍"}
+            ]"#,
+            &chat.id,
+        ).unwrap();
+        let (messages, ids, orphans) = fold_hub_messages_and_reactions(&hub_msgs, &chat, true);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].reactions,
+            vec![postbox_core::Reaction {
+                emoji: "👍".into(),
+                count: 2,
+                from_me: true,
+            }]
+        );
+        assert_eq!(
+            messages[1].reactions,
+            vec![postbox_core::Reaction {
+                emoji: "👍".into(),
+                count: 3,
+                from_me: false,
+            }]
+        );
+        assert_eq!(ids, vec!["reaction:aaa", "reaction:bbb"]);
+        assert!(orphans.is_empty());
+    }
+
+    #[tokio::test]
+    async fn foreground_and_background_sync_fold_reactions_and_update_cached_orphan_targets() {
+        let chat = ChatKey::new(
+            Provider::Whatsapp,
+            "personal",
+            "personal:123@s.whatsapp.net",
+        );
+        let payload = r#"[
+            {"MsgID":"personal:m1","ChatJID":"personal:123@s.whatsapp.net","Text":"Hello"},
+            {"MsgID":"personal:r1","ChatJID":"personal:123@s.whatsapp.net","SenderJID":"alice","ReactionToID":"personal:m1","ReactionEmoji":"😍","DisplayText":"Reacted 😍 to message"}
+        ]"#;
+        let hub_msgs = postbox_hub::normalize_messages(payload, &chat.id).unwrap();
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let (endpoint, server) = start_mock_server(state.clone()).await;
+        for background in [false, true] {
+            let mut store = Store::open_in_memory().unwrap();
+            store
+                .upsert_message(&hub_msgs[1].to_core_message(&chat, false))
+                .unwrap();
+            let client = HubClient::new(endpoint.clone(), "test-token").unwrap();
+            let (_bridge, worker) = create_sync_bridge();
+            let mut engine = SyncEngine::new(client, store, worker);
+            state
+                .lock()
+                .unwrap()
+                .messages_by_chat
+                .insert(chat.id.clone(), payload.into());
+            if background {
+                engine.handle_bg_result(BackgroundTaskResult::BackgroundChatMessagesFetched {
+                    chat: chat.clone(),
+                    last_msg_ts: String::new(),
+                    is_group: false,
+                    result: Ok(hub_msgs.clone()),
+                });
+            } else {
+                assert_eq!(engine.sync_chat_messages(&chat, 10, None).await.unwrap(), 1);
+            }
+            let stored = engine.store.list_messages(&chat, 10, None).unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].msg_id, "personal:m1");
+            assert_eq!(
+                stored[0].reactions,
+                vec![postbox_core::Reaction {
+                    emoji: "😍".into(),
+                    count: 1,
+                    from_me: false,
+                }]
+            );
+            assert!(
+                engine
+                    .store
+                    .search_messages_fts("Reacted", 10)
+                    .unwrap()
+                    .is_empty()
+            );
+
+            for emoji in ["👍", ""] {
+                let mut reaction = hub_msgs[1].clone();
+                reaction.reaction_emoji = emoji.into();
+                let orphan_payload = serde_json::json!([{
+                    "MsgID": reaction.msg_id, "ChatJID": chat.id,
+                    "SenderJID": "alice", "ReactionToID": "personal:m1", "ReactionEmoji": emoji,
+                }])
+                .to_string();
+                state
+                    .lock()
+                    .unwrap()
+                    .messages_by_chat
+                    .insert(chat.id.clone(), orphan_payload);
+                if background {
+                    engine.handle_bg_result(BackgroundTaskResult::BackgroundChatMessagesFetched {
+                        chat: chat.clone(),
+                        last_msg_ts: String::new(),
+                        is_group: false,
+                        result: Ok(vec![reaction]),
+                    });
+                } else {
+                    assert_eq!(engine.sync_chat_messages(&chat, 10, None).await.unwrap(), 0);
+                }
+                let mut expected = stored[0].clone();
+                expected.reactions = if emoji.is_empty() {
+                    vec![]
+                } else {
+                    vec![postbox_core::Reaction {
+                        emoji: emoji.into(),
+                        count: 1,
+                        from_me: false,
+                    }]
+                };
+                assert_eq!(
+                    engine.store.get_message(&chat, "personal:m1").unwrap(),
+                    Some(expected.clone())
+                );
+                assert_eq!(
+                    engine.store.list_messages(&chat, 10, None).unwrap(),
+                    vec![expected]
+                );
+            }
+        }
+        server.abort();
+    }
 
     fn sse_event(kind: &str, chat: &str, account: &str) -> SseEvent {
         SseEvent {

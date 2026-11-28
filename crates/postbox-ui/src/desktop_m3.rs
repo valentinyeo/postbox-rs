@@ -892,14 +892,20 @@ impl PostboxShell {
             return None;
         }
         let pending = self.vm.is_reaction_pending(&msg.chat, &msg.msg_id);
-        let mut row = div().flex().flex_wrap().items_center().gap_1().mt_1();
+        let mut row = div()
+            .mt(px(-8.0))
+            .mx_2p5()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1();
         for (seg_ix, r) in msg.reactions.iter().enumerate() {
             let label = if r.count > 1 {
                 format!("{} {}", r.emoji, r.count)
             } else {
                 r.emoji.clone()
             };
-            let bg = if r.from_me { p.accent } else { p.secondary };
+            let bg = if r.from_me { p.accent } else { p.card };
             let fg = if pending {
                 p.muted_foreground
             } else {

@@ -1129,6 +1129,54 @@ impl Store {
         Ok(messages.len())
     }
 
+    pub fn delete_messages_by_ids(
+        &mut self,
+        chat: &ChatKey,
+        msg_ids: &[String],
+    ) -> Result<usize, StoreError> {
+        if msg_ids.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut deleted = 0;
+        {
+            let mut fts_stmt = tx.prepare(
+                "DELETE FROM messages_fts WHERE rowid IN (
+                    SELECT rowid FROM messages
+                    WHERE provider = ?1 AND account_id = ?2 AND chat_id = ?3 AND msg_id = ?4
+                )",
+            )?;
+            let mut delete_stmt = tx.prepare(
+                "DELETE FROM messages
+                 WHERE provider = ?1 AND account_id = ?2 AND chat_id = ?3 AND msg_id = ?4",
+            )?;
+            for msg_id in msg_ids {
+                let args = params![chat.provider.as_str(), chat.account, chat.id, msg_id];
+                fts_stmt.execute(args)?;
+                deleted += delete_stmt.execute(args)?;
+            }
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    pub fn get_message(&self, chat: &ChatKey, msg_id: &str) -> Result<Option<Message>, StoreError> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT msg_id, sender_id, sender_name, from_me, ts, body,
+                       reply_to_id, reply_broadcast, media_type, mime_type,
+                       filename, file_size, reactions_json, read_status, deleted
+                FROM messages
+                WHERE provider = ?1 AND account_id = ?2 AND chat_id = ?3 AND msg_id = ?4
+                "#,
+                params![chat.provider.as_str(), chat.account, chat.id, msg_id],
+                |row| map_message_row(chat, row),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     /// Replaces a local optimistic message (`msg_id == client_id`) with the confirmed Hub message,
     /// cleanly removing the old FTS5 entry.
     pub fn replace_optimistic_message(
@@ -2020,6 +2068,14 @@ mod tests {
         store.upsert_message(&msg2).unwrap();
         store.upsert_message(&msg3).unwrap();
 
+        for msg in [&msg1, &msg2, &msg3] {
+            assert_eq!(
+                store.get_message(&chat, &msg.msg_id).unwrap().as_ref(),
+                Some(msg)
+            );
+        }
+        assert!(store.get_message(&chat, "missing").unwrap().is_none());
+
         let latest_two = store.list_messages(&chat, 2, None).unwrap();
         assert_eq!(latest_two.len(), 2);
         assert_eq!(latest_two[0], msg2);
@@ -2029,6 +2085,66 @@ mod tests {
             .list_messages(&chat, 10, Some(&MessageCursor::from_message(&msg2)))
             .unwrap();
         assert_eq!(older, vec![msg1]);
+    }
+
+    #[test]
+    fn delete_messages_by_ids_is_scoped_idempotent_and_removes_search_entries() {
+        let mut store = Store::open_in_memory().unwrap();
+        let chat = ChatKey::new(Provider::Whatsapp, "personal", "chat1");
+        let other_chats = [
+            ChatKey::new(Provider::Slack, "personal", "chat1"),
+            ChatKey::new(Provider::Whatsapp, "work", "chat1"),
+            ChatKey::new(Provider::Whatsapp, "personal", "chat2"),
+        ];
+        let message = Message {
+            chat: chat.clone(),
+            msg_id: "r1".into(),
+            sender_id: "alice".into(),
+            sender_name: "Alice".into(),
+            from_me: false,
+            ts: "2026-11-26T10:00:00Z".into(),
+            body: "Reacted 😍 to message".into(),
+            reply_to_id: None,
+            reply_broadcast: false,
+            media_kind: None,
+            mime_type: None,
+            filename: None,
+            file_size: None,
+            reactions: vec![],
+            read_status: ReadStatus::None,
+            deleted: false,
+        };
+        for key in std::iter::once(&chat).chain(&other_chats) {
+            for id in ["r1", "r2", "keep"] {
+                let mut msg = message.clone();
+                msg.chat = key.clone();
+                msg.msg_id = id.into();
+                store.upsert_message(&msg).unwrap();
+            }
+        }
+        assert_eq!(store.delete_messages_by_ids(&chat, &[]).unwrap(), 0);
+        assert_eq!(store.list_messages(&chat, 10, None).unwrap().len(), 3);
+        let ids = vec!["r1".into(), "r2".into(), "r1".into(), "missing".into()];
+        assert_eq!(store.delete_messages_by_ids(&chat, &ids).unwrap(), 2);
+        assert_eq!(store.delete_messages_by_ids(&chat, &ids).unwrap(), 0);
+        assert!(store.get_message(&chat, "r1").unwrap().is_none());
+        assert!(store.get_message(&chat, "r2").unwrap().is_none());
+        assert_eq!(
+            store.get_message(&chat, "keep").unwrap().unwrap().body,
+            message.body
+        );
+        assert_eq!(store.list_messages(&chat, 10, None).unwrap().len(), 1);
+        for key in &other_chats {
+            assert_eq!(store.list_messages(key, 10, None).unwrap().len(), 3);
+            assert_eq!(store.get_message(key, "r1").unwrap().unwrap().chat, *key);
+        }
+        let hits = store.search_messages_fts("Reacted", 20).unwrap();
+        assert_eq!(hits.len(), 10);
+        assert!(
+            !hits
+                .iter()
+                .any(|hit| hit.chat == chat && ids.contains(&hit.msg_id))
+        );
     }
 
     #[test]

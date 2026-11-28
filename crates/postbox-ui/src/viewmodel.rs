@@ -1339,6 +1339,24 @@ impl PostboxViewModel {
         self.effective_replies_fold(chat)
     }
 
+    pub fn chat_replies_fold(&self) -> bool {
+        self.selected_chat()
+            .is_some_and(|chat| self.effective_replies_fold(chat))
+    }
+
+    pub fn set_chat_replies_fold(&mut self, slack: bool) {
+        if let Some(chat) = self.selected_chat().cloned() {
+            self.replies_fold_by_chat.insert(chat.key.clone(), slack);
+            let _ = self.store.set_chat_replies_fold(&chat.key, Some(slack));
+            self.rebuild_timeline();
+        }
+        self.status_notice = Some(if slack {
+            "Replies: Slack style".into()
+        } else {
+            "Replies: WhatsApp style".into()
+        });
+    }
+
     pub fn refresh_messages(&mut self) {
         let Some(chat) = self.selected_chat().cloned() else {
             self.messages.clear();
@@ -2954,18 +2972,7 @@ impl PostboxViewModel {
             PaletteCommand::ToggleArchivedInline => self.toggle_archived_inline(),
             PaletteCommand::ArchiveBulkSelected => self.archive_selected(),
             PaletteCommand::CancelBulkSelection => self.cancel_bulk_selection(),
-            PaletteCommand::SetReplyStyleSlack(slack) => {
-                if let Some(chat) = self.selected_chat().cloned() {
-                    self.replies_fold_by_chat.insert(chat.key.clone(), *slack);
-                    let _ = self.store.set_chat_replies_fold(&chat.key, Some(*slack));
-                    self.rebuild_timeline();
-                }
-                self.status_notice = Some(if *slack {
-                    "Replies: Slack style".into()
-                } else {
-                    "Replies: WhatsApp style".into()
-                });
-            }
+            PaletteCommand::SetReplyStyleSlack(slack) => self.set_chat_replies_fold(*slack),
             PaletteCommand::ToggleArchivedOnlyView => self.toggle_archived_only(),
             PaletteCommand::ArchiveOrUnarchiveSelected { expected_archived } => {
                 let current_matches = self.selected_chat().is_some_and(|chat| {
@@ -3743,6 +3750,60 @@ mod tests {
             .unwrap();
 
         store
+    }
+
+    #[test]
+    fn reply_style_defaults_overrides_and_sync_rebuild_the_folded_timeline() {
+        let mut vm = PostboxViewModel::new(seeded_store(), Keymap::postbox_defaults(), "0.1.0");
+        let whatsapp_ix = vm
+            .chats
+            .iter()
+            .position(|c| c.key.provider == Provider::Whatsapp)
+            .unwrap();
+        vm.select_chat_index(whatsapp_ix);
+        assert!(!vm.chat_replies_fold());
+        let mut root = vm.messages[0].clone();
+        vm.set_chat_replies_fold(true);
+        assert!(vm.chat_replies_fold());
+
+        let slack_ix = vm
+            .chats
+            .iter()
+            .position(|c| c.key.provider == Provider::Slack)
+            .unwrap();
+        vm.select_chat_index(slack_ix);
+        assert!(vm.chat_replies_fold());
+        let chat = vm.selected_chat().unwrap().key.clone();
+        root.chat = chat.clone();
+        root.msg_id = "1700.1".into();
+        root.reply_to_id = None;
+        let mut reply = root.clone();
+        reply.msg_id = "1700.2".into();
+        reply.reply_to_id = Some(root.msg_id.clone());
+        vm.store.upsert_message(&root).unwrap();
+        vm.store.upsert_message(&reply).unwrap();
+        vm.apply_sync_event(SyncEvent::MessagesUpdated {
+            chat: chat.clone(),
+            prepended: 0,
+            exhausted: false,
+        });
+        assert_eq!(vm.timeline_items.len(), 2);
+        assert!(matches!(&vm.timeline_items[1], TimelineItem::MessageRow {
+            message, thread_reply_count: 1, ..
+        } if message.msg_id == "1700.1"));
+        assert!(vm.open_thread("1700.1"));
+        assert_eq!(vm.thread_panel().unwrap().messages.len(), 2);
+
+        vm.execute_palette_command(&PaletteCommand::SetReplyStyleSlack(false), None);
+        assert!(!vm.chat_replies_fold());
+        assert_eq!(vm.timeline_items.len(), 3);
+        assert_eq!(vm.store.get_chat_replies_fold(&chat).unwrap(), Some(false));
+        vm.replies_fold_by_chat.clear();
+        assert!(!vm.chat_replies_fold());
+        vm.execute_palette_command(&PaletteCommand::SetReplyStyleSlack(true), None);
+        assert!(vm.chat_replies_fold());
+        assert_eq!(vm.timeline_items.len(), 2);
+        assert_eq!(vm.store.get_chat_replies_fold(&chat).unwrap(), Some(true));
     }
 
     #[test]

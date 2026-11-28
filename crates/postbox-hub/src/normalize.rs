@@ -424,11 +424,26 @@ pub fn normalize_messages(raw: &str, expected_chat: &str) -> Result<Vec<HubMessa
             }
         }
 
+        let reply_to_id = opt_nonempty_str(
+            &obj,
+            &["ReplyToID", "reply_to_id", "quoted_msg_id", "QuotedMsgID"],
+        );
+        let mut thread_ts = opt_nonempty_str(&obj, &["ThreadTS", "thread_ts"]);
+        if is_slack && thread_ts.is_none() {
+            thread_ts = reply_to_id.clone();
+        }
+
         let display_text = str_field(&obj, &["DisplayText", "display_text"]);
         let text = str_field(&obj, &["Text", "text"]);
         let stripped_display = strip_placeholder(&display_text);
         let stripped_text = strip_placeholder(&text);
-        let effective_text = if !stripped_display.is_empty() {
+        let effective_text = if is_slack
+            && thread_ts.as_deref().is_some_and(|t| t != msg_id)
+            && !stripped_text.is_empty()
+            && stripped_display.starts_with("> ")
+        {
+            stripped_text.to_owned()
+        } else if !stripped_display.is_empty() {
             stripped_display.to_owned()
         } else {
             stripped_text.to_owned()
@@ -467,8 +482,8 @@ pub fn normalize_messages(raw: &str, expected_chat: &str) -> Result<Vec<HubMessa
             display_text,
             text,
             effective_text,
-            reply_to_id: opt_nonempty_str(&obj, &["ReplyToID", "reply_to_id"]),
-            thread_ts: opt_nonempty_str(&obj, &["ThreadTS", "thread_ts"]),
+            reply_to_id,
+            thread_ts,
             reply_broadcast: bool_field(&obj, &["ReplyBroadcast", "reply_broadcast"]),
             media_type: str_field(&obj, &["MediaType", "media_type"]),
             mime_type: opt_nonempty_str(&obj, &["MimeType", "mime_type"]),
@@ -551,4 +566,73 @@ pub fn read_message_id(messages: &[HubMessage]) -> Result<String, HubError> {
         return Ok(msg.msg_id.clone());
     }
     Err(HubError::NoIncomingMessage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn slack_quoted_reply_normalizes_parent_thread_and_body() {
+        for parent_key in ["ReplyToID", "reply_to_id", "quoted_msg_id", "QuotedMsgID"] {
+            let mut raw = json!([{
+                "MsgID": "1700.2",
+                "ChatJID": "slack:T1:C1",
+                "DisplayText": "> parent\nreply",
+                "Text": "reply"
+            }]);
+            raw[0][parent_key] = json!("1700.1");
+            let messages = normalize_messages(&raw.to_string(), "slack:T1:C1").unwrap();
+            let reply = &messages[0];
+            assert_eq!(reply.reply_to_id.as_deref(), Some("1700.1"), "{parent_key}");
+            assert_eq!(reply.thread_ts.as_deref(), Some("1700.1"), "{parent_key}");
+            assert_eq!(reply.effective_text, "reply", "{parent_key}");
+            let chat = postbox_core::ChatKey::new(Provider::Slack, "T1", "slack:T1:C1");
+            let message = reply.to_core_message(&chat, true);
+            assert_eq!(message.reply_to_id.as_deref(), Some("1700.1"));
+            assert_eq!(message.body, "reply");
+        }
+    }
+
+    #[test]
+    fn explicit_slack_thread_takes_precedence_over_quoted_parent() {
+        let raw = json!([{
+            "MsgID": "1700.3",
+            "ChatJID": "slack:T1:C1",
+            "quoted_msg_id": "1700.2",
+            "ThreadTS": "1700.1",
+            "DisplayText": "> parent\nreply",
+            "Text": "reply"
+        }]);
+        let messages = normalize_messages(&raw.to_string(), "slack:T1:C1").unwrap();
+        assert_eq!(messages[0].reply_to_id.as_deref(), Some("1700.2"));
+        assert_eq!(messages[0].thread_ts.as_deref(), Some("1700.1"));
+        assert_eq!(messages[0].effective_text, "reply");
+    }
+
+    #[test]
+    fn display_text_is_preserved_outside_quoted_slack_replies() {
+        for (chat, thread_ts, display_text, text) in [
+            ("main:1@s.whatsapp.net", None, "> parent\nreply", "reply"),
+            ("slack:T1:C1", Some("1700.2"), "> quoted root", "root"),
+            ("slack:T1:C1", Some("1700.1"), "> attachment", ""),
+            ("slack:T1:C1", Some("1700.1"), "formatted reply", "reply"),
+        ] {
+            let raw = json!([{
+                "MsgID": "1700.2",
+                "ChatJID": chat,
+                "quoted_msg_id": "1700.1",
+                "ThreadTS": thread_ts,
+                "DisplayText": display_text,
+                "Text": text
+            }]);
+            let messages = normalize_messages(&raw.to_string(), chat).unwrap();
+            assert_eq!(messages[0].effective_text, display_text);
+            if !chat.starts_with("slack:") {
+                assert_eq!(messages[0].thread_ts, None);
+                assert_eq!(messages[0].reply_to_id.as_deref(), Some("1700.1"));
+            }
+        }
+    }
 }

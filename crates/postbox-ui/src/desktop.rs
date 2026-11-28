@@ -44,6 +44,10 @@ pub const RADIUS_MODAL_PX: f32 = 18.0;
 pub const RADIUS_ROW_PX: f32 = 12.0;
 pub const RADIUS_CHIP_PX: f32 = 9999.0;
 
+pub(crate) fn is_slack_display_style(id_prefix: &str, chat_replies_fold: bool) -> bool {
+    id_prefix == "msg" && chat_replies_fold
+}
+
 pub(crate) fn message_group_spacing(
     grouped_with_prev: bool,
     grouped_with_next: bool,
@@ -422,6 +426,7 @@ pub struct PostboxShell {
     last_window_title: String,
     last_applied_theme: ThemeChoice,
     last_applied_scale: FontScale,
+    last_applied_reply_style: bool,
     pub(crate) gpu_textures: GpuTextureLru,
     pub(crate) gif_tick: usize,
     pub(crate) gif_timer_task: Option<Task<()>>,
@@ -747,6 +752,7 @@ impl PostboxShell {
 
         window.set_window_title(&initial_title);
         let init_elapsed_ms = started_at.elapsed().as_millis();
+        let initial_reply_style = vm.chat_replies_fold();
 
         let mut shell = Self {
             vm,
@@ -773,6 +779,7 @@ impl PostboxShell {
             last_window_title: initial_title,
             last_applied_theme: initial_theme,
             last_applied_scale: initial_scale,
+            last_applied_reply_style: initial_reply_style,
             gpu_textures: GpuTextureLru::default(),
             gif_tick: 0,
             gif_timer_task: None,
@@ -1015,6 +1022,12 @@ impl PostboxShell {
                 .scroll_to_item(sel, ScrollStrategy::Nearest);
         }
 
+        let reply_style = self.vm.chat_replies_fold();
+        if reply_style != self.last_applied_reply_style {
+            self.last_applied_reply_style = reply_style;
+            self.timeline_state
+                .update(cx, |state, cx| state.remeasure(cx));
+        }
         let new_timeline_len = self.vm.timeline_items().len();
         let scroll_latest = self.vm.take_scroll_to_latest_pending();
         let current_len = self.timeline_state.read(cx).item_count();
@@ -1671,6 +1684,7 @@ impl PostboxShell {
         let body_px = scaled_px(BASE_FONT_PX, scale);
         let time_px = scaled_px(TYPE_TIME_PX, scale);
         let label_px = scaled_px(TYPE_LABEL_PX, scale);
+        let slack_style = is_slack_display_style(id_prefix, self.vm.chat_replies_fold());
 
         match item {
             TimelineItem::DateDivider { date_label } => div()
@@ -1703,17 +1717,19 @@ impl PostboxShell {
                 read_ticks,
                 ..
             } => {
-                let bubble_bg = if message.from_me {
+                let bubble_bg = if slack_style {
+                    if *selected { p.accent } else { p.card }
+                } else if message.from_me {
                     p.bubble_outgoing
                 } else {
                     p.bubble_incoming
                 };
-                let bubble_fg = if message.from_me {
+                let bubble_fg = if !slack_style && message.from_me {
                     p.bubble_outgoing_foreground
                 } else {
                     p.foreground
                 };
-                let bubble_meta = if message.from_me {
+                let bubble_meta = if !slack_style && message.from_me {
                     p.bubble_outgoing_muted
                 } else {
                     p.muted_foreground
@@ -1732,21 +1748,26 @@ impl PostboxShell {
                 let mut bubble = div()
                     .id(SharedString::from(format!("{id_prefix}-bubble-{ix}")))
                     .test_support()
-                    .max_w(px(620.0))
                     .px_3()
                     .py_1p5()
-                    .rounded(px(RADIUS_BUBBLE_PX))
-                    .when(message.from_me && *grouped_with_prev, |el| {
-                        el.rounded_tr(px(RADIUS_GROUPED_INNER_PX))
+                    .when(slack_style, |el| {
+                        el.w_full().max_w_full().rounded(px(RADIUS_ROW_PX))
                     })
-                    .when(message.from_me && *grouped_with_next, |el| {
-                        el.rounded_br(px(RADIUS_GROUPED_INNER_PX))
-                    })
-                    .when(!message.from_me && *grouped_with_prev, |el| {
-                        el.rounded_tl(px(RADIUS_GROUPED_INNER_PX))
-                    })
-                    .when(!message.from_me && *grouped_with_next, |el| {
-                        el.rounded_bl(px(RADIUS_GROUPED_INNER_PX))
+                    .when(!slack_style, |el| {
+                        el.max_w(px(620.0))
+                            .rounded(px(RADIUS_BUBBLE_PX))
+                            .when(message.from_me && *grouped_with_prev, |el| {
+                                el.rounded_tr(px(RADIUS_GROUPED_INNER_PX))
+                            })
+                            .when(message.from_me && *grouped_with_next, |el| {
+                                el.rounded_br(px(RADIUS_GROUPED_INNER_PX))
+                            })
+                            .when(!message.from_me && *grouped_with_prev, |el| {
+                                el.rounded_tl(px(RADIUS_GROUPED_INNER_PX))
+                            })
+                            .when(!message.from_me && *grouped_with_next, |el| {
+                                el.rounded_bl(px(RADIUS_GROUPED_INNER_PX))
+                            })
                     })
                     .bg(rgb(bubble_bg))
                     .border_1()
@@ -1796,7 +1817,52 @@ impl PostboxShell {
                         },
                     );
 
-                if !grouped_with_prev && !message.from_me {
+                let mut meta_row = div()
+                    .flex()
+                    .items_center()
+                    .when(slack_style, |el| el.justify_start())
+                    .when(!slack_style, |el| el.justify_end())
+                    .gap_2()
+                    .text_size(px(time_px))
+                    .text_color(rgb(bubble_meta))
+                    .when(slack_style && !grouped_with_prev, |el| {
+                        el.child(
+                            div()
+                                .font_weight(gpui_kit::FontWeight::BOLD)
+                                .text_size(px(label_px))
+                                .text_color(rgb(bubble_fg))
+                                .child(if message.from_me {
+                                    "You".to_owned()
+                                } else {
+                                    message.sender_name.clone()
+                                }),
+                        )
+                    })
+                    .when(*marked, |el| el.child("Marked"))
+                    .child(format_time_hm(&message.ts));
+
+                if *read_ticks != ReadTickDisplay::None {
+                    let tick_color = if *read_ticks == ReadTickDisplay::DoubleRead {
+                        p.ring
+                    } else {
+                        bubble_meta
+                    };
+                    meta_row = meta_row.child(
+                        div()
+                            .text_size(px(label_px))
+                            .text_color(rgb(tick_color))
+                            .child(read_ticks.symbol()),
+                    );
+                }
+
+                let bottom_meta = if slack_style && !grouped_with_prev {
+                    bubble = bubble.child(meta_row);
+                    None
+                } else {
+                    Some(meta_row)
+                };
+
+                if !slack_style && !grouped_with_prev && !message.from_me {
                     bubble = bubble.child(
                         div()
                             .text_size(px(label_px))
@@ -1841,30 +1907,6 @@ impl PostboxShell {
                     bubble = bubble.child(media_el);
                 }
 
-                let mut meta_row = div()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap_2()
-                    .text_size(px(time_px))
-                    .text_color(rgb(bubble_meta))
-                    .when(*marked, |el| el.child("Marked"))
-                    .child(format_time_hm(&message.ts));
-
-                if *read_ticks != ReadTickDisplay::None {
-                    let tick_color = if *read_ticks == ReadTickDisplay::DoubleRead {
-                        p.ring
-                    } else {
-                        bubble_meta
-                    };
-                    meta_row = meta_row.child(
-                        div()
-                            .text_size(px(label_px))
-                            .text_color(rgb(tick_color))
-                            .child(read_ticks.symbol()),
-                    );
-                }
-
                 if !body_text.is_empty() {
                     bubble = bubble.child(self.render_message_body_element(
                         message, body_text, body_px, bubble_fg, ix, id_prefix,
@@ -1873,12 +1915,17 @@ impl PostboxShell {
                 if let Some((card, _)) = unfurl_match {
                     bubble = bubble.child(self.render_unfurl_card(card, &p, ix, id_prefix, &shell));
                 }
-                if should_show_message_meta(
-                    *grouped_with_next,
-                    *selected,
-                    *marked,
-                    outbox_status.is_some(),
-                ) {
+                let show_bottom_meta = if slack_style {
+                    *selected || *marked || outbox_status.is_some()
+                } else {
+                    should_show_message_meta(
+                        *grouped_with_next,
+                        *selected,
+                        *marked,
+                        outbox_status.is_some(),
+                    )
+                };
+                if show_bottom_meta && let Some(meta_row) = bottom_meta {
                     bubble = bubble.child(meta_row);
                 }
 
@@ -1925,7 +1972,16 @@ impl PostboxShell {
 
                 if *thread_reply_count > 0 {
                     let root_id = message.msg_id.clone();
-                    let label = replies_line(*thread_reply_count);
+                    let label = if slack_style {
+                        let reply_word = if *thread_reply_count == 1 {
+                            "reply"
+                        } else {
+                            "replies"
+                        };
+                        format!("{thread_reply_count} {reply_word} · View thread >")
+                    } else {
+                        replies_line(*thread_reply_count)
+                    };
                     let shell_thread = shell.clone();
                     bubble = bubble.child(
                         div()
@@ -1934,9 +1990,12 @@ impl PostboxShell {
                             .mt_1()
                             .px_2()
                             .py_0p5()
-                            .rounded(px(RADIUS_CHIP_PX))
-                            .bg(rgb(p.secondary))
-                            .border_1()
+                            .when(slack_style, |el| el.w_full().border_t_1())
+                            .when(!slack_style, |el| {
+                                el.rounded(px(RADIUS_CHIP_PX))
+                                    .bg(rgb(p.secondary))
+                                    .border_1()
+                            })
                             .border_color(rgb(p.border))
                             .text_size(px(label_px))
                             .text_color(rgb(p.foreground))
@@ -1956,19 +2015,28 @@ impl PostboxShell {
                 }
 
                 let mut bubble_column = div()
-                    .max_w(px(620.0))
                     .flex()
                     .flex_col()
-                    .when(message.from_me, |el| el.items_end())
-                    .when(!message.from_me, |el| el.items_start())
+                    .when(slack_style, |el| el.w_full().max_w_full().items_start())
+                    .when(!slack_style, |el| {
+                        el.max_w(px(620.0))
+                            .when(message.from_me, |el| el.items_end())
+                            .when(!message.from_me, |el| el.items_start())
+                    })
                     .child(bubble);
                 if let Some(chips) = self.render_reaction_chips(message, &p, ix, id_prefix, &shell)
                 {
                     bubble_column = bubble_column.child(chips);
                 }
 
-                let (top_pt, bottom_pb) =
-                    message_group_spacing(*grouped_with_prev, *grouped_with_next);
+                let (top_pt, bottom_pb) = if slack_style {
+                    (
+                        if *grouped_with_prev { 2.0 } else { 8.0 },
+                        if *grouped_with_next { 2.0 } else { 4.0 },
+                    )
+                } else {
+                    message_group_spacing(*grouped_with_prev, *grouped_with_next)
+                };
                 let bottom_pb = bottom_pb
                     + if message.reactions.is_empty() {
                         0.0
@@ -1983,8 +2051,8 @@ impl PostboxShell {
                     .pt(px(top_pt))
                     .pb(px(bottom_pb))
                     .flex()
-                    .when(message.from_me, |el| el.justify_end())
-                    .when(!message.from_me, |el| el.justify_start())
+                    .when(!slack_style && message.from_me, |el| el.justify_end())
+                    .when(slack_style || !message.from_me, |el| el.justify_start())
                     .child(bubble_column)
                     .into_any_element()
             }
@@ -2939,6 +3007,30 @@ impl Render for PostboxShell {
                                             } else {
                                                 "Voice"
                                             }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("composer-style-btn")
+                                            .test_support()
+                                            .px_2p5()
+                                            .py_1()
+                                            .rounded(px(RADIUS_CHIP_PX))
+                                            .bg(rgb(p.muted))
+                                            .border_1()
+                                            .border_color(rgb(p.border))
+                                            .text_size(px(TYPE_LABEL_PX))
+                                            .text_color(rgb(p.foreground))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                let current = this.vm.chat_replies_fold();
+                                                this.vm.set_chat_replies_fold(!current);
+                                                this.sync_after_vm_change(window, cx);
+                                            }))
+                                            .child(if self.vm.chat_replies_fold() {
+                                                "Slack view"
+                                            } else {
+                                                "WhatsApp view"
+                                            }),
                                     ),
                             )
                             .child(
@@ -3499,6 +3591,20 @@ mod message_group_tests {
     use super::*;
 
     #[test]
+    fn slack_display_style_only_applies_to_folded_main_timeline() {
+        for (id_prefix, fold, expected) in [
+            ("msg", true, true),
+            ("msg", false, false),
+            ("thread", true, false),
+            ("thread", false, false),
+            ("", true, false),
+            ("other", true, false),
+        ] {
+            assert_eq!(is_slack_display_style(id_prefix, fold), expected);
+        }
+    }
+
+    #[test]
     fn spacing_distinguishes_single_and_burst_positions() {
         for (position, grouped_with_prev, grouped_with_next, expected) in [
             ("single", false, false, (10.0, 2.0)),
@@ -3920,6 +4026,7 @@ mod desktop_tests {
             assert!(window.try_find("composer-attach-btn").is_some());
             assert!(window.try_find("composer-dictate-btn").is_some());
             assert!(window.try_find("composer-voice-btn").is_some());
+            assert!(window.try_find("composer-style-btn").is_some());
             assert!(window.try_find("composer-send-btn").is_some());
             assert!(window.try_find("toolbar").is_none());
         })
@@ -3930,6 +4037,29 @@ mod desktop_tests {
                 "Combined inbox - Postbox v0.1.0"
             );
         });
+    }
+
+    #[gpui_kit::test]
+    fn composer_style_button_toggles_and_persists_chat_display_style(cx: &mut TestAppContext) {
+        let (handle, shell) = open_shell(cx);
+        for expected in [true, false] {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.click("composer-style-btn", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update(|cx| {
+                let vm = &shell.read(cx).vm;
+                assert_eq!(vm.chat_replies_fold(), expected);
+                assert_eq!(
+                    vm.store()
+                        .get_chat_replies_fold(&vm.selected_chat().unwrap().key)
+                        .unwrap(),
+                    Some(expected)
+                );
+            });
+        }
     }
 
     #[gpui_kit::test]
@@ -4511,7 +4641,7 @@ mod desktop_tests {
         cx: &mut TestAppContext,
     ) {
         let (handle, shell) = open_shell(cx);
-        // Select Bob (Slack chat with folded thread) and open thread panel.
+        // Select Bob (Slack chat with folded thread) and open its attachment footer.
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             window.press("j", cx);
@@ -4520,10 +4650,26 @@ mod desktop_tests {
         cx.run_until_parked();
 
         cx.update_window(handle.into(), |_, window, cx| {
-            shell.update(cx, |this, cx| {
-                assert!(this.vm.open_thread("1700.1"));
-                this.sync_after_vm_change(window, cx);
-            });
+            let vm = &shell.read(cx).vm;
+            assert!(vm.chat_replies_fold());
+            let root_ix = vm
+                .timeline_items()
+                .iter()
+                .position(|item| {
+                    matches!(item, TimelineItem::MessageRow { message, thread_reply_count: 1, .. }
+                    if message.msg_id == "1700.1")
+                })
+                .unwrap();
+            window.render_frame(cx);
+            window.click(&format!("msg-thread-pill-{root_ix}"), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let panel = shell.read(cx).vm.thread_panel().unwrap();
+            assert_eq!(panel.root_msg_id, "1700.1");
+            assert_eq!(panel.messages.len(), 2);
             window.render_frame(cx);
             assert!(window.try_find("thread-panel").is_some());
             assert!(window.try_find("thread-broadcast-wrap").is_some());

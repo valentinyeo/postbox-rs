@@ -1007,6 +1007,7 @@ impl Store {
         }
         let tx = self.conn.transaction()?;
         let mut title_cache: HashMap<&ChatKey, String> = HashMap::new();
+        reconcile_superseded_local_messages(&tx, messages)?;
         {
             let mut upsert_stmt = tx.prepare(
                 r#"
@@ -1544,6 +1545,95 @@ fn map_message_row(chat_key: &ChatKey, row: &Row<'_>) -> rusqlite::Result<Messag
         read_status: ReadStatus::parse(&read_status_str),
         deleted: row.get::<_, i64>(14)? != 0,
     })
+}
+
+/// Deletes stored optimistic `client_id` rows that a batch is about to supersede (PORU-25).
+///
+/// Runs inside the batch transaction so the timeline never shows both copies. Rows still held in
+/// the outbox, failed sends, rows keyed by a server id, and anything outside the pairing window
+/// stay untouched.
+fn reconcile_superseded_local_messages(
+    tx: &rusqlite::Transaction<'_>,
+    messages: &[Message],
+) -> Result<(), StoreError> {
+    let mut by_chat: HashMap<&ChatKey, Vec<&Message>> = HashMap::new();
+    for msg in messages {
+        by_chat.entry(&msg.chat).or_default().push(msg);
+    }
+
+    for (chat, batch) in by_chat {
+        let mut stmt = tx.prepare(
+            r#"
+            SELECT msg_id, sender_id, sender_name, from_me, ts, body,
+                   reply_to_id, reply_broadcast, media_type, mime_type,
+                   filename, file_size, reactions_json, read_status, deleted
+            FROM messages
+            WHERE provider = ?1 AND account_id = ?2 AND chat_id = ?3
+              AND from_me = 1 AND read_status IN ('sending', 'sent')
+              AND length(msg_id) = 32
+            "#,
+        )?;
+        let stored = stmt
+            .query_map(
+                params![chat.provider.as_str(), chat.account, chat.id],
+                |row| map_message_row(chat, row),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let superseded = postbox_core::dedup::pair_superseded_local_messages(&stored, &batch);
+        if superseded.is_empty() {
+            continue;
+        }
+
+        let mut delete_msg = tx.prepare(
+            "DELETE FROM messages
+             WHERE provider = ?1 AND account_id = ?2 AND chat_id = ?3 AND msg_id = ?4",
+        )?;
+        let mut outbox_phase = tx.prepare("SELECT phase FROM outbox WHERE client_id = ?1")?;
+        let mut cache_row = tx.prepare("SELECT 1 FROM media_cache WHERE cache_key = ?1")?;
+        let mut cache_rekey =
+            tx.prepare("UPDATE OR REPLACE media_cache SET cache_key = ?2 WHERE cache_key = ?1")?;
+
+        for (local_id, server_id) in superseded {
+            // A send still queued or held must keep its row: it is the user's only copy.
+            let phase: Option<String> = outbox_phase
+                .query_row(params![local_id], |row| row.get(0))
+                .optional()?;
+            if phase.is_some() {
+                continue;
+            }
+
+            // Voice notes cache their bytes under the local `client_id` key; carry it over so the
+            // server-keyed row resolves the same download.
+            let old_key = postbox_core::dedup::chat_msg_cache_key(chat, &local_id);
+            if cache_row
+                .query_row(params![old_key], |row| row.get::<_, i64>(0))
+                .optional()?
+                .is_some()
+            {
+                let new_key = postbox_core::dedup::chat_msg_cache_key(chat, &server_id);
+                if new_key != old_key {
+                    cache_rekey.execute(params![old_key, new_key])?;
+                }
+            }
+
+            tx.execute(
+                "DELETE FROM messages_fts WHERE rowid IN (
+                    SELECT rowid FROM messages
+                    WHERE provider = ?1 AND account_id = ?2 AND chat_id = ?3 AND msg_id = ?4
+                )",
+                params![chat.provider.as_str(), chat.account, chat.id, local_id],
+            )?;
+            delete_msg.execute(params![
+                chat.provider.as_str(),
+                chat.account,
+                chat.id,
+                local_id
+            ])?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2664,6 +2754,219 @@ mod tests {
         let loaded = store.list_messages(&chat, 10, None).unwrap();
         let opt_row = loaded.iter().find(|m| m.msg_id == "m_opt").unwrap();
         assert_eq!(opt_row.read_status, ReadStatus::Failed);
+    }
+
+    /// Builds an outgoing message row keyed by a local `client_id` (what an unconfirmed send left).
+    fn local_sent(chat: &ChatKey, client_id: &str, ts: &str, body: &str) -> Message {
+        Message {
+            chat: chat.clone(),
+            msg_id: client_id.into(),
+            sender_id: "me".into(),
+            sender_name: "You".into(),
+            from_me: true,
+            ts: ts.into(),
+            body: body.into(),
+            reply_to_id: None,
+            reply_broadcast: false,
+            media_kind: None,
+            mime_type: None,
+            filename: None,
+            file_size: None,
+            reactions: vec![],
+            read_status: ReadStatus::Sent,
+            deleted: false,
+        }
+    }
+
+    /// Builds the authoritative `from_me` row Hub returns once WhatsApp assigns a server id.
+    fn server_sent(chat: &ChatKey, msg_id: &str, ts: &str, body: &str) -> Message {
+        let mut msg = local_sent(chat, msg_id, ts, body);
+        msg.msg_id = msg_id.into();
+        msg
+    }
+
+    #[test]
+    fn synced_server_copy_replaces_local_client_id_row_poru_25() {
+        let mut store = Store::open_in_memory().unwrap();
+        let chat = ChatKey::new(Provider::Whatsapp, "main", "dedup@s.whatsapp.net");
+        let cid = format_client_id([0x42; 16]);
+        store
+            .upsert_messages_batch(&[local_sent(
+                &chat,
+                &cid,
+                "2026-11-26T10:57:02Z",
+                "https://x.com/liam_fallen/status/1",
+            )])
+            .unwrap();
+        assert_eq!(
+            store.search_messages_fts("liam_fallen", 10).unwrap().len(),
+            1
+        );
+
+        store
+            .upsert_messages_batch(&[server_sent(
+                &chat,
+                "3EB0A1B2C3D4E5",
+                "2026-11-26T10:57:00Z",
+                "https://x.com/liam_fallen/status/1",
+            )])
+            .unwrap();
+
+        let msgs = store.list_messages(&chat, 10, None).unwrap();
+        assert_eq!(msgs.len(), 1, "one bubble, got {msgs:?}");
+        assert_eq!(msgs[0].msg_id, "3EB0A1B2C3D4E5");
+        assert_eq!(
+            store.search_messages_fts("liam_fallen", 10).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn media_copy_keeps_server_file_size_and_drops_local_row_poru_25() {
+        let mut store = Store::open_in_memory().unwrap();
+        let chat = ChatKey::new(Provider::Whatsapp, "main", "media@s.whatsapp.net");
+        let cid = format_client_id([0x24; 16]);
+        let mut local = local_sent(&chat, &cid, "2026-11-26T10:57:01Z", "");
+        local.media_kind = Some(MediaKind::Document);
+        local.filename = Some("{CDAA5B2F-0000-4000-8000-000000000000}.png".into());
+        local.file_size = None;
+        store.upsert_messages_batch(&[local]).unwrap();
+
+        let mut server = server_sent(&chat, "3EB0FFEE", "2026-11-26T10:57:01Z", "");
+        server.media_kind = Some(MediaKind::Document);
+        server.filename = Some("{CDAA5B2F-0000-4000-8000-000000000000}.png".into());
+        server.file_size = Some(115_000);
+        store.upsert_messages_batch(&[server]).unwrap();
+
+        let msgs = store.list_messages(&chat, 10, None).unwrap();
+        assert_eq!(msgs.len(), 1, "one bubble, got {msgs:?}");
+        assert_eq!(msgs[0].msg_id, "3EB0FFEE");
+        assert_eq!(msgs[0].file_size, Some(115_000));
+    }
+
+    #[test]
+    fn identical_server_messages_are_never_merged_poru_25() {
+        let mut store = Store::open_in_memory().unwrap();
+        let chat = ChatKey::new(Provider::Whatsapp, "main", "same@s.whatsapp.net");
+        let first = server_sent(&chat, "3EB00000000001", "2026-11-26T10:57:00Z", "ok");
+        let second = server_sent(&chat, "3EB00000000002", "2026-11-26T10:57:01Z", "ok");
+        store
+            .upsert_messages_batch(&[first.clone(), second.clone()])
+            .unwrap();
+        let msgs = store.list_messages(&chat, 10, None).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(store.search_messages_fts("ok", 10).unwrap().len(), 2);
+
+        // Re-syncing the same pair must stay idempotent.
+        store.upsert_messages_batch(&[first, second]).unwrap();
+        assert_eq!(store.list_messages(&chat, 10, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pre_existing_duplicate_is_cleaned_on_next_sync_poru_25() {
+        let mut store = Store::open_in_memory().unwrap();
+        let chat = ChatKey::new(Provider::Whatsapp, "main", "dup@s.whatsapp.net");
+        let cid = format_client_id([0x77; 16]);
+        // Both rows already on disk, as a user upgrading from the buggy build has.
+        store
+            .upsert_messages_batch(&[local_sent(&chat, &cid, "2026-11-26T10:57:00Z", "hi")])
+            .unwrap();
+        store
+            .upsert_messages_batch(&[server_sent(
+                &chat,
+                "3EB0000000AA",
+                "2026-11-26T10:57:00Z",
+                "hi",
+            )])
+            .unwrap();
+
+        // The next sync re-delivers the server copy and the stale local row disappears.
+        store
+            .upsert_messages_batch(&[server_sent(
+                &chat,
+                "3EB0000000AA",
+                "2026-11-26T10:57:00Z",
+                "hi",
+            )])
+            .unwrap();
+        let msgs = store.list_messages(&chat, 10, None).unwrap();
+        assert_eq!(msgs.len(), 1, "one bubble, got {msgs:?}");
+        assert_eq!(msgs[0].msg_id, "3EB0000000AA");
+    }
+
+    #[test]
+    fn failed_and_queued_local_rows_survive_sync_poru_25() {
+        let mut store = Store::open_in_memory().unwrap();
+        let chat = ChatKey::new(Provider::Whatsapp, "main", "fail@s.whatsapp.net");
+        let failed_id = format_client_id([0x01; 16]);
+        let queued_id = format_client_id([0x02; 16]);
+
+        let mut failed = local_sent(&chat, &failed_id, "2026-11-26T10:57:00Z", "retry me");
+        failed.read_status = ReadStatus::Failed;
+        store.upsert_messages_batch(&[failed]).unwrap();
+
+        let mut queued = local_sent(&chat, &queued_id, "2026-11-26T10:57:00Z", "queued");
+        queued.read_status = ReadStatus::Sending;
+        store.upsert_messages_batch(&[queued]).unwrap();
+        store
+            .enqueue_outbox(&OutboxRecord::new_text(
+                queued_id.clone(),
+                chat.clone(),
+                "queued",
+                None,
+                false,
+                1_000,
+            ))
+            .unwrap();
+
+        store
+            .upsert_messages_batch(&[
+                server_sent(&chat, "3EB0FAIL", "2026-11-26T10:57:00Z", "retry me"),
+                server_sent(&chat, "3EB0QUEU", "2026-11-26T10:57:00Z", "queued"),
+            ])
+            .unwrap();
+
+        let ids: Vec<String> = store
+            .list_messages(&chat, 10, None)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.msg_id)
+            .collect();
+        assert!(ids.contains(&failed_id), "failed row kept: {ids:?}");
+        assert!(ids.contains(&queued_id), "queued row kept: {ids:?}");
+        assert!(ids.contains(&"3EB0FAIL".to_string()));
+        assert!(ids.contains(&"3EB0QUEU".to_string()));
+    }
+
+    #[test]
+    fn unmatched_local_row_survives_when_content_or_time_differs_poru_25() {
+        let mut store = Store::open_in_memory().unwrap();
+        let chat = ChatKey::new(Provider::Whatsapp, "main", "keep@s.whatsapp.net");
+        let cid = format_client_id([0x09; 16]);
+        store
+            .upsert_messages_batch(&[local_sent(&chat, &cid, "2026-11-26T10:57:00Z", "mine")])
+            .unwrap();
+
+        // Different text, then a far-off timestamp: neither is this row's copy.
+        store
+            .upsert_messages_batch(&[server_sent(
+                &chat,
+                "3EB0OTHER1",
+                "2026-11-26T10:57:00Z",
+                "theirs",
+            )])
+            .unwrap();
+        store
+            .upsert_messages_batch(&[server_sent(
+                &chat,
+                "3EB0OTHER2",
+                "2026-11-26T15:00:00Z",
+                "mine",
+            )])
+            .unwrap();
+
+        let msgs = store.list_messages(&chat, 10, None).unwrap();
+        assert_eq!(msgs.len(), 3, "nothing deleted, got {msgs:?}");
     }
 
     #[test]

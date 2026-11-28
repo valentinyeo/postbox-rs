@@ -3096,18 +3096,20 @@ impl PostboxViewModel {
             PaletteCommand::OpenVideoExternal => {
                 self.request_external_video();
             }
-            PaletteCommand::AttachFile => {
-                self.pending_attachment_picker = self.selected_chat().map(|chat| chat.key.clone());
-                if self.pending_attachment_picker.is_none() {
-                    self.status_notice = Some("Select a chat first".into());
-                }
-            }
+            PaletteCommand::AttachFile => self.request_attachment_picker(),
             PaletteCommand::SearchChats
             | PaletteCommand::SortViews
             | PaletteCommand::OpenLinksInMessage
             | PaletteCommand::ShowShortcuts => unreachable!(),
         }
         true
+    }
+
+    pub fn request_attachment_picker(&mut self) {
+        self.pending_attachment_picker = self.selected_chat().map(|chat| chat.key.clone());
+        if self.pending_attachment_picker.is_none() {
+            self.status_notice = Some("Select a chat first".into());
+        }
     }
 
     pub fn take_attachment_picker_request(&mut self) -> Option<ChatKey> {

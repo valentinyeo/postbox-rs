@@ -116,6 +116,7 @@ gpui_kit::actions!(
         FontReset,
         PlayPauseVoice,
         ToggleTranscript,
+        ToggleVoiceRecord,
         FinishVoiceRecord,
         CancelVoiceRecord,
         ToggleDictation,
@@ -204,6 +205,7 @@ fn gpui_action_for(action: PbAction) -> Option<Box<dyn GpuiAction>> {
         PbAction::FontReset => Some(Box::new(FontReset)),
         PbAction::PlayPauseVoice => Some(Box::new(PlayPauseVoice)),
         PbAction::ToggleTranscript => Some(Box::new(ToggleTranscript)),
+        PbAction::ToggleVoiceRecord => Some(Box::new(ToggleVoiceRecord)),
         PbAction::FinishVoiceRecord => Some(Box::new(FinishVoiceRecord)),
         PbAction::CancelVoiceRecord => Some(Box::new(CancelVoiceRecord)),
         PbAction::ToggleDictation => Some(Box::new(ToggleDictation)),
@@ -1156,6 +1158,17 @@ impl PostboxShell {
         let thread_sel = self.thread_composer.read(cx).selected_range();
         self.vm.set_composer_selection(main_sel);
         self.vm.set_thread_selection(thread_sel);
+    }
+
+    fn refresh_deepgram_key_availability(&mut self) {
+        if !self.vm.deepgram_key_available() {
+            let plat = NativePlatform::default();
+            if let postbox_platform::ApiKeyOutcome::Ready(_) =
+                postbox_platform::discover_deepgram_api_key_from_system(&plat, &plat)
+            {
+                self.vm.set_deepgram_key_available(true);
+            }
+        }
     }
 
     fn execute_palette_index(
@@ -2251,12 +2264,47 @@ impl PostboxShell {
             footer = footer.child(pill);
         }
 
-        footer = footer.child(
-            Textarea::new(&self.thread_composer)
-                .aria_label("Thread reply composer")
-                .bordered(true)
-                .rounded(px(RADIUS_BUBBLE_PX)),
-        );
+        footer = footer
+            .child(
+                Textarea::new(&self.thread_composer)
+                    .aria_label("Thread reply composer")
+                    .bordered(true)
+                    .rounded(px(RADIUS_BUBBLE_PX)),
+            )
+            .child(
+                div().flex().flex_row().items_center().child(
+                    div()
+                        .id("thread-dictate-btn")
+                        .test_support()
+                        .px_2p5()
+                        .py_1()
+                        .rounded(px(RADIUS_CHIP_PX))
+                        .bg(rgb(p.muted))
+                        .border_1()
+                        .border_color(rgb(p.border))
+                        .text_size(px(TYPE_LABEL_PX))
+                        .text_color(rgb(p.foreground))
+                        .when(self.vm.is_dictation_active(), |button| {
+                            button
+                                .bg(rgb(p.destructive))
+                                .border_color(rgb(p.destructive))
+                                .text_color(rgb(p.primary_foreground))
+                        })
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.refresh_deepgram_key_availability();
+                            this.vm.set_focus(FocusTarget::ThreadComposer);
+                            this.sync_selections_to_vm(cx);
+                            this.vm.toggle_dictation(true);
+                            this.sync_after_vm_change(window, cx);
+                        }))
+                        .child(if self.vm.is_dictation_active() {
+                            "Stop dictation"
+                        } else {
+                            "Dictate"
+                        }),
+                ),
+            );
 
         let thread_key_ctx = if self
             .vm
@@ -2725,10 +2773,145 @@ impl Render for PostboxShell {
                 }
             }))
             .child(
-                Textarea::new(&self.composer)
-                    .aria_label("Message composer")
-                    .bordered(true)
-                    .rounded(px(RADIUS_BUBBLE_PX)),
+                div()
+                    .rounded(px(RADIUS_BUBBLE_PX))
+                    .bg(rgb(p.secondary))
+                    .border_1()
+                    .border_color(rgb(p.border))
+                    .p_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .child(
+                        Textarea::new(&self.composer)
+                            .aria_label("Message composer")
+                            .bordered(false)
+                            .rounded(px(RADIUS_BUBBLE_PX)),
+                    )
+                    .child(
+                        div()
+                            .id("composer-action-bar")
+                            .test_support()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .px_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .id("composer-attach-btn")
+                                            .test_support()
+                                            .px_2p5()
+                                            .py_1()
+                                            .rounded(px(RADIUS_CHIP_PX))
+                                            .bg(rgb(p.muted))
+                                            .border_1()
+                                            .border_color(rgb(p.border))
+                                            .text_size(px(TYPE_LABEL_PX))
+                                            .text_color(rgb(p.foreground))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.vm.request_attachment_picker();
+                                                this.sync_after_vm_change(window, cx);
+                                            }))
+                                            .child("Attach"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("composer-dictate-btn")
+                                            .test_support()
+                                            .px_2p5()
+                                            .py_1()
+                                            .rounded(px(RADIUS_CHIP_PX))
+                                            .bg(rgb(p.muted))
+                                            .border_1()
+                                            .border_color(rgb(p.border))
+                                            .text_size(px(TYPE_LABEL_PX))
+                                            .text_color(rgb(p.foreground))
+                                            .when(self.vm.is_dictation_active(), |button| {
+                                                button
+                                                    .bg(rgb(p.destructive))
+                                                    .border_color(rgb(p.destructive))
+                                                    .text_color(rgb(p.primary_foreground))
+                                            })
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.refresh_deepgram_key_availability();
+                                                this.sync_selections_to_vm(cx);
+                                                this.vm.toggle_dictation(true);
+                                                this.sync_after_vm_change(window, cx);
+                                            }))
+                                            .child(if self.vm.is_dictation_active() {
+                                                "Stop dictation"
+                                            } else {
+                                                "Dictate"
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("composer-voice-btn")
+                                            .test_support()
+                                            .px_2p5()
+                                            .py_1()
+                                            .rounded(px(RADIUS_CHIP_PX))
+                                            .bg(rgb(p.muted))
+                                            .border_1()
+                                            .border_color(rgb(p.border))
+                                            .text_size(px(TYPE_LABEL_PX))
+                                            .text_color(rgb(p.foreground))
+                                            .when(
+                                                self.vm.voice_record_state().is_active(),
+                                                |button| {
+                                                    button
+                                                        .bg(rgb(p.destructive))
+                                                        .border_color(rgb(p.destructive))
+                                                        .text_color(rgb(p.primary_foreground))
+                                                },
+                                            )
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.vm.toggle_voice_recording(true);
+                                                this.sync_after_vm_change(window, cx);
+                                            }))
+                                            .child(if self.vm.voice_record_state().is_active() {
+                                                "Stop & send"
+                                            } else {
+                                                "Voice"
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("composer-send-btn")
+                                    .test_support()
+                                    .px_3()
+                                    .py_1()
+                                    .rounded(px(RADIUS_CHIP_PX))
+                                    .bg(rgb(p.primary))
+                                    .text_color(rgb(p.primary_foreground))
+                                    .text_size(px(TYPE_LABEL_PX))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.sync_selections_to_vm(cx);
+                                        if this.vm.is_dictation_active() {
+                                            this.vm.finish_dictation_and_auto_send();
+                                        } else if this.vm.voice_record_state().is_active() {
+                                            this.vm.finish_voice_recording();
+                                        } else {
+                                            this.vm.submit_composer_message();
+                                        }
+                                        this.sync_after_vm_change(window, cx);
+                                    }))
+                                    .child("Send"),
+                            ),
+                    ),
             );
 
         let mut main_column = div()
@@ -2850,6 +3033,7 @@ impl Render for PostboxShell {
                         postbox_keymap::DictationKeyOutcome::Toggle => {
                             cx.stop_propagation();
                             this.sync_selections_to_vm(cx);
+                            this.refresh_deepgram_key_availability();
                             if this.vm.toggle_dictation(window.is_window_active()) {
                                 this.sync_after_vm_change(window, cx);
                             }
@@ -3078,6 +3262,9 @@ impl Render for PostboxShell {
             .on_action(cx.listener(|this, _: &ToggleTranscript, window, cx| {
                 this.dispatch_vm_action(PbAction::ToggleTranscript, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleVoiceRecord, window, cx| {
+                this.dispatch_vm_action(PbAction::ToggleVoiceRecord, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &FinishVoiceRecord, window, cx| {
                 this.dispatch_vm_action(PbAction::FinishVoiceRecord, window, cx);
             }))
@@ -3085,6 +3272,7 @@ impl Render for PostboxShell {
                 this.dispatch_vm_action(PbAction::CancelVoiceRecord, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleDictation, window, cx| {
+                this.refresh_deepgram_key_availability();
                 this.sync_selections_to_vm(cx);
                 this.dispatch_vm_action(PbAction::ToggleDictation, window, cx);
             }))
@@ -3234,6 +3422,12 @@ pub fn run_desktop(launch_ctx: PostboxLaunchContext) {
 #[cfg(test)]
 mod radius_tests {
     use super::*;
+
+    #[test]
+    fn voice_recording_and_dictation_have_gpui_actions() {
+        assert!(gpui_action_for(PbAction::ToggleVoiceRecord).is_some());
+        assert!(gpui_action_for(PbAction::ToggleDictation).is_some());
+    }
 
     #[test]
     fn rounded_ui_uses_grok_bot_radii() {
@@ -3605,6 +3799,11 @@ mod desktop_tests {
             assert!(window.try_find("chat-sidebar").is_some());
             assert!(window.try_find("chat-main-column").is_some());
             assert!(window.try_find("composer-container").is_some());
+            assert!(window.try_find("composer-action-bar").is_some());
+            assert!(window.try_find("composer-attach-btn").is_some());
+            assert!(window.try_find("composer-dictate-btn").is_some());
+            assert!(window.try_find("composer-voice-btn").is_some());
+            assert!(window.try_find("composer-send-btn").is_some());
             assert!(window.try_find("toolbar").is_none());
         })
         .unwrap();
@@ -3613,6 +3812,117 @@ mod desktop_tests {
                 shell.read(cx).view_model().window_title(),
                 "Combined inbox - Postbox v0.1.0"
             );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn composer_buttons_send_text_and_finish_voice_recording(cx: &mut TestAppContext) {
+        let (handle, shell) = open_shell(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                this.vm.set_composer_text("Sent from the action bar");
+                this.vm.set_focus(FocusTarget::Composer);
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            window.click("composer-send-btn", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(shell.read(cx).vm.composer_text().is_empty());
+            assert_eq!(shell.read(cx).vm.store().list_outbox().unwrap().len(), 1);
+            window.render_frame(cx);
+            window.click("composer-voice-btn", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            assert!(shell.read(cx).vm.is_voice_recording());
+            window.render_frame(cx);
+            assert!(window.try_find("voice-recording-strip").is_some());
+            window.click("composer-send-btn", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let commands = shell.update(cx, |this, _| this.vm.take_emitted_sync_commands());
+            assert!(
+                commands
+                    .iter()
+                    .any(|c| matches!(c, SyncCommand::VoiceRecordFinish))
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn composer_dictate_and_send_buttons_arm_dictation_auto_send(cx: &mut TestAppContext) {
+        let (handle, shell) = open_shell(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                this.vm.set_focus(FocusTarget::Composer);
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            window.click("composer-dictate-btn", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let dictation = shell.read(cx).vm.live_dictation().unwrap();
+            assert!(dictation.phase.is_active());
+            assert!(!dictation.in_thread);
+            window.render_frame(cx);
+            assert!(window.try_find("dictation-mic-pill").is_some());
+            window.click("composer-send-btn", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert!(shell.read(cx).vm.live_dictation().unwrap().auto_send_armed);
+            assert!(shell.read(cx).vm.store().list_outbox().unwrap().is_empty());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn thread_dictate_button_targets_thread_and_stops_dictation(cx: &mut TestAppContext) {
+        let (handle, shell) = open_shell(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            shell.update(cx, |this, cx| {
+                assert!(this.vm.select_chat_index(1));
+                assert!(this.vm.open_thread("1700.1"));
+                this.vm.set_focus(FocusTarget::MessageList);
+                this.sync_after_vm_change(window, cx);
+            });
+            window.render_frame(cx);
+            window.click("thread-dictate-btn", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let dictation = shell.read(cx).vm.live_dictation().unwrap();
+            assert!(dictation.phase.is_active());
+            assert!(dictation.in_thread);
+            window.render_frame(cx);
+            window.click("thread-dictate-btn", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let commands = shell.update(cx, |this, _| this.vm.take_emitted_sync_commands());
+            assert!(
+                commands
+                    .iter()
+                    .any(|c| matches!(c, SyncCommand::DictationStop { .. }))
+            );
+            assert!(!shell.read(cx).vm.live_dictation().unwrap().auto_send_armed);
         });
     }
 

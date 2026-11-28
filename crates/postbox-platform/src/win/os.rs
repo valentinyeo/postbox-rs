@@ -12,14 +12,99 @@ use postbox_core::os_integration::{
 };
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
+use std::sync::OnceLock;
 use std::time::Duration;
-use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
     RegCreateKeyExW, RegSetValueExW,
 };
-use windows::Win32::System::Threading::CreateMutexW;
-use windows::core::PCWSTR;
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DestroyIcon, EnumWindows, GetSystemMetrics, GetWindowThreadProcessId, HICON, ICON_BIG,
+    ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LoadImageW, SM_CXICON, SM_CYICON, SendMessageW,
+    WM_SETICON,
+};
+use windows::core::{BOOL, PCWSTR};
+
+pub fn apply_embedded_window_icon() {
+    struct WindowIcons {
+        process_id: u32,
+        big: LPARAM,
+        small: LPARAM,
+    }
+
+    unsafe extern "system" fn set_window_icons(hwnd: HWND, param: LPARAM) -> BOOL {
+        // SAFETY: EnumWindows calls synchronously with our live WindowIcons pointer.
+        let icons = unsafe { &*(param.0 as *const WindowIcons) };
+        let mut process_id = 0;
+        // SAFETY: hwnd comes from EnumWindows; process_id is a valid out pointer.
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+        if process_id == icons.process_id {
+            for (kind, icon) in [(ICON_BIG, icons.big), (ICON_SMALL, icons.small)] {
+                // SAFETY: these cached icon handles stay valid for the process lifetime.
+                unsafe {
+                    SendMessageW(hwnd, WM_SETICON, Some(WPARAM(kind as usize)), Some(icon));
+                }
+            }
+        }
+        BOOL(1)
+    }
+
+    // WM_SETICON borrows the handles for the window lifetime. Cache both sizes rather
+    // than using LR_SHARED, which can return the first size loaded for a resource name.
+    static ICONS: OnceLock<Option<WindowIcons>> = OnceLock::new();
+    let Some(icons) = ICONS.get_or_init(|| {
+        // SAFETY: None selects the current executable without changing its reference count.
+        let module = unsafe { GetModuleHandleW(None) }.ok()?;
+        let resource = PCWSTR(1usize as *const u16);
+        // SAFETY: resource is MAKEINTRESOURCE(1) in the current module; metrics have no
+        // preconditions. The resulting handle is retained in ICONS for the process lifetime.
+        let big = unsafe {
+            LoadImageW(
+                Some(module.into()),
+                resource,
+                IMAGE_ICON,
+                GetSystemMetrics(SM_CXICON),
+                GetSystemMetrics(SM_CYICON),
+                LR_DEFAULTSIZE,
+            )
+        }
+        .ok()?;
+        // SAFETY: the same valid module resource, requested at titlebar size.
+        let small = unsafe {
+            LoadImageW(
+                Some(module.into()),
+                resource,
+                IMAGE_ICON,
+                16,
+                16,
+                LR_DEFAULTSIZE,
+            )
+        };
+        let Ok(small) = small else {
+            // SAFETY: big is a non-shared icon we own and have not assigned to any window.
+            let _ = unsafe { DestroyIcon(HICON(big.0)) };
+            return None;
+        };
+        Some(WindowIcons {
+            // SAFETY: GetCurrentProcessId has no preconditions.
+            process_id: unsafe { GetCurrentProcessId() },
+            big: LPARAM(big.0 as isize),
+            small: LPARAM(small.0 as isize),
+        })
+    }) else {
+        return;
+    };
+    // SAFETY: icons outlives the synchronous enumeration and the callback only reads it.
+    let _ = unsafe {
+        EnumWindows(
+            Some(set_window_icons),
+            LPARAM(icons as *const WindowIcons as isize),
+        )
+    };
+}
 
 fn wide(value: &str) -> Vec<u16> {
     OsString::from(value).encode_wide().chain([0]).collect()

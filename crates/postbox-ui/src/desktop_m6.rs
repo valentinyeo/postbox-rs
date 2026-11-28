@@ -9,7 +9,7 @@
 //! driving presentation. Occluded/minimized pauses playback; closing or switching chats stops
 //! the render stream and releases the frame buffer.
 
-use crate::desktop::PostboxShell;
+use crate::desktop::{PostboxShell, RADIUS_BUBBLE_PX, RADIUS_CHIP_PX, RADIUS_MODAL_PX};
 use crate::m6::{VIDEO_PLAYER_TICK_MS, VideoThumbReady};
 use crate::theme::ShadcnPalette;
 use crate::{FONT_MONO, scaled_px};
@@ -593,14 +593,14 @@ impl PostboxShell {
                             .unwrap_or((PREVIEW_MAX_W as f32, PREVIEW_MAX_H as f32));
                         div()
                             .relative()
-                            .rounded_md()
+                            .rounded(px(RADIUS_BUBBLE_PX))
                             .overflow_hidden()
                             .child(
                                 img(frame)
                                     .w(px(w))
                                     .h(px(h))
                                     .object_fit(ObjectFit::Contain)
-                                    .rounded_md(),
+                                    .rounded(px(RADIUS_BUBBLE_PX)),
                             )
                             .child(self.render_video_play_badge(thumb, chip_px))
                             .into_any_element()
@@ -627,7 +627,7 @@ impl PostboxShell {
                 )))
                 .test_support()
                 .cursor_pointer()
-                .rounded_md()
+                .rounded(px(RADIUS_BUBBLE_PX))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                     cx.stop_propagation();
                 })
@@ -672,7 +672,7 @@ impl PostboxShell {
                     .test_support()
                     .w(px(28.0))
                     .h(px(28.0))
-                    .rounded_full()
+                    .rounded(px(RADIUS_CHIP_PX))
                     .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.55))
                     .border_1()
                     .border_color(rgb(0xffffff))
@@ -692,7 +692,7 @@ impl PostboxShell {
                     .test_support()
                     .px_1p5()
                     .py_0p5()
-                    .rounded_full()
+                    .rounded(px(RADIUS_CHIP_PX))
                     .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.65))
                     .font_family(FONT_MONO)
                     .text_size(px(chip_px))
@@ -713,7 +713,7 @@ impl PostboxShell {
             .test_support()
             .w(px(260.0))
             .h(px(146.0))
-            .rounded_md()
+            .rounded(px(RADIUS_BUBBLE_PX))
             .bg(rgb(p.secondary))
             .border_1()
             .border_color(rgb(p.border))
@@ -834,7 +834,7 @@ impl PostboxShell {
                     .test_support()
                     .w(px(28.0))
                     .h(px(28.0))
-                    .rounded_full()
+                    .rounded(px(RADIUS_CHIP_PX))
                     .bg(rgb(p.primary))
                     .text_color(rgb(p.primary_foreground))
                     .flex()
@@ -862,7 +862,7 @@ impl PostboxShell {
                     .test_support()
                     .px_1p5()
                     .py_0p5()
-                    .rounded_sm()
+                    .rounded(px(RADIUS_CHIP_PX))
                     .bg(rgb(p.secondary))
                     .text_size(px(label_px))
                     .text_color(rgb(p.muted_foreground))
@@ -874,7 +874,7 @@ impl PostboxShell {
                     .test_support()
                     .px_2()
                     .py_0p5()
-                    .rounded_sm()
+                    .rounded(px(RADIUS_CHIP_PX))
                     .bg(rgb(p.muted))
                     .text_size(px(label_px))
                     .text_color(rgb(p.foreground))
@@ -890,7 +890,7 @@ impl PostboxShell {
                     .test_support()
                     .px_2()
                     .py_0p5()
-                    .rounded_sm()
+                    .rounded(px(RADIUS_CHIP_PX))
                     .bg(rgb(p.muted))
                     .text_size(px(label_px))
                     .text_color(rgb(p.foreground))
@@ -906,7 +906,7 @@ impl PostboxShell {
                     .test_support()
                     .px_2()
                     .py_0p5()
-                    .rounded_sm()
+                    .rounded(px(RADIUS_CHIP_PX))
                     .bg(rgb(p.muted))
                     .text_size(px(label_px))
                     .text_color(rgb(p.foreground))
@@ -920,7 +920,7 @@ impl PostboxShell {
         let body = div()
             .flex()
             .flex_col()
-            .rounded_lg()
+            .rounded(px(RADIUS_MODAL_PX))
             .overflow_hidden()
             .bg(rgb(p.background))
             .border_1()
@@ -954,7 +954,7 @@ impl PostboxShell {
                 .bottom(px(96.0))
                 .track_focus(focus)
                 .key_context("PostboxVideoPlayer")
-                .rounded_lg()
+                .rounded(px(RADIUS_MODAL_PX))
                 .shadow_lg()
                 .child(body)
         };

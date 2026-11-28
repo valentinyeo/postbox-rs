@@ -5,7 +5,7 @@
 //! and paints. Every OS piece is optional, so the shell still runs in tests with none of them.
 
 use crate::control::LiveTelemetry;
-use crate::desktop::PostboxShell;
+use crate::desktop::{PostboxShell, RADIUS_BUBBLE_PX, RADIUS_CHIP_PX};
 use crate::geometry::{TYPE_LABEL_PX, TYPE_TIME_PX};
 use crate::m7::{M7State, StatusCard};
 use crate::theme::ShadcnPalette;
@@ -582,7 +582,7 @@ impl PostboxShell {
                 .mx_auto()
                 .mb_2()
                 .p_3()
-                .rounded_lg()
+                .rounded(px(RADIUS_BUBBLE_PX))
                 .bg(rgb(p.card))
                 .border_1()
                 .border_color(rgb(p.border))
@@ -619,7 +619,7 @@ impl PostboxShell {
                                 .test_support()
                                 .px_3()
                                 .py_1()
-                                .rounded_md()
+                                .rounded(px(RADIUS_CHIP_PX))
                                 .bg(rgb(p.primary))
                                 .font_family(FONT_SANS)
                                 .text_size(px(TYPE_TIME_PX))
@@ -636,7 +636,7 @@ impl PostboxShell {
                                 .test_support()
                                 .px_3()
                                 .py_1()
-                                .rounded_md()
+                                .rounded(px(RADIUS_CHIP_PX))
                                 .bg(rgb(p.secondary))
                                 .border_1()
                                 .border_color(rgb(p.border))
@@ -674,7 +674,7 @@ impl PostboxShell {
                 .mx_auto()
                 .mb_2()
                 .p_3()
-                .rounded_lg()
+                .rounded(px(RADIUS_BUBBLE_PX))
                 .bg(rgb(p.card))
                 .border_1()
                 .border_color(rgb(accent))
@@ -709,7 +709,7 @@ impl PostboxShell {
                         .test_support()
                         .px_2()
                         .py_1()
-                        .rounded_md()
+                        .rounded(px(RADIUS_CHIP_PX))
                         .bg(rgb(p.secondary))
                         .font_family(FONT_MONO)
                         .text_size(px(TYPE_TIME_PX))

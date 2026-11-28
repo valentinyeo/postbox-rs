@@ -38,6 +38,11 @@ use std::borrow::Cow;
 use std::rc::Rc;
 use std::time::Instant;
 
+pub const RADIUS_BUBBLE_PX: f32 = 18.0;
+pub const RADIUS_MODAL_PX: f32 = 18.0;
+pub const RADIUS_ROW_PX: f32 = 12.0;
+pub const RADIUS_CHIP_PX: f32 = 9999.0;
+
 gpui_kit::actions!(
     postbox,
     [
@@ -317,8 +322,8 @@ pub fn apply_postbox_theme(cx: &mut App, choice: ThemeChoice, scale: FontScale) 
         theme.mono_font_family = SharedString::from(FONT_MONO);
         theme.font_size = px(body_px);
         theme.mono_font_size = px(mono_px);
-        theme.radius = px(6.0);
-        theme.radius_lg = px(10.0);
+        theme.radius = px(RADIUS_ROW_PX);
+        theme.radius_lg = px(RADIUS_BUBBLE_PX);
 
         let c = &mut theme.colors;
         c.background = hsla_rgb(p.background);
@@ -1306,7 +1311,7 @@ impl PostboxShell {
                     .test_support()
                     .w(px(34.0))
                     .h(px(34.0))
-                    .rounded_md()
+                    .rounded(px(RADIUS_ROW_PX))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1353,7 +1358,7 @@ impl PostboxShell {
                         .test_support()
                         .w(px(34.0))
                         .h(px(34.0))
-                        .rounded_md()
+                        .rounded(px(RADIUS_ROW_PX))
                         .overflow_hidden()
                         .border_1()
                         .border_color(rgb(if is_active { p.ring } else { p.border }))
@@ -1373,7 +1378,7 @@ impl PostboxShell {
                                         .w(px(34.0))
                                         .h(px(34.0))
                                         .object_fit(ObjectFit::Cover)
-                                        .rounded_md(),
+                                        .rounded(px(RADIUS_ROW_PX)),
                                 ),
                         ),
                 );
@@ -1407,7 +1412,7 @@ impl PostboxShell {
                         .test_support()
                         .w(px(34.0))
                         .h(px(34.0))
-                        .rounded_md()
+                        .rounded(px(RADIUS_ROW_PX))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -1517,7 +1522,7 @@ impl PostboxShell {
                 div()
                     .px_1p5()
                     .py_0p5()
-                    .rounded_sm()
+                    .rounded(px(RADIUS_CHIP_PX))
                     .bg(rgb(p.muted))
                     .text_size(px(TYPE_LABEL_PX))
                     .text_color(rgb(p.muted_foreground))
@@ -1530,7 +1535,7 @@ impl PostboxShell {
                 div()
                     .px_1p5()
                     .py_0p5()
-                    .rounded_full()
+                    .rounded(px(RADIUS_CHIP_PX))
                     .bg(rgb(p.primary))
                     .text_size(px(TYPE_LABEL_PX))
                     .text_color(rgb(p.primary_foreground))
@@ -1581,35 +1586,43 @@ impl PostboxShell {
         };
 
         div()
-            .id(SharedString::from(format!("chat-row-{ix}")))
-            .test_support()
             .w_full()
-            .h(px(geom.height))
-            .px_3()
-            .py(px(geom.padding))
             .flex()
-            .flex_row()
-            .items_center()
-            .gap_2p5()
-            .bg(rgb(row_bg))
-            .border_b_1()
-            .border_color(rgb(if row.bulk_selected { p.ring } else { p.border }))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.vm.select_chat_index(ix);
-                this.vm.set_focus(FocusTarget::ChatList);
-                this.sync_after_vm_change(window, cx);
-            }))
-            .child(avatar_el)
+            .flex_col()
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .id(SharedString::from(format!("chat-row-{ix}")))
+                    .test_support()
+                    .mx_1p5()
+                    .rounded(px(RADIUS_ROW_PX))
+                    .h(px(geom.height))
+                    .px_3()
+                    .py(px(geom.padding))
                     .flex()
-                    .flex_col()
-                    .justify_center()
-                    .child(top_line)
-                    .child(bottom_line),
+                    .flex_row()
+                    .items_center()
+                    .gap_2p5()
+                    .bg(rgb(row_bg))
+                    .hover(|style| style.bg(rgb(p.accent)))
+                    .border_b_1()
+                    .border_color(rgb(if row.bulk_selected { p.ring } else { p.border }))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.vm.select_chat_index(ix);
+                        this.vm.set_focus(FocusTarget::ChatList);
+                        this.sync_after_vm_change(window, cx);
+                    }))
+                    .child(avatar_el)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .child(top_line)
+                            .child(bottom_line),
+                    ),
             )
             .into_any_element()
     }
@@ -1637,7 +1650,7 @@ impl PostboxShell {
                     div()
                         .px_2p5()
                         .py_0p5()
-                        .rounded_full()
+                        .rounded(px(RADIUS_CHIP_PX))
                         .bg(rgb(p.muted))
                         .border_1()
                         .border_color(rgb(p.border))
@@ -1689,7 +1702,7 @@ impl PostboxShell {
                     .max_w(px(620.0))
                     .px_3()
                     .py_2()
-                    .rounded_lg()
+                    .rounded(px(RADIUS_BUBBLE_PX))
                     .bg(rgb(bubble_bg))
                     .border_1()
                     .border_color(rgb(border_col))
@@ -1757,7 +1770,7 @@ impl PostboxShell {
                         div()
                             .px_2()
                             .py_0p5()
-                            .rounded_sm()
+                            .rounded(px(RADIUS_BUBBLE_PX))
                             .bg(rgb(p.secondary))
                             .text_size(px(label_px))
                             .text_color(rgb(p.muted_foreground))
@@ -1874,7 +1887,7 @@ impl PostboxShell {
                             .mt_1()
                             .px_2()
                             .py_0p5()
-                            .rounded_sm()
+                            .rounded(px(RADIUS_CHIP_PX))
                             .bg(rgb(p.secondary))
                             .border_1()
                             .border_color(rgb(p.border))
@@ -1936,7 +1949,7 @@ impl PostboxShell {
             .max_w(px(540.0))
             .w_full()
             .p_5()
-            .rounded_lg()
+            .rounded(px(RADIUS_BUBBLE_PX))
             .bg(rgb(p.card))
             .border_1()
             .border_color(rgb(
@@ -1992,7 +2005,7 @@ impl PostboxShell {
                     .child(
                         div()
                             .p_3()
-                            .rounded_md()
+                            .rounded(px(RADIUS_BUBBLE_PX))
                             .bg(rgb(p.secondary))
                             .border_1()
                             .border_color(rgb(p.border))
@@ -2081,7 +2094,7 @@ impl PostboxShell {
                             .test_support()
                             .px_3()
                             .py_1p5()
-                            .rounded_md()
+                            .rounded(px(RADIUS_CHIP_PX))
                             .bg(rgb(p.primary))
                             .text_size(px(TYPE_TIME_PX))
                             .text_color(rgb(p.primary_foreground))
@@ -2180,7 +2193,7 @@ impl PostboxShell {
                     .test_support()
                     .px_2()
                     .py_0p5()
-                    .rounded_sm()
+                    .rounded(px(RADIUS_CHIP_PX))
                     .bg(rgb(p.secondary))
                     .text_size(px(TYPE_LABEL_PX))
                     .text_color(rgb(p.muted_foreground))
@@ -2241,7 +2254,8 @@ impl PostboxShell {
         footer = footer.child(
             Textarea::new(&self.thread_composer)
                 .aria_label("Thread reply composer")
-                .bordered(true),
+                .bordered(true)
+                .rounded(px(RADIUS_BUBBLE_PX)),
         );
 
         let thread_key_ctx = if self
@@ -2280,6 +2294,7 @@ impl PostboxShell {
         let shell_confirm = cx.entity();
 
         let mut cmd = Command::new(&self.palette_state)
+            .bordered(false)
             .filterable(false)
             .placeholder(self.vm.palette_placeholder())
             .max_h(px(380.0))
@@ -2336,7 +2351,8 @@ impl PostboxShell {
                     .id("command-palette-overlay")
                     .test_support()
                     .w(px(580.0))
-                    .rounded_lg()
+                    .rounded(px(RADIUS_MODAL_PX))
+                    .overflow_hidden()
                     .bg(rgb(p.popover))
                     .border_1()
                     .border_color(rgb(p.border))
@@ -2383,7 +2399,7 @@ impl PostboxShell {
                                 div()
                                     .px_1p5()
                                     .py_0p5()
-                                    .rounded_sm()
+                                    .rounded(px(RADIUS_CHIP_PX))
                                     .bg(rgb(p.muted))
                                     .border_1()
                                     .border_color(rgb(p.border))
@@ -2419,7 +2435,7 @@ impl PostboxShell {
                     .test_support()
                     .w(px(860.0))
                     .max_h(px(640.0))
-                    .rounded_lg()
+                    .rounded(px(RADIUS_MODAL_PX))
                     .bg(rgb(p.popover))
                     .border_1()
                     .border_color(rgb(p.border))
@@ -2531,7 +2547,7 @@ impl Render for PostboxShell {
                                     .test_support()
                                     .px_2()
                                     .py_0p5()
-                                    .rounded_sm()
+                                    .rounded(px(RADIUS_CHIP_PX))
                                     .bg(rgb(p.primary))
                                     .text_size(px(TYPE_LABEL_PX))
                                     .text_color(rgb(p.primary_foreground))
@@ -2548,7 +2564,7 @@ impl Render for PostboxShell {
                                     .test_support()
                                     .px_2()
                                     .py_0p5()
-                                    .rounded_sm()
+                                    .rounded(px(RADIUS_CHIP_PX))
                                     .bg(rgb(p.muted))
                                     .text_size(px(TYPE_LABEL_PX))
                                     .text_color(rgb(p.muted_foreground))
@@ -2631,6 +2647,7 @@ impl Render for PostboxShell {
         let mut composer_section = div()
             .id("composer-container")
             .test_support()
+            .rounded(px(RADIUS_BUBBLE_PX))
             .key_context(
                 match (
                     self.vm.composer_text().is_empty(),
@@ -2665,7 +2682,7 @@ impl Render for PostboxShell {
                 div()
                     .px_2p5()
                     .py_1()
-                    .rounded_md()
+                    .rounded(px(RADIUS_BUBBLE_PX))
                     .bg(rgb(p.secondary))
                     .border_1()
                     .border_color(rgb(p.border))
@@ -2710,7 +2727,8 @@ impl Render for PostboxShell {
             .child(
                 Textarea::new(&self.composer)
                     .aria_label("Message composer")
-                    .bordered(true),
+                    .bordered(true)
+                    .rounded(px(RADIUS_BUBBLE_PX)),
             );
 
         let mut main_column = div()
@@ -3209,7 +3227,22 @@ pub fn run_desktop(launch_ctx: PostboxLaunchContext) {
                 })
             })
             .expect("failed to open Postbox window");
+            postbox_platform::apply_embedded_window_icon();
         });
+}
+
+#[cfg(test)]
+mod radius_tests {
+    use super::*;
+
+    #[test]
+    fn rounded_ui_uses_grok_bot_radii() {
+        assert_eq!(RADIUS_ROW_PX, 12.0);
+        assert_eq!(RADIUS_BUBBLE_PX, 18.0);
+        assert_eq!(RADIUS_MODAL_PX, 18.0);
+        let chip_radius = RADIUS_CHIP_PX;
+        assert!(chip_radius >= 9999.0);
+    }
 }
 
 #[cfg(all(test, feature = "desktop-test"))]

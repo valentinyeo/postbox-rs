@@ -23,6 +23,12 @@ pub use win::crash::install_unhandled_exception_filter;
 #[cfg(not(windows))]
 pub fn install_unhandled_exception_filter(_data_dir: &std::path::Path, _version: &str) {}
 
+#[cfg(windows)]
+pub use win::os::apply_embedded_window_icon;
+
+#[cfg(not(windows))]
+pub fn apply_embedded_window_icon() {}
+
 use postbox_core::ChatKey;
 use postbox_core::voice::AudioDeviceInfo;
 use std::collections::HashMap;

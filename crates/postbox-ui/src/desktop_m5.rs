@@ -3,7 +3,7 @@
 //! - `120 ms` animation timer running ONLY while `window.is_window_active() && vm.is_dictation_active()`
 //!   (`0.0%` idle CPU/GPU otherwise, never stealing focus from open modals).
 
-use crate::desktop::PostboxShell;
+use crate::desktop::{PostboxShell, RADIUS_CHIP_PX};
 use crate::m5::{DICTATION_METER_TICK_MS, DictationPhase};
 use crate::theme::ShadcnPalette;
 use crate::{FONT_MONO, scaled_px};
@@ -102,7 +102,7 @@ impl PostboxShell {
             .w_full()
             .px_3()
             .py_1p5()
-            .rounded_full()
+            .rounded(px(RADIUS_CHIP_PX))
             .bg(rgb(p.secondary))
             .border_1()
             .border_color(rgb(p.ring))
@@ -123,7 +123,7 @@ impl PostboxShell {
                             .test_support()
                             .w(px(20.0))
                             .h(px(20.0))
-                            .rounded_full()
+                            .rounded(px(RADIUS_CHIP_PX))
                             .bg(rgb(p.muted))
                             .flex()
                             .items_center()
@@ -170,7 +170,7 @@ impl PostboxShell {
                             .test_support()
                             .px_2()
                             .py_0p5()
-                            .rounded_sm()
+                            .rounded(px(RADIUS_CHIP_PX))
                             .bg(rgb(p.muted))
                             .text_size(px(scaled_px(11.0, scale)))
                             .text_color(rgb(p.foreground))

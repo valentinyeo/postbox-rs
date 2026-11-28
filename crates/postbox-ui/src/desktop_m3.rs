@@ -1,6 +1,8 @@
 //! GPUI rendering & Intel Arc `<= 16 MB` VRAM texture LRU for Milestone 3 features (#18–#26).
 
-use crate::desktop::PostboxShell;
+use crate::desktop::{
+    PostboxShell, RADIUS_BUBBLE_PX, RADIUS_CHIP_PX, RADIUS_MODAL_PX, RADIUS_ROW_PX,
+};
 use crate::geometry::{TYPE_LABEL_PX, TYPE_TIME_PX};
 use crate::theme::ShadcnPalette;
 use gpui_kit::base::TestSupportExt as _;
@@ -627,7 +629,7 @@ impl PostboxShell {
                 path,
                 kind: DecodeKind::WorkspaceIcon {
                     target_size: 34,
-                    radius: 6.0,
+                    radius: 10.0,
                 },
             });
         }
@@ -805,7 +807,7 @@ impl PostboxShell {
                         .id(SharedString::from(format!("{id_prefix}-media-{ix}")))
                         .test_support()
                         .cursor_pointer()
-                        .rounded_md()
+                        .rounded(px(RADIUS_BUBBLE_PX))
                         .overflow_hidden()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                             cx.stop_propagation();
@@ -823,7 +825,7 @@ impl PostboxShell {
                                 .w(px(entry.width as f32))
                                 .h(px(entry.height as f32))
                                 .object_fit(ObjectFit::Contain)
-                                .rounded_md(),
+                                .rounded(px(RADIUS_BUBBLE_PX)),
                         )
                         .into_any_element(),
                 );
@@ -845,7 +847,7 @@ impl PostboxShell {
                 .test_support()
                 .px_2p5()
                 .py_1p5()
-                .rounded_md()
+                .rounded(px(RADIUS_BUBBLE_PX))
                 .bg(rgb(p.secondary))
                 .border_1()
                 .border_color(rgb(p.border))
@@ -913,7 +915,7 @@ impl PostboxShell {
                     .test_support()
                     .px_1p5()
                     .py_0p5()
-                    .rounded_full()
+                    .rounded(px(RADIUS_CHIP_PX))
                     .bg(rgb(bg))
                     .border_1()
                     .border_color(rgb(p.border))
@@ -953,7 +955,7 @@ impl PostboxShell {
             .mt_1()
             .w(px(card_w as f32))
             .min_h(px(card_h as f32))
-            .rounded_md()
+            .rounded(px(RADIUS_BUBBLE_PX))
             .bg(rgb(p.card))
             .border_1()
             .border_color(rgb(p.border))
@@ -1008,7 +1010,7 @@ impl PostboxShell {
                                     div()
                                         .w(px(28.0))
                                         .h(px(28.0))
-                                        .rounded_full()
+                                        .rounded(px(RADIUS_CHIP_PX))
                                         .bg(hsla(0.0, 0.0, 0.0, 0.65))
                                         .flex()
                                         .items_center()
@@ -1105,7 +1107,7 @@ impl PostboxShell {
                 .relative()
                 .w(px(52.0))
                 .h(px(52.0))
-                .rounded_md()
+                .rounded(px(RADIUS_BUBBLE_PX))
                 .bg(rgb(p.secondary))
                 .border_1()
                 .border_color(rgb(p.border))
@@ -1122,7 +1124,7 @@ impl PostboxShell {
                         .w(px(44.0))
                         .h(px(44.0))
                         .object_fit(ObjectFit::Contain)
-                        .rounded_sm(),
+                        .rounded(px(RADIUS_BUBBLE_PX)),
                 );
             } else {
                 chip = chip.child(
@@ -1144,7 +1146,7 @@ impl PostboxShell {
                     .right(px(2.0))
                     .w(px(14.0))
                     .h(px(14.0))
-                    .rounded_full()
+                    .rounded(px(RADIUS_CHIP_PX))
                     .bg(rgb(p.destructive))
                     .text_size(px(10.0))
                     .text_color(rgb(p.primary_foreground))
@@ -1176,7 +1178,7 @@ impl PostboxShell {
                 .test_support()
                 .w(px(300.0))
                 .p_1()
-                .rounded_md()
+                .rounded(px(RADIUS_MODAL_PX))
                 .bg(rgb(p.popover))
                 .border_1()
                 .border_color(rgb(p.border))
@@ -1196,7 +1198,7 @@ impl PostboxShell {
                         .test_support()
                         .px_2p5()
                         .py_1()
-                        .rounded_sm()
+                        .rounded(px(RADIUS_ROW_PX))
                         .bg(rgb(if selected { p.accent } else { p.popover }))
                         .text_size(px(TYPE_LABEL_PX))
                         .text_color(rgb(fg))
@@ -1220,7 +1222,7 @@ impl PostboxShell {
                 .test_support()
                 .w(px(300.0))
                 .p_1()
-                .rounded_md()
+                .rounded(px(RADIUS_MODAL_PX))
                 .bg(rgb(p.popover))
                 .border_1()
                 .border_color(rgb(p.border))
@@ -1235,7 +1237,7 @@ impl PostboxShell {
                         .test_support()
                         .px_2p5()
                         .py_1()
-                        .rounded_sm()
+                        .rounded(px(RADIUS_ROW_PX))
                         .bg(rgb(if selected { p.accent } else { p.popover }))
                         .flex()
                         .items_center()
@@ -1283,13 +1285,13 @@ impl PostboxShell {
                 .max_w(px(entry.width as f32))
                 .max_h(px(entry.height as f32))
                 .object_fit(ObjectFit::Contain)
-                .rounded_md()
+                .rounded(px(RADIUS_BUBBLE_PX))
                 .into_any_element()
         } else {
             div()
                 .px_4()
                 .py_3()
-                .rounded_md()
+                .rounded(px(RADIUS_BUBBLE_PX))
                 .bg(rgb(p.card))
                 .border_1()
                 .border_color(rgb(p.border))
@@ -1333,7 +1335,7 @@ impl PostboxShell {
                                 .test_support()
                                 .w(px(40.0))
                                 .h(px(48.0))
-                                .rounded_md()
+                                .rounded(px(RADIUS_CHIP_PX))
                                 .bg(rgb(p.card))
                                 .flex()
                                 .items_center()
@@ -1365,7 +1367,7 @@ impl PostboxShell {
                                 .test_support()
                                 .w(px(40.0))
                                 .h(px(48.0))
-                                .rounded_md()
+                                .rounded(px(RADIUS_CHIP_PX))
                                 .bg(rgb(p.card))
                                 .flex()
                                 .items_center()
@@ -1430,7 +1432,7 @@ impl PostboxShell {
                             .test_support()
                             .w(px(40.0))
                             .h(px(40.0))
-                            .rounded_md()
+                            .rounded(px(RADIUS_ROW_PX))
                             .bg(rgb(if selected { p.accent } else { p.popover }))
                             .flex()
                             .items_center()
@@ -1471,7 +1473,7 @@ impl PostboxShell {
                         .test_support()
                         .w(px(376.0))
                         .p_3()
-                        .rounded_lg()
+                        .rounded(px(RADIUS_MODAL_PX))
                         .bg(rgb(p.popover))
                         .border_1()
                         .border_color(rgb(p.border))
@@ -1522,7 +1524,7 @@ impl PostboxShell {
                             .w(px(124.0))
                             .h(px(96.0))
                             .object_fit(ObjectFit::Contain)
-                            .rounded_sm()
+                            .rounded(px(RADIUS_BUBBLE_PX))
                             .into_any_element()
                     } else {
                         div()
@@ -1544,7 +1546,7 @@ impl PostboxShell {
                             .w(px(132.0))
                             .h(px(104.0))
                             .p_1()
-                            .rounded_md()
+                            .rounded(px(RADIUS_BUBBLE_PX))
                             .bg(rgb(p.secondary))
                             .border_1()
                             .border_color(rgb(if selected { p.ring } else { p.border }))
@@ -1586,7 +1588,7 @@ impl PostboxShell {
                         .test_support()
                         .w(px(584.0))
                         .p_3()
-                        .rounded_lg()
+                        .rounded(px(RADIUS_MODAL_PX))
                         .bg(rgb(p.popover))
                         .border_1()
                         .border_color(rgb(p.border))

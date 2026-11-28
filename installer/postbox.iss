@@ -16,6 +16,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
 OutputBaseFilename=postbox-setup-x64
 UninstallDisplayName=Postbox
+SetupIconFile=..\assets\messages.ico
+UninstallDisplayIcon={app}\postbox.exe
 
 [Files]
 Source: "{#StageDir}\postbox.exe"; DestDir: "{app}"; Flags: ignoreversion

@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod control;
 pub mod crash;
+pub mod dedup;
 pub mod deep_link;
 pub mod dictation;
 pub mod drafts;

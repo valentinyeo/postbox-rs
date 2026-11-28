@@ -73,9 +73,16 @@ pub struct HubRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendReply {
     pub client_id: String,
-    #[serde(default)]
+    // Hub has returned the server id as `msg_id`, `id`, `message_id` and `MsgID` over time.
+    #[serde(
+        default,
+        alias = "id",
+        alias = "message_id",
+        alias = "MsgID",
+        alias = "msgId"
+    )]
     pub msg_id: String,
-    #[serde(default)]
+    #[serde(default, alias = "timestamp", alias = "Timestamp", alias = "ts")]
     pub ts: String,
     pub status: String,
 }
@@ -293,5 +300,32 @@ impl HubMessage {
             read_status,
             deleted: self.revoked,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SendReply;
+
+    /// Hub has named the server id differently across versions; every spelling must land.
+    #[test]
+    fn send_reply_reads_server_id_and_timestamp_aliases_poru_25() {
+        for raw in [
+            r#"{"client_id":"cid","msg_id":"3EB0A","ts":"2026-11-26T10:57:00Z","status":"sent"}"#,
+            r#"{"client_id":"cid","id":"3EB0A","timestamp":"2026-11-26T10:57:00Z","status":"sent"}"#,
+            r#"{"client_id":"cid","message_id":"3EB0A","Timestamp":"2026-11-26T10:57:00Z","status":"sent"}"#,
+            r#"{"client_id":"cid","MsgID":"3EB0A","ts":"2026-11-26T10:57:00Z","status":"sent"}"#,
+            r#"{"client_id":"cid","msgId":"3EB0A","ts":"2026-11-26T10:57:00Z","status":"sent"}"#,
+        ] {
+            let reply: SendReply = serde_json::from_str(raw).unwrap();
+            assert_eq!(reply.msg_id, "3EB0A", "{raw}");
+            assert_eq!(reply.ts, "2026-11-26T10:57:00Z", "{raw}");
+        }
+
+        // A Hub that confirms without any id still parses; the app then keeps the client id.
+        let bare: SendReply =
+            serde_json::from_str(r#"{"client_id":"cid","status":"sent"}"#).unwrap();
+        assert!(bare.msg_id.is_empty());
+        assert!(bare.ts.is_empty());
     }
 }

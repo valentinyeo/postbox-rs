@@ -2660,6 +2660,159 @@ mod tests {
         server.abort();
     }
 
+    /// End-to-end PORU-25: an unconfirmed send lands under the local `client_id`, then the next
+    /// sync returns the real server row. The timeline and the search index must hold one bubble.
+    #[tokio::test]
+    async fn unconfirmed_text_send_collapses_into_synced_server_copy_poru_25() {
+        for background in [false, true] {
+            let chat = ChatKey::new(
+                Provider::Whatsapp,
+                "personal",
+                "personal:777@s.whatsapp.net",
+            );
+            let state = Arc::new(Mutex::new(MockState::default()));
+            state.lock().unwrap().send_reply_template =
+                Some(r#"{"client_id":"{cid}","status":"sent"}"#.to_owned());
+            let (endpoint, server) = start_mock_server(state.clone()).await;
+
+            let mut store = Store::open_in_memory().unwrap();
+            let cid = format_client_id([0x5A; 16]);
+            store
+                .enqueue_outbox(&OutboxRecord::new_text(
+                    cid.clone(),
+                    chat.clone(),
+                    "https://x.com/liam_fallen/status/1",
+                    None,
+                    false,
+                    1_000,
+                ))
+                .unwrap();
+
+            let client = HubClient::new(endpoint.clone(), "test-token").unwrap();
+            let (_bridge, worker) = create_sync_bridge();
+            let mut engine = SyncEngine::new(client, store, worker);
+            engine.drain_outbox().await;
+
+            // Hub confirmed without a server id, so the row stays keyed by the local client id.
+            let after_send = engine.store.list_messages(&chat, 10, None).unwrap();
+            assert_eq!(after_send.len(), 1);
+            assert_eq!(after_send[0].msg_id, cid);
+
+            let payload = serde_json::json!({
+                "MsgID": "3EB0A1B2C3D4E5",
+                "ChatJID": chat.id,
+                "FromMe": true,
+                "Timestamp": after_send[0].ts,
+                "Text": "https://x.com/liam_fallen/status/1",
+            })
+            .to_string();
+            state
+                .lock()
+                .unwrap()
+                .messages_by_chat
+                .insert(chat.id.clone(), format!("[{payload}]"));
+            if background {
+                let fetched = engine
+                    .client
+                    .fetch_messages(&chat.id, 20, None)
+                    .await
+                    .unwrap();
+                engine.handle_bg_result(BackgroundTaskResult::BackgroundChatMessagesFetched {
+                    chat: chat.clone(),
+                    last_msg_ts: String::new(),
+                    is_group: false,
+                    result: Ok(fetched),
+                });
+            } else {
+                engine.sync_chat_messages(&chat, 10, None).await.unwrap();
+            }
+
+            let stored = engine.store.list_messages(&chat, 10, None).unwrap();
+            assert_eq!(stored.len(), 1, "one bubble, got {stored:?}");
+            assert_eq!(stored[0].msg_id, "3EB0A1B2C3D4E5");
+            assert_eq!(
+                engine
+                    .store
+                    .search_messages_fts("liam_fallen", 10)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            server.abort();
+        }
+    }
+
+    /// PORU-25 for the screenshot's image bubble: a filename-only local row must give way to the
+    /// server row that carries the real byte size.
+    #[tokio::test]
+    async fn unconfirmed_file_send_keeps_server_file_size_poru_25() {
+        let chat = ChatKey::new(
+            Provider::Whatsapp,
+            "personal",
+            "personal:888@s.whatsapp.net",
+        );
+        let cid = format_client_id([0x6B; 16]);
+        let path = unique_sync_test_dir("poru25").join("{CDAA5B2F}.png");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = b"PNG-bytes-for-the-dedup-test";
+        std::fs::write(&path, bytes).unwrap();
+
+        let state = Arc::new(Mutex::new(MockState::default()));
+        state.lock().unwrap().send_reply_template =
+            Some(r#"{"client_id":"{cid}","status":"sent"}"#.to_owned());
+        let (endpoint, server) = start_mock_server(state.clone()).await;
+
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .enqueue_outbox(&OutboxRecord::new_file(
+                cid.clone(),
+                chat.clone(),
+                "",
+                None,
+                path.to_string_lossy(),
+                "{CDAA5B2F-0000-4000-8000-000000000000}.png",
+                sha256_bytes(bytes),
+                bytes.len() as u64,
+                1_000,
+            ))
+            .unwrap();
+
+        let client = HubClient::new(endpoint.clone(), "test-token").unwrap();
+        let (_bridge, worker) = create_sync_bridge();
+        let mut engine = SyncEngine::new(client, store, worker);
+        engine.drain_outbox().await;
+
+        let mut local = engine.store.list_messages(&chat, 10, None).unwrap();
+        assert_eq!(local.len(), 1);
+        local[0].file_size = None;
+        engine.store.upsert_message(&local[0]).unwrap();
+
+        let payload = serde_json::json!({
+            "MsgID": "3EB0F11E",
+            "ChatJID": chat.id,
+            "FromMe": true,
+            "Timestamp": local[0].ts,
+            "MediaType": "document",
+            "Filename": "{CDAA5B2F-0000-4000-8000-000000000000}.png",
+            "FileSize": 115_000,
+        })
+        .to_string();
+        state
+            .lock()
+            .unwrap()
+            .messages_by_chat
+            .insert(chat.id.clone(), format!("[{payload}]"));
+        engine.sync_chat_messages(&chat, 10, None).await.unwrap();
+
+        let stored = engine.store.list_messages(&chat, 10, None).unwrap();
+        assert_eq!(stored.len(), 1, "one bubble, got {stored:?}");
+        assert_eq!(stored[0].msg_id, "3EB0F11E");
+        assert_eq!(stored[0].file_size, Some(115_000));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+        server.abort();
+    }
+
     fn sse_event(kind: &str, chat: &str, account: &str) -> SseEvent {
         SseEvent {
             id: 1,
@@ -2794,6 +2947,8 @@ mod tests {
         message_fetches: Vec<String>,
         mark_read_bodies: Vec<String>,
         send_count: usize,
+        /// Reply body for `/v1/wazig/send`; `{cid}` is replaced with the request's client id.
+        send_reply_template: Option<String>,
     }
 
     async fn start_mock_server(
@@ -2883,18 +3038,28 @@ mod tests {
                         let mut g = st.lock().unwrap();
                         g.send_count += 1;
                         let seq = g.send_count;
-                        // Extract client_id from multipart form-data.
+                        // `client_id` arrives as a multipart field or in the JSON body.
                         let cid = body
                             .split("name=\"client_id\"\r\n\r\n")
                             .nth(1)
                             .and_then(|s| s.split("\r\n").next())
-                            .unwrap_or("00000000000000000000000000000000");
-                        (
-                            200,
-                            format!(
-                                "{{\"client_id\":\"{cid}\",\"msg_id\":\"srv_{seq}\",\"ts\":\"2026-11-26T12:00:00Z\",\"status\":\"sent\"}}"
-                            ),
-                        )
+                            .map(str::to_owned)
+                            .or_else(|| {
+                                let marker = "\"client_id\":\"";
+                                let tail = body.split_once(marker)?.1;
+                                Some(tail.split('"').next()?.to_owned())
+                            })
+                            .unwrap_or_else(|| "00000000000000000000000000000000".to_owned());
+                        if let Some(template) = g.send_reply_template.clone() {
+                            (200, template.replace("{cid}", &cid))
+                        } else {
+                            (
+                                200,
+                                format!(
+                                    "{{\"client_id\":\"{cid}\",\"msg_id\":\"srv_{seq}\",\"ts\":\"2026-11-26T12:00:00Z\",\"status\":\"sent\"}}"
+                                ),
+                            )
+                        }
                     } else {
                         (404, "{}".to_owned())
                     };

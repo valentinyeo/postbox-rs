@@ -1,7 +1,7 @@
 use crate::MediaError;
 use crate::drain::atomic_write_file;
 use postbox_core::{ChatKey, Provider};
-use postbox_hub::{HubClient, valid_team};
+use postbox_hub::{AvatarFetchState, HubClient, HubError, valid_team};
 use postbox_store::Store;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -520,17 +520,51 @@ impl SlackEmojiIndex {
     }
 }
 
-/// Fetches and caches a chat avatar (`GET /v1/wazig/avatar/{chat}`) honoring the exact 7d/7d/24h
-/// TTL policy via SQLite `media_fetch_markers` and disk storage.
-pub async fn fetch_or_load_avatar(
-    client: &HubClient,
+pub fn default_wacli_remote_avatars_dir() -> Option<PathBuf> {
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(home_var).map(|home| PathBuf::from(home).join(".wacli").join("remote-avatars"))
+}
+
+pub fn find_local_wacli_avatar_in_dir(chat: &ChatKey, dir: &Path) -> Option<PathBuf> {
+    if chat.provider != Provider::Whatsapp {
+        return None;
+    }
+    let bare_jid = chat
+        .id
+        .split_once(':')
+        .map(|(_, rest)| rest)
+        .unwrap_or(&chat.id);
+    if bare_jid.is_empty() || bare_jid.contains(['/', '\\', '\0']) || bare_jid.contains("..") {
+        return None;
+    }
+    [
+        format!("{bare_jid}.jpg"),
+        format!("{bare_jid}.jpeg"),
+        format!("{bare_jid}.png"),
+        format!("{bare_jid}.webp"),
+        bare_jid.to_owned(),
+    ]
+    .into_iter()
+    .map(|name| dir.join(name))
+    .find(|path| std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AvatarCacheLookup {
+    Ready(PathBuf),
+    NeedsFetch { fallback_path: Option<PathBuf> },
+    Missing,
+}
+
+pub fn resolve_avatar_cache_or_seed(
     store: &Store,
     avatar_dir: &Path,
+    seed_dir: Option<&Path>,
     chat: &ChatKey,
     now_unix: i64,
-) -> Result<Option<PathBuf>, MediaError> {
+) -> Result<AvatarCacheLookup, MediaError> {
     if !chat_avatar_enabled(chat.provider) {
-        return Ok(None);
+        return Ok(AvatarCacheLookup::Missing);
     }
     let marker_key = format!(
         "avatar:{}:{}:{}",
@@ -552,25 +586,83 @@ pub async fn fetch_or_load_avatar(
     };
     let has_disk_file = file_path.is_file();
     let decision = classify_avatar_cache(img_secs, has_disk_file, none_secs, fail_secs, now_unix);
-    if !decision.needs_fetch {
-        return Ok(decision.has_image.then_some(file_path));
+    if decision.has_image && !decision.needs_fetch {
+        return Ok(AvatarCacheLookup::Ready(file_path));
     }
 
-    match client.fetch_avatar(&chat.id).await {
-        Ok(Some(bytes)) => {
+    // Local images take precedence over negative markers, including failures from queued requests.
+    if let Some(seed_path) = seed_dir.and_then(|dir| find_local_wacli_avatar_in_dir(chat, dir)) {
+        let bytes = std::fs::read(seed_path)?;
+        if !bytes.is_empty() {
+            atomic_write_file(&file_path, &bytes)?;
+            let rel = format!("{file_hash}.img");
+            store.upsert_fetch_marker(&marker_key, "ready", now_unix, Some(&rel))?;
+            return Ok(AvatarCacheLookup::Ready(file_path));
+        }
+    }
+
+    if !decision.needs_fetch {
+        return Ok(if decision.has_image {
+            AvatarCacheLookup::Ready(file_path)
+        } else {
+            AvatarCacheLookup::Missing
+        });
+    }
+    Ok(AvatarCacheLookup::NeedsFetch {
+        fallback_path: decision.has_image.then_some(file_path),
+    })
+}
+
+pub fn commit_avatar_fetch_result(
+    store: &Store,
+    avatar_dir: &Path,
+    chat: &ChatKey,
+    now_unix: i64,
+    outcome: Result<AvatarFetchState, HubError>,
+) -> Result<Option<PathBuf>, MediaError> {
+    let marker_key = format!(
+        "avatar:{}:{}:{}",
+        chat.provider.as_str(),
+        chat.account,
+        chat.id
+    );
+    let file_hash = short_sha256_hex(marker_key.as_bytes());
+    let file_path = avatar_dir.join(format!("{file_hash}.img"));
+    match outcome {
+        Ok(AvatarFetchState::Ready(bytes)) => {
             atomic_write_file(&file_path, &bytes)?;
             let rel = format!("{file_hash}.img");
             store.upsert_fetch_marker(&marker_key, "ready", now_unix, Some(&rel))?;
             Ok(Some(file_path))
         }
-        Ok(None) => {
+        Ok(AvatarFetchState::Pending) => Ok(file_path.is_file().then_some(file_path)),
+        Ok(AvatarFetchState::Missing) => {
             let _ = std::fs::remove_file(&file_path);
             store.upsert_fetch_marker(&marker_key, "none", now_unix, None)?;
             Ok(None)
         }
         Err(_) => {
             store.upsert_fetch_marker(&marker_key, "fail", now_unix, None)?;
-            Ok(has_disk_file.then_some(file_path))
+            Ok(file_path.is_file().then_some(file_path))
+        }
+    }
+}
+
+/// Fetches and caches a chat avatar (`GET /v1/wazig/avatar/{chat}`) honoring the exact 7d/7d/24h
+/// TTL policy via SQLite `media_fetch_markers` and disk storage.
+pub async fn fetch_or_load_avatar(
+    client: &HubClient,
+    store: &Store,
+    avatar_dir: &Path,
+    chat: &ChatKey,
+    now_unix: i64,
+) -> Result<Option<PathBuf>, MediaError> {
+    match resolve_avatar_cache_or_seed(store, avatar_dir, None, chat, now_unix)? {
+        AvatarCacheLookup::Ready(path) => Ok(Some(path)),
+        AvatarCacheLookup::Missing => Ok(None),
+        AvatarCacheLookup::NeedsFetch { .. } => {
+            let outcome = client.fetch_avatar_state(&chat.id).await;
+            commit_avatar_fetch_result(store, avatar_dir, chat, now_unix, outcome)
         }
     }
 }
@@ -658,6 +750,152 @@ fn short_sha256_hex(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn avatar_test_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "postbox_avatar_{tag}_{}_{nanos}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn local_wacli_avatar_seeds_cache_and_heals_negative_markers() {
+        let root = avatar_test_dir("seed");
+        let seed_dir = root.join(".wacli").join("remote-avatars");
+        let avatar_dir = root.join("avatars");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        std::fs::write(seed_dir.join("123@s.whatsapp.net.jpg"), b"LOCAL-AVATAR").unwrap();
+        let chat = ChatKey::new(
+            Provider::Whatsapp,
+            "personal",
+            "personal:123@s.whatsapp.net",
+        );
+        let marker_key = "avatar:whatsapp:personal:personal:123@s.whatsapp.net";
+        let rel = format!("{}.img", short_sha256_hex(marker_key.as_bytes()));
+        let path = avatar_dir.join(&rel);
+        let store = Store::open_in_memory().unwrap();
+
+        for status in ["fail", "none"] {
+            store
+                .upsert_fetch_marker(marker_key, status, 100, None)
+                .unwrap();
+            assert_eq!(
+                resolve_avatar_cache_or_seed(&store, &avatar_dir, Some(&seed_dir), &chat, 101)
+                    .unwrap(),
+                AvatarCacheLookup::Ready(path.clone())
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"LOCAL-AVATAR");
+            let marker = store.get_fetch_marker(marker_key).unwrap().unwrap();
+            assert_eq!(marker.status, "ready");
+            assert_eq!(marker.checked_at, 101);
+            assert_eq!(marker.rel_path.as_deref(), Some(rel.as_str()));
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_wacli_avatar_ignores_empty_negative_cache_files() {
+        let root = avatar_test_dir("empty");
+        let seed_dir = root.join("remote-avatars");
+        let avatar_dir = root.join("avatars");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        std::fs::write(seed_dir.join("123@s.whatsapp.net.jpg"), b"").unwrap();
+        let chat = ChatKey::new(Provider::Whatsapp, "personal", "123@s.whatsapp.net");
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(find_local_wacli_avatar_in_dir(&chat, &seed_dir), None);
+        assert_eq!(
+            resolve_avatar_cache_or_seed(&store, &avatar_dir, Some(&seed_dir), &chat, 100).unwrap(),
+            AvatarCacheLookup::NeedsFetch {
+                fallback_path: None
+            }
+        );
+        assert!(
+            store
+                .get_fetch_marker("avatar:whatsapp:personal:123@s.whatsapp.net")
+                .unwrap()
+                .is_none()
+        );
+        let png = seed_dir.join("123@s.whatsapp.net.png");
+        std::fs::write(&png, b"PNG-AVATAR").unwrap();
+        assert_eq!(find_local_wacli_avatar_in_dir(&chat, &seed_dir), Some(png));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_wacli_avatar_rejects_unsafe_ids_and_other_providers() {
+        let root = avatar_test_dir("unsafe");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("123@s.whatsapp.net.jpg"), b"LOCAL-AVATAR").unwrap();
+        let telegram = ChatKey::new(Provider::Telegram, "personal", "123@s.whatsapp.net");
+        assert_eq!(find_local_wacli_avatar_in_dir(&telegram, &root), None);
+        for id in [
+            "",
+            "personal:",
+            "../123",
+            "personal:../123",
+            "a/b",
+            "a\\b",
+            "a..b",
+            "a\0b",
+        ] {
+            let chat = ChatKey::new(Provider::Whatsapp, "personal", id);
+            assert_eq!(find_local_wacli_avatar_in_dir(&chat, &root), None);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_avatar_fetch_leaves_markers_and_cached_image_unchanged() {
+        let root = avatar_test_dir("pending");
+        let chat = ChatKey::new(
+            Provider::Whatsapp,
+            "personal",
+            "personal:123@s.whatsapp.net",
+        );
+        let marker_key = "avatar:whatsapp:personal:personal:123@s.whatsapp.net";
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(
+            commit_avatar_fetch_result(&store, &root, &chat, 100, Ok(AvatarFetchState::Pending))
+                .unwrap(),
+            None
+        );
+        assert!(store.get_fetch_marker(marker_key).unwrap().is_none());
+
+        let path = commit_avatar_fetch_result(
+            &store,
+            &root,
+            &chat,
+            101,
+            Ok(AvatarFetchState::Ready(b"CACHED-AVATAR".to_vec())),
+        )
+        .unwrap()
+        .unwrap();
+        for status in ["ready", "fail", "none"] {
+            store
+                .upsert_fetch_marker(marker_key, status, 101, Some("cached.img"))
+                .unwrap();
+            let before = store.get_fetch_marker(marker_key).unwrap();
+            assert_eq!(
+                commit_avatar_fetch_result(
+                    &store,
+                    &root,
+                    &chat,
+                    102,
+                    Ok(AvatarFetchState::Pending)
+                )
+                .unwrap(),
+                Some(path.clone())
+            );
+            assert_eq!(store.get_fetch_marker(marker_key).unwrap(), before);
+            assert_eq!(std::fs::read(&path).unwrap(), b"CACHED-AVATAR");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn circle_mask_and_square_area_downscale_match_spec() {

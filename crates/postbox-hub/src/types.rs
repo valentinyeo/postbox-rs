@@ -104,6 +104,13 @@ pub struct ArchiveBatchItemResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AvatarFetchState {
+    Ready(Vec<u8>),
+    Pending,
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaFetchState {
     Ready(Vec<u8>),
     Pending,

@@ -4,8 +4,9 @@ use postbox_core::outbox::{
 };
 use postbox_core::{ChatKey, Provider};
 use postbox_hub::{
-    ArchiveOutcome, Endpoint, HubClient, HubError, MediaFetchState, SendFileRequest, SseParser,
-    before_cursor, classify_signal_send_failure, classify_telegram_send_failure, is_real_message,
+    ArchiveOutcome, AvatarFetchState, Endpoint, HubClient, HubError, MediaFetchState,
+    SendFileRequest, SseParser, before_cursor, classify_signal_send_failure,
+    classify_telegram_send_failure, is_real_message,
 };
 use postbox_store::Store;
 use serde_json::{Value, json};
@@ -295,10 +296,12 @@ async fn start_mock_hub(
                         }
                     }
                     ("GET", p) if p.starts_with("/v1/wazig/avatar/") => {
-                        if let Some(code) = st.lock().unwrap().media_status_override {
-                            (code, "image/png", b"partial".to_vec())
-                        } else {
-                            (200, "image/png", b"PNG-AVATAR".to_vec())
+                        match st.lock().unwrap().media_status_override {
+                            Some(202) => {
+                                (202, "application/json", br#"{"status":"queued"}"#.to_vec())
+                            }
+                            Some(code) => (code, "image/png", b"partial".to_vec()),
+                            None => (200, "image/png", b"PNG-AVATAR".to_vec()),
                         }
                     }
                     ("GET", p) if p.starts_with("/v1/wazig/workspace-icon/") => {
@@ -904,6 +907,41 @@ async fn normalizer_lid_alias_slack_attachments_and_path_stripping() {
         .delete_message("slack:T1:C1", "1700.1", "cid-del-1")
         .await
         .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn avatar_fetch_distinguishes_queued_missing_ready_and_errors() {
+    let state = Arc::new(Mutex::new(MockHubState::default()));
+    let (endpoint, server) = start_mock_hub(state.clone()).await;
+    let client = HubClient::new(endpoint, TEST_TOKEN).unwrap();
+    let chat = "personal:1@s.whatsapp.net";
+
+    for (status, expected) in [
+        (None, Ok(AvatarFetchState::Ready(b"PNG-AVATAR".to_vec()))),
+        (Some(202), Ok(AvatarFetchState::Pending)),
+        (Some(404), Ok(AvatarFetchState::Missing)),
+        (Some(410), Ok(AvatarFetchState::Missing)),
+        (Some(206), Err(HubError::PartialMedia)),
+        (
+            Some(503),
+            Err(HubError::HttpStatus {
+                status: 503,
+                body: "partial".to_owned(),
+            }),
+        ),
+    ] {
+        state.lock().unwrap().media_status_override = status;
+        assert_eq!(client.fetch_avatar_state(chat).await, expected);
+    }
+
+    state.lock().unwrap().media_status_override = Some(202);
+    assert_eq!(client.fetch_avatar(chat).await.unwrap(), None);
+    state.lock().unwrap().media_status_override = None;
+    assert_eq!(
+        client.fetch_avatar_state(chat).await.unwrap(),
+        AvatarFetchState::Ready(b"PNG-AVATAR".to_vec())
+    );
     server.abort();
 }
 

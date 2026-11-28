@@ -12,15 +12,17 @@ use postbox_core::read::select_read_message_id;
 use postbox_core::views::{format_account_label, resolve_slack_workspace_name};
 use postbox_core::{Account, ChatKey, MediaKind, Message, Provider, ReadStatus};
 use postbox_hub::{
-    ArchiveOutcome, Endpoint, EventStream, HubClient, HubError, MAX_ROWS, OLDER_PAGE_LIMIT,
-    SendFileRequest, SseEvent, SseParser, SseReconnectState, classify_signal_send_failure,
-    classify_telegram_send_failure, is_real_message, read_message_id, should_run_safety_poll,
+    ArchiveOutcome, AvatarFetchState, Endpoint, EventStream, HubClient, HubError, MAX_ROWS,
+    OLDER_PAGE_LIMIT, SendFileRequest, SseEvent, SseParser, SseReconnectState,
+    classify_signal_send_failure, classify_telegram_send_failure, is_real_message, read_message_id,
+    should_run_safety_poll,
 };
 use postbox_media::MEDIA_EVICTION_DAYS;
 use postbox_media::age::{evict_expired_media_cache, format_utc_rfc3339};
 use postbox_media::avatar::{
-    SlackEmojiIndex, fetch_or_load_avatar, fetch_or_load_slack_emoji_media,
-    fetch_or_load_workspace_icon,
+    AvatarCacheLookup, SlackEmojiIndex, commit_avatar_fetch_result,
+    default_wacli_remote_avatars_dir, fetch_or_load_slack_emoji_media,
+    fetch_or_load_workspace_icon, resolve_avatar_cache_or_seed,
 };
 use postbox_media::drain::{
     BACKGROUND_MEDIA_LIMIT, CachedDownloadResult, DownloadOutcome, MAX_BACKGROUND_READ_FAILURES,
@@ -221,6 +223,10 @@ pub fn spawn_sync_engine(
 }
 
 enum BackgroundTaskResult {
+    AvatarFetched {
+        chat: ChatKey,
+        outcome: Result<AvatarFetchState, HubError>,
+    },
     MediaDownloadDone {
         chat: ChatKey,
         target: MediaDownloadTarget,
@@ -260,6 +266,8 @@ struct SyncEngine {
     giphy_api_key: Option<String>,
     giphy_cancel_tx: Option<(u64, watch::Sender<bool>)>,
     slack_emoji_cache: HashMap<String, SlackEmojiIndex>,
+    avatar_sem: Arc<tokio::sync::Semaphore>,
+    avatar_in_flight: HashSet<ChatKey>,
     background_swept_chats: HashMap<ChatKey, String>,
     bg_tx: mpsc::UnboundedSender<BackgroundTaskResult>,
     bg_rx: mpsc::UnboundedReceiver<BackgroundTaskResult>,
@@ -366,6 +374,8 @@ impl SyncEngine {
             giphy_api_key,
             giphy_cancel_tx: None,
             slack_emoji_cache: HashMap::new(),
+            avatar_sem: Arc::new(tokio::sync::Semaphore::new(4)),
+            avatar_in_flight: HashSet::new(),
             background_swept_chats: HashMap::new(),
             bg_tx,
             bg_rx,
@@ -801,16 +811,54 @@ impl SyncEngine {
             }
             SyncCommand::FetchAvatar { chat } => {
                 let avatar_dir = self.data_dir.join("avatars");
-                if let Ok(path) = fetch_or_load_avatar(
-                    &self.client,
+                match resolve_avatar_cache_or_seed(
                     &self.store,
                     &avatar_dir,
+                    default_wacli_remote_avatars_dir().as_deref(),
                     &chat,
                     now_epoch_secs(),
-                )
-                .await
-                {
-                    self.emit(SyncEvent::AvatarReady { chat, path });
+                ) {
+                    Ok(AvatarCacheLookup::Ready(path)) => {
+                        self.emit(SyncEvent::AvatarReady {
+                            chat,
+                            path: Some(path),
+                        });
+                    }
+                    Ok(AvatarCacheLookup::Missing) => {
+                        self.emit(SyncEvent::AvatarReady { chat, path: None });
+                    }
+                    Ok(AvatarCacheLookup::NeedsFetch { fallback_path }) => {
+                        if let Some(path) = fallback_path {
+                            self.emit(SyncEvent::AvatarReady {
+                                chat: chat.clone(),
+                                path: Some(path),
+                            });
+                        }
+                        if self.avatar_in_flight.insert(chat.clone()) {
+                            let client = Arc::clone(&self.client);
+                            let avatar_sem = Arc::clone(&self.avatar_sem);
+                            let bg_tx = self.bg_tx.clone();
+                            tokio::spawn(async move {
+                                let _permit = avatar_sem
+                                    .acquire_owned()
+                                    .await
+                                    .expect("avatar semaphore is never closed");
+                                let mut outcome = Ok(AvatarFetchState::Pending);
+                                for attempt in 0..3 {
+                                    if attempt > 0 {
+                                        tokio::time::sleep(Duration::from_secs(15)).await;
+                                    }
+                                    outcome = client.fetch_avatar_state(&chat.id).await;
+                                    if !matches!(outcome, Ok(AvatarFetchState::Pending)) {
+                                        break;
+                                    }
+                                }
+                                let _ = bg_tx
+                                    .send(BackgroundTaskResult::AvatarFetched { chat, outcome });
+                            });
+                        }
+                    }
+                    Err(_) => {}
                 }
             }
             SyncCommand::FetchWorkspaceIcon { team } => {
@@ -1298,6 +1346,22 @@ impl SyncEngine {
 
     fn handle_bg_result(&mut self, bg: BackgroundTaskResult) {
         match bg {
+            BackgroundTaskResult::AvatarFetched { chat, outcome } => {
+                self.avatar_in_flight.remove(&chat);
+                if matches!(outcome, Ok(AvatarFetchState::Pending)) {
+                    return;
+                }
+                let avatar_dir = self.data_dir.join("avatars");
+                if let Ok(path) = commit_avatar_fetch_result(
+                    &self.store,
+                    &avatar_dir,
+                    &chat,
+                    now_epoch_secs(),
+                    outcome,
+                ) {
+                    self.emit(SyncEvent::AvatarReady { chat, path });
+                }
+            }
             BackgroundTaskResult::MediaDownloadDone {
                 chat,
                 target,
@@ -2790,6 +2854,119 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("postbox_sync_{tag}_{}_{nanos}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn avatar_fetches_do_not_block_commands_and_deduplicate_in_flight() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let (endpoint, server) = start_mock_server(state.clone()).await;
+        let client = HubClient::new(endpoint, "test-token").unwrap();
+        let data_dir = unique_sync_test_dir("avatars");
+        let (bridge, worker) = create_sync_bridge();
+        let mut engine = SyncEngine::with_m3(
+            client,
+            Store::open_in_memory().unwrap(),
+            worker,
+            data_dir.clone(),
+            None,
+        );
+        let permits = engine.avatar_sem.clone().try_acquire_many_owned(4).unwrap();
+        let chats: Vec<_> = (0..5)
+            .map(|i| {
+                ChatKey::new(
+                    Provider::Telegram,
+                    "telegram",
+                    format!("telegram:avatar-{i}"),
+                )
+            })
+            .collect();
+        for chat in chats.iter().chain(chats.iter()) {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                engine.handle_command(SyncCommand::FetchAvatar { chat: chat.clone() }),
+            )
+            .await
+            .expect("avatar command must not wait for a download permit");
+        }
+        assert_eq!(engine.avatar_in_flight.len(), 5);
+        while let Ok(event) = bridge.event_rx.try_recv() {
+            assert!(!matches!(event, SyncEvent::AvatarReady { .. }));
+        }
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.handle_command(SyncCommand::FetchChatMessages {
+                chat: chats[0].clone(),
+                limit: 10,
+            }),
+        )
+        .await
+        .expect("message sync must run while avatars wait");
+        assert_eq!(state.lock().unwrap().message_fetches.len(), 1);
+
+        drop(permits);
+        for _ in &chats {
+            let result = tokio::time::timeout(Duration::from_secs(2), engine.bg_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(result, BackgroundTaskResult::AvatarFetched { .. }));
+            engine.handle_bg_result(result);
+        }
+        assert!(engine.avatar_in_flight.is_empty());
+        assert_eq!(engine.avatar_sem.available_permits(), 4);
+        server.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn pending_avatar_result_does_not_emit_missing_or_change_cache() {
+        let endpoint = Endpoint::parse("http://127.0.0.1:9", true).unwrap();
+        let client = HubClient::new(endpoint, "test-token").unwrap();
+        let data_dir = unique_sync_test_dir("avatar-pending");
+        let (bridge, worker) = create_sync_bridge();
+        let mut engine = SyncEngine::with_m3(
+            client,
+            Store::open_in_memory().unwrap(),
+            worker,
+            data_dir.clone(),
+            None,
+        );
+        let chat = ChatKey::new(Provider::Telegram, "telegram", "telegram:avatar");
+        let marker_key = "avatar:telegram:telegram:telegram:avatar";
+        engine.avatar_in_flight.insert(chat.clone());
+        engine.handle_bg_result(BackgroundTaskResult::AvatarFetched {
+            chat: chat.clone(),
+            outcome: Ok(AvatarFetchState::Pending),
+        });
+        assert!(!engine.avatar_in_flight.contains(&chat));
+        while let Ok(event) = bridge.event_rx.try_recv() {
+            assert!(!matches!(event, SyncEvent::AvatarReady { .. }));
+        }
+        assert!(engine.store.get_fetch_marker(marker_key).unwrap().is_none());
+
+        let avatar_dir = data_dir.join("avatars");
+        let path = commit_avatar_fetch_result(
+            &engine.store,
+            &avatar_dir,
+            &chat,
+            100,
+            Ok(AvatarFetchState::Ready(b"CACHED-AVATAR".to_vec())),
+        )
+        .unwrap()
+        .unwrap();
+        let before = engine.store.get_fetch_marker(marker_key).unwrap();
+        engine.avatar_in_flight.insert(chat.clone());
+        engine.handle_bg_result(BackgroundTaskResult::AvatarFetched {
+            chat: chat.clone(),
+            outcome: Ok(AvatarFetchState::Pending),
+        });
+        assert!(!engine.avatar_in_flight.contains(&chat));
+        while let Ok(event) = bridge.event_rx.try_recv() {
+            assert!(!matches!(event, SyncEvent::AvatarReady { .. }));
+        }
+        assert_eq!(engine.store.get_fetch_marker(marker_key).unwrap(), before);
+        assert_eq!(std::fs::read(path).unwrap(), b"CACHED-AVATAR");
+        std::fs::remove_dir_all(data_dir).unwrap();
     }
 
     #[tokio::test]

@@ -9,8 +9,8 @@ use crate::request::{
     workspace_icon_request,
 };
 use crate::types::{
-    ArchiveBatchItemResult, ArchiveOutcome, Endpoint, HubChat, HubMessage, HubRequest,
-    MediaFetchDetailed, MediaFetchState, SendFileRequest, SendReply,
+    ArchiveBatchItemResult, ArchiveOutcome, AvatarFetchState, Endpoint, HubChat, HubMessage,
+    HubRequest, MediaFetchDetailed, MediaFetchState, SendFileRequest, SendReply,
 };
 use futures_util::StreamExt;
 use postbox_core::Provider;
@@ -480,12 +480,20 @@ impl HubClient {
     }
 
     pub async fn fetch_avatar(&self, chat: &str) -> Result<Option<Vec<u8>>, HubError> {
+        match self.fetch_avatar_state(chat).await? {
+            AvatarFetchState::Ready(bytes) => Ok(Some(bytes)),
+            AvatarFetchState::Pending | AvatarFetchState::Missing => Ok(None),
+        }
+    }
+
+    pub async fn fetch_avatar_state(&self, chat: &str) -> Result<AvatarFetchState, HubError> {
         let req = media_request(chat, None)?;
         let (status, bytes) = self.execute_rest(&req, MAX_DOWNLOAD_BYTES).await?;
         match status {
-            200 => Ok(Some(bytes)),
+            200 => Ok(AvatarFetchState::Ready(bytes)),
+            202 => Ok(AvatarFetchState::Pending),
             206 => Err(HubError::PartialMedia),
-            404 | 410 => Ok(None),
+            404 | 410 => Ok(AvatarFetchState::Missing),
             other => Err(HubError::HttpStatus {
                 status: other,
                 body: String::from_utf8_lossy(&bytes).into_owned(),

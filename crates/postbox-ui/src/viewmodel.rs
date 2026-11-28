@@ -1257,7 +1257,7 @@ impl PostboxViewModel {
         let avatar_targets: Vec<ChatKey> = self
             .chats
             .iter()
-            .take(24)
+            .take(256)
             .filter(|c| postbox_media::avatar::chat_avatar_enabled(c.key.provider))
             .map(|c| c.key.clone())
             .collect();

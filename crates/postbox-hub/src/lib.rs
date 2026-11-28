@@ -35,8 +35,9 @@ pub use sync::{
     SseReconnectState, hub_reconnect_wait_ms, should_run_safety_poll,
 };
 pub use types::{
-    ArchiveBatchItemResult, ArchiveOutcome, Endpoint, HubChat, HubMessage, HubRequest,
-    HubSyncSignal, MediaFetchDetailed, MediaFetchState, SendFileRequest, SendReply, SseEvent,
+    ArchiveBatchItemResult, ArchiveOutcome, AvatarFetchState, Endpoint, HubChat, HubMessage,
+    HubRequest, HubSyncSignal, MediaFetchDetailed, MediaFetchState, SendFileRequest, SendReply,
+    SseEvent,
 };
 
 #[cfg(test)]

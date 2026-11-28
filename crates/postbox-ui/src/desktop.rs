@@ -48,6 +48,14 @@ pub(crate) fn is_slack_display_style(id_prefix: &str, chat_replies_fold: bool) -
     id_prefix == "msg" && chat_replies_fold
 }
 
+pub(crate) fn show_sender_profile_gutter(
+    id_prefix: &str,
+    slack_style: bool,
+    provider: Provider,
+) -> bool {
+    slack_style || (id_prefix == "thread" && provider == Provider::Slack)
+}
+
 pub(crate) fn message_group_spacing(
     grouped_with_prev: bool,
     grouped_with_next: bool,
@@ -1717,6 +1725,8 @@ impl PostboxShell {
                 read_ticks,
                 ..
             } => {
+                let show_profile_gutter =
+                    show_sender_profile_gutter(id_prefix, slack_style, message.chat.provider);
                 let bubble_bg = if slack_style {
                     if *selected { p.accent } else { p.card }
                 } else if message.from_me {
@@ -1855,19 +1865,21 @@ impl PostboxShell {
                     );
                 }
 
+                let mut content_children = Vec::new();
                 let bottom_meta = if slack_style && !grouped_with_prev {
-                    bubble = bubble.child(meta_row);
+                    content_children.push(meta_row.into_any_element());
                     None
                 } else {
                     Some(meta_row)
                 };
 
                 if !slack_style && !grouped_with_prev && !message.from_me {
-                    bubble = bubble.child(
+                    content_children.push(
                         div()
                             .text_size(px(label_px))
                             .text_color(rgb(bubble_meta))
-                            .child(message.sender_name.clone()),
+                            .child(message.sender_name.clone())
+                            .into_any_element(),
                     );
                 }
 
@@ -1877,7 +1889,7 @@ impl PostboxShell {
                     } else {
                         format!("Replying to {reply_id}")
                     };
-                    bubble = bubble.child(
+                    content_children.push(
                         div()
                             .px_2()
                             .py_0p5()
@@ -1885,7 +1897,8 @@ impl PostboxShell {
                             .bg(rgb(p.secondary))
                             .text_size(px(label_px))
                             .text_color(rgb(p.muted_foreground))
-                            .child(quote_label),
+                            .child(quote_label)
+                            .into_any_element(),
                     );
                 }
 
@@ -1904,16 +1917,16 @@ impl PostboxShell {
                 if let Some(media_el) =
                     self.render_inline_media_element(message, &p, ix, id_prefix, &shell)
                 {
-                    bubble = bubble.child(media_el);
+                    content_children.push(media_el);
                 }
 
                 if !body_text.is_empty() {
-                    bubble = bubble.child(self.render_message_body_element(
+                    content_children.push(self.render_message_body_element(
                         message, body_text, body_px, bubble_fg, ix, id_prefix,
                     ));
                 }
                 if let Some((card, _)) = unfurl_match {
-                    bubble = bubble.child(self.render_unfurl_card(card, &p, ix, id_prefix, &shell));
+                    content_children.push(self.render_unfurl_card(card, &p, ix, id_prefix, &shell));
                 }
                 let show_bottom_meta = if slack_style {
                     *selected || *marked || outbox_status.is_some()
@@ -1926,17 +1939,18 @@ impl PostboxShell {
                     )
                 };
                 if show_bottom_meta && let Some(meta_row) = bottom_meta {
-                    bubble = bubble.child(meta_row);
+                    content_children.push(meta_row.into_any_element());
                 }
 
                 if let Some(badge) = outbox_status {
                     match badge {
                         OutboxBadge::Sending => {
-                            bubble = bubble.child(
+                            content_children.push(
                                 div()
                                     .text_size(px(label_px))
                                     .text_color(rgb(bubble_meta))
-                                    .child("Sending..."),
+                                    .child("Sending...")
+                                    .into_any_element(),
                             );
                         }
                         OutboxBadge::Failed { reason, ambiguous } => {
@@ -1947,7 +1961,7 @@ impl PostboxShell {
                             };
                             let retry_id = message.msg_id.clone();
                             let shell_retry = shell.clone();
-                            bubble = bubble.child(
+                            content_children.push(
                                 div()
                                     .id(SharedString::from(format!("{id_prefix}-retry-{ix}")))
                                     .test_support()
@@ -1964,7 +1978,8 @@ impl PostboxShell {
                                             this.sync_after_vm_change(window, cx);
                                         });
                                     })
-                                    .child(label),
+                                    .child(label)
+                                    .into_any_element(),
                             );
                         }
                     }
@@ -1983,7 +1998,7 @@ impl PostboxShell {
                         replies_line(*thread_reply_count)
                     };
                     let shell_thread = shell.clone();
-                    bubble = bubble.child(
+                    content_children.push(
                         div()
                             .id(SharedString::from(format!("{id_prefix}-thread-pill-{ix}")))
                             .test_support()
@@ -2010,8 +2025,93 @@ impl PostboxShell {
                                     this.sync_after_vm_change(window, cx);
                                 });
                             })
-                            .child(label),
+                            .child(label)
+                            .into_any_element(),
                     );
+                }
+
+                if show_profile_gutter {
+                    let content_col = div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .children(content_children);
+                    let avatar_gutter = if !*grouped_with_prev {
+                        let sender_label = if message.from_me {
+                            "You"
+                        } else if !message.sender_name.is_empty() {
+                            message.sender_name.as_str()
+                        } else {
+                            message.sender_id.as_str()
+                        };
+                        let avatar = div()
+                            .id(SharedString::from(format!(
+                                "{id_prefix}-sender-avatar-{ix}"
+                            )))
+                            .test_support()
+                            .w(px(30.0))
+                            .h(px(30.0))
+                            .flex_shrink_0()
+                            .rounded_full();
+                        if message.chat.provider == Provider::Whatsapp
+                            && !message.from_me
+                            && !self.vm.selected_chat().is_some_and(|c| c.is_group)
+                            && let Some(path) = self.vm.avatar_path_for(&message.chat)
+                            && let Some(entry) =
+                                self.gpu_textures.peek(&avatar_tex_key(&message.chat, path))
+                            && let Some(frame) = entry.frame_at(0)
+                        {
+                            avatar
+                                .overflow_hidden()
+                                .child(
+                                    img(frame)
+                                        .w(px(30.0))
+                                        .h(px(30.0))
+                                        .object_fit(ObjectFit::Cover)
+                                        .rounded_full(),
+                                )
+                                .into_any_element()
+                        } else {
+                            let seed = if !message.sender_id.is_empty() {
+                                message.sender_id.as_str()
+                            } else {
+                                sender_label
+                            };
+                            let color_hex = postbox_media::avatar::SENDER_PALETTE_HEX
+                                [postbox_media::avatar::sender_color_index(seed, sender_label)];
+                            let initial = postbox_media::avatar::avatar_initial(sender_label);
+                            avatar
+                                .bg(rgb(color_hex))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(label_px))
+                                .font_weight(gpui_kit::FontWeight::BOLD)
+                                .text_color(rgb(0xFFFFFF))
+                                .child(initial)
+                                .into_any_element()
+                        }
+                    } else {
+                        div()
+                            .w(px(30.0))
+                            .h(px(1.0))
+                            .flex_shrink_0()
+                            .into_any_element()
+                    };
+                    bubble = bubble.child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_start()
+                            .gap_2p5()
+                            .child(avatar_gutter)
+                            .child(content_col),
+                    );
+                } else {
+                    bubble = bubble.children(content_children);
                 }
 
                 let mut bubble_column = div()
@@ -3601,6 +3701,24 @@ mod message_group_tests {
             ("other", true, false),
         ] {
             assert_eq!(is_slack_display_style(id_prefix, fold), expected);
+        }
+    }
+
+    #[test]
+    fn sender_profile_gutter_shows_for_slack_style_and_slack_threads() {
+        for (id_prefix, slack_style, provider, expected) in [
+            ("msg", true, Provider::Slack, true),
+            ("msg", false, Provider::Slack, false),
+            ("msg", false, Provider::Whatsapp, false),
+            ("msg", true, Provider::Whatsapp, true),
+            ("thread", false, Provider::Slack, true),
+            ("thread", false, Provider::Whatsapp, false),
+        ] {
+            assert_eq!(
+                show_sender_profile_gutter(id_prefix, slack_style, provider),
+                expected,
+                "{id_prefix}, slack_style={slack_style}, provider={provider:?}"
+            );
         }
     }
 

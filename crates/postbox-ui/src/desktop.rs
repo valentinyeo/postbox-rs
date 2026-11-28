@@ -39,9 +39,28 @@ use std::rc::Rc;
 use std::time::Instant;
 
 pub const RADIUS_BUBBLE_PX: f32 = 18.0;
+pub const RADIUS_GROUPED_INNER_PX: f32 = 6.0;
 pub const RADIUS_MODAL_PX: f32 = 18.0;
 pub const RADIUS_ROW_PX: f32 = 12.0;
 pub const RADIUS_CHIP_PX: f32 = 9999.0;
+
+pub(crate) fn message_group_spacing(
+    grouped_with_prev: bool,
+    grouped_with_next: bool,
+) -> (f32, f32) {
+    let top_pt = if grouped_with_prev { 1.0 } else { 10.0 };
+    let bottom_pb = if grouped_with_next { 1.0 } else { 2.0 };
+    (top_pt, bottom_pb)
+}
+
+pub(crate) fn should_show_message_meta(
+    grouped_with_next: bool,
+    selected: bool,
+    marked: bool,
+    has_outbox_status: bool,
+) -> bool {
+    !grouped_with_next || selected || marked || has_outbox_status
+}
 
 gpui_kit::actions!(
     postbox,
@@ -1676,6 +1695,7 @@ impl PostboxShell {
             TimelineItem::MessageRow {
                 message,
                 grouped_with_prev,
+                grouped_with_next,
                 selected,
                 marked,
                 thread_reply_count,
@@ -1714,14 +1734,26 @@ impl PostboxShell {
                     .test_support()
                     .max_w(px(620.0))
                     .px_3()
-                    .py_2()
+                    .py_1p5()
                     .rounded(px(RADIUS_BUBBLE_PX))
+                    .when(message.from_me && *grouped_with_prev, |el| {
+                        el.rounded_tr(px(RADIUS_GROUPED_INNER_PX))
+                    })
+                    .when(message.from_me && *grouped_with_next, |el| {
+                        el.rounded_br(px(RADIUS_GROUPED_INNER_PX))
+                    })
+                    .when(!message.from_me && *grouped_with_prev, |el| {
+                        el.rounded_tl(px(RADIUS_GROUPED_INNER_PX))
+                    })
+                    .when(!message.from_me && *grouped_with_next, |el| {
+                        el.rounded_bl(px(RADIUS_GROUPED_INNER_PX))
+                    })
                     .bg(rgb(bubble_bg))
                     .border_1()
                     .border_color(rgb(border_col))
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap_0p5()
                     .on_mouse_down(
                         MouseButton::Left,
                         move |event: &MouseDownEvent, window, cx| {
@@ -1841,7 +1873,14 @@ impl PostboxShell {
                 if let Some((card, _)) = unfurl_match {
                     bubble = bubble.child(self.render_unfurl_card(card, &p, ix, id_prefix, &shell));
                 }
-                bubble = bubble.child(meta_row);
+                if should_show_message_meta(
+                    *grouped_with_next,
+                    *selected,
+                    *marked,
+                    outbox_status.is_some(),
+                ) {
+                    bubble = bubble.child(meta_row);
+                }
 
                 if let Some(chips) = self.render_reaction_chips(message, &p, ix, id_prefix, &shell)
                 {
@@ -1921,13 +1960,15 @@ impl PostboxShell {
                     );
                 }
 
+                let (top_pt, bottom_pb) =
+                    message_group_spacing(*grouped_with_prev, *grouped_with_next);
                 div()
                     .w_full()
                     .max_w(px(CHAT_COLUMN_MAX_WIDTH_PX))
                     .mx_auto()
                     .px_4()
-                    .pt(px(if *grouped_with_prev { 2.0 } else { 8.0 }))
-                    .pb(px(2.0))
+                    .pt(px(top_pt))
+                    .pb(px(bottom_pb))
                     .flex()
                     .when(message.from_me, |el| el.justify_end())
                     .when(!message.from_me, |el| el.justify_start())
@@ -3433,9 +3474,72 @@ mod radius_tests {
     fn rounded_ui_uses_grok_bot_radii() {
         assert_eq!(RADIUS_ROW_PX, 12.0);
         assert_eq!(RADIUS_BUBBLE_PX, 18.0);
+        assert_eq!(RADIUS_GROUPED_INNER_PX, 6.0);
         assert_eq!(RADIUS_MODAL_PX, 18.0);
         let chip_radius = RADIUS_CHIP_PX;
         assert!(chip_radius >= 9999.0);
+    }
+}
+
+#[cfg(test)]
+mod message_group_tests {
+    use super::*;
+
+    #[test]
+    fn spacing_distinguishes_single_and_burst_positions() {
+        for (position, grouped_with_prev, grouped_with_next, expected) in [
+            ("single", false, false, (10.0, 2.0)),
+            ("burst start", false, true, (10.0, 1.0)),
+            ("burst middle", true, true, (1.0, 1.0)),
+            ("burst end", true, false, (1.0, 2.0)),
+        ] {
+            assert_eq!(
+                message_group_spacing(grouped_with_prev, grouped_with_next),
+                expected,
+                "{position}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_shows_only_on_single_messages_and_burst_ends() {
+        for (position, grouped_with_next, expected) in [
+            ("single", false, true),
+            ("burst start", true, false),
+            ("burst middle", true, false),
+            ("burst end", false, true),
+        ] {
+            assert_eq!(
+                should_show_message_meta(grouped_with_next, false, false, false),
+                expected,
+                "{position}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_stays_visible_for_selected_marked_and_outbox_messages() {
+        for (state, selected, marked, has_outbox_status) in [
+            ("selected", true, false, false),
+            ("marked", false, true, false),
+            ("sending or failed", false, false, true),
+            ("selected and marked", true, true, false),
+            ("selected and sending", true, false, true),
+            ("marked and sending", false, true, true),
+            ("selected marked and sending", true, true, true),
+        ] {
+            for grouped_with_next in [false, true] {
+                assert!(
+                    should_show_message_meta(
+                        grouped_with_next,
+                        selected,
+                        marked,
+                        has_outbox_status
+                    ),
+                    "{state}, grouped_with_next={grouped_with_next}"
+                );
+            }
+        }
     }
 }
 
